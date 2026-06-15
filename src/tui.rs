@@ -293,18 +293,19 @@ fn compact_row(model: &ModelUsage, totals: &UsageTotals, max_cost: f64) -> Row<'
 }
 
 fn share_cell(value: f64, total: f64, max: f64) -> String {
-    let bar = ascii_bar(value, max, 8);
-    format!("{bar} {}", format::percent(value, total))
+    let percentage = format::percent(value, total);
+    let bar = braille_bar(value, max, 8);
+    format!("{percentage} {bar}")
 }
 
-fn ascii_bar(value: f64, max: f64, width: usize) -> String {
+fn braille_bar(value: f64, max: f64, width: usize) -> String {
     if max <= 0.0 {
-        return "-".repeat(width);
+        return "⠄".repeat(width);
     }
 
     let filled = ((value / max) * width as f64).round() as usize;
     let filled = filled.clamp(0, width);
-    format!("{}{}", "#".repeat(filled), "-".repeat(width - filled))
+    format!("{}{}", "⣿".repeat(filled), "⠄".repeat(width - filled))
 }
 
 fn model_cost(model: &ModelUsage) -> f64 {
@@ -395,8 +396,22 @@ mod tests {
         assert!(output.contains("Daily by model"));
         assert!(output.contains("provider/gpt-test (high)"));
         assert!(output.contains("$2.5000"));
-        assert!(output.contains("######## 66.7%"));
+        assert!(output.contains("66.7% ⣿⣿⣿⣿⣿⣿⣿⣿"));
         assert!(output.contains("since Jun 15 04:00"));
+    }
+
+    #[test]
+    fn renders_percent_before_bar_in_compact_width() {
+        let stats = sample_stats(Mode::Daily, Some(local_millis(2026, 6, 15, 4, 0, 0)));
+        let app = app_with_stats(Mode::Daily, stats);
+
+        let output = render(&app, 80, 24);
+
+        assert!(output.contains("Cost %"));
+        assert!(output.contains("66.7%"));
+        assert!(output.contains("33.3%"));
+        assert!(output.contains("⣿"));
+        assert!(!output.contains("#"));
     }
 
     #[test]
