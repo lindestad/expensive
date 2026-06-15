@@ -62,6 +62,7 @@ Controls:
 | `Enter` | Open selected Calendar period |
 | `h` / `k` | Previous period from Calendar detail |
 | `j` / `l` | Next period from Calendar detail |
+| `?` | Open or close Help |
 | `r` | Refresh now |
 | `Esc` | Back one level; quit from the dashboard |
 | `q` | Quit |
@@ -74,6 +75,9 @@ orders of magnitude faster than parsing `opencode stats`.
 
 ```bash
 expensive --daily-start 05:00
+expensive --week-start sunday
+expensive --color-theme ocean
+expensive --theme-scope all
 expensive --refresh 10
 expensive --no-refresh
 expensive --db ~/.local/share/opencode/opencode.db
@@ -98,11 +102,19 @@ Example:
 
 ```toml
 daily_start = "04:00"
+week_start = "monday"
 refresh_seconds = 60
+color_theme = "aurora"
+theme_scope = "calendar"
 scope = "all"
 ```
 
 Only `scope = "all"` is supported today.
+
+`week_start` can be `monday` or `sunday`. Themes are `aurora`, `ember`,
+`ocean`, `forest`, and `graphite`. `theme_scope = "calendar"` applies the
+theme to the Calendar heatmap only; `theme_scope = "all"` applies it to the
+entire TUI.
 
 ## Notes
 

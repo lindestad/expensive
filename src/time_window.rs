@@ -132,6 +132,54 @@ pub struct DailyStart {
     pub minute: u32,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum WeekStart {
+    #[default]
+    Monday,
+    Sunday,
+}
+
+impl WeekStart {
+    pub fn title(self) -> &'static str {
+        match self {
+            WeekStart::Monday => "Monday",
+            WeekStart::Sunday => "Sunday",
+        }
+    }
+
+    pub fn short_days(self) -> [&'static str; 7] {
+        match self {
+            WeekStart::Monday => ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
+            WeekStart::Sunday => ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"],
+        }
+    }
+
+    fn days_since_start(self, date: NaiveDate) -> i64 {
+        match self {
+            WeekStart::Monday => date.weekday().num_days_from_monday() as i64,
+            WeekStart::Sunday => date.weekday().num_days_from_sunday() as i64,
+        }
+    }
+}
+
+impl fmt::Display for WeekStart {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.title().to_lowercase())
+    }
+}
+
+impl FromStr for WeekStart {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "monday" | "mon" => Ok(Self::Monday),
+            "sunday" | "sun" => Ok(Self::Sunday),
+            _ => bail!("week start must be \"monday\" or \"sunday\""),
+        }
+    }
+}
+
 impl Default for DailyStart {
     fn default() -> Self {
         Self { hour: 4, minute: 0 }
@@ -173,8 +221,9 @@ pub fn cutoff_millis(
     mode: Mode,
     now: DateTime<Local>,
     daily_start: DailyStart,
+    week_start: WeekStart,
 ) -> Result<Option<i64>> {
-    let Some(local_cutoff) = cutoff_naive(mode, now.naive_local(), daily_start) else {
+    let Some(local_cutoff) = cutoff_naive(mode, now.naive_local(), daily_start, week_start) else {
         return Ok(None);
     };
 
@@ -197,8 +246,9 @@ pub fn current_period(
     scale: CalendarScale,
     now: DateTime<Local>,
     daily_start: DailyStart,
+    week_start: WeekStart,
 ) -> Result<PeriodKey> {
-    let start_millis = cutoff_millis(scale.mode(), now, daily_start)?
+    let start_millis = cutoff_millis(scale.mode(), now, daily_start, week_start)?
         .expect("calendar scales always have a finite cutoff");
     let start = local_from_millis(start_millis)?;
     period_from_start(scale, start)
@@ -210,10 +260,14 @@ pub fn shift_period(period: PeriodKey, steps: i32) -> Result<PeriodKey> {
     period_from_start(period.scale, shifted)
 }
 
-pub fn visible_periods(period: PeriodKey, daily_start: DailyStart) -> Result<Vec<PeriodKey>> {
+pub fn visible_periods(
+    period: PeriodKey,
+    daily_start: DailyStart,
+    week_start: WeekStart,
+) -> Result<Vec<PeriodKey>> {
     match period.scale {
-        CalendarScale::Day => visible_days(period, daily_start),
-        CalendarScale::Week => visible_weeks(period),
+        CalendarScale::Day => visible_days(period, daily_start, week_start),
+        CalendarScale::Week => visible_weeks(period, week_start),
         CalendarScale::Month => visible_months(period, daily_start),
     }
 }
@@ -222,21 +276,26 @@ pub fn cutoff_naive(
     mode: Mode,
     now: NaiveDateTime,
     daily_start: DailyStart,
+    week_start: WeekStart,
 ) -> Option<NaiveDateTime> {
     match mode {
         Mode::Daily => Some(daily_cutoff(now, daily_start)),
-        Mode::Weekly => Some(weekly_cutoff(now, daily_start)),
+        Mode::Weekly => Some(weekly_cutoff(now, daily_start, week_start)),
         Mode::Monthly => Some(monthly_cutoff(now, daily_start)),
         Mode::AllTime => None,
     }
 }
 
-fn visible_days(period: PeriodKey, daily_start: DailyStart) -> Result<Vec<PeriodKey>> {
+fn visible_days(
+    period: PeriodKey,
+    daily_start: DailyStart,
+    week_start: WeekStart,
+) -> Result<Vec<PeriodKey>> {
     let selected = local_from_millis(period.start_millis)?.naive_local();
     let first_of_month = NaiveDate::from_ymd_opt(selected.year(), selected.month(), 1)
         .expect("selected year and month are valid")
         .and_time(daily_start.as_time());
-    let offset = first_of_month.weekday().num_days_from_monday() as i64;
+    let offset = week_start.days_since_start(first_of_month.date());
     let grid_start = resolve_local(first_of_month - Duration::days(offset))?;
 
     (0..42)
@@ -247,9 +306,9 @@ fn visible_days(period: PeriodKey, daily_start: DailyStart) -> Result<Vec<Period
         .collect()
 }
 
-fn visible_weeks(period: PeriodKey) -> Result<Vec<PeriodKey>> {
+fn visible_weeks(period: PeriodKey, week_start: WeekStart) -> Result<Vec<PeriodKey>> {
     let selected = local_from_millis(period.start_millis)?;
-    let week_index = selected.iso_week().week() as i32 - 1;
+    let week_index = week_number(selected, week_start) as i32 - 1;
     let page_offset = week_index.rem_euclid(12);
     let grid_start = shift_start(selected, CalendarScale::Week, -page_offset)?;
 
@@ -351,10 +410,21 @@ fn resolve_local(value: NaiveDateTime) -> Result<DateTime<Local>> {
     }
 }
 
-fn weekly_cutoff(now: NaiveDateTime, daily_start: DailyStart) -> NaiveDateTime {
-    let days_from_monday = now.weekday().num_days_from_monday() as i64;
-    let monday = now.date() - Duration::days(days_from_monday);
-    let cutoff = monday.and_time(daily_start.as_time());
+pub fn week_number(start: DateTime<Local>, week_start: WeekStart) -> u32 {
+    match week_start {
+        WeekStart::Monday => start.iso_week().week(),
+        WeekStart::Sunday => start.format("%U").to_string().parse().unwrap_or(0),
+    }
+}
+
+fn weekly_cutoff(
+    now: NaiveDateTime,
+    daily_start: DailyStart,
+    week_start: WeekStart,
+) -> NaiveDateTime {
+    let days_from_week_start = week_start.days_since_start(now.date());
+    let week_start_date = now.date() - Duration::days(days_from_week_start);
+    let cutoff = week_start_date.and_time(daily_start.as_time());
     if now < cutoff {
         cutoff - Duration::days(7)
     } else {
@@ -400,7 +470,12 @@ mod tests {
     #[test]
     fn daily_cutoff_uses_today_after_start() {
         assert_eq!(
-            cutoff_naive(Mode::Daily, dt("2026-06-15 10:30"), DailyStart::default()),
+            cutoff_naive(
+                Mode::Daily,
+                dt("2026-06-15 10:30"),
+                DailyStart::default(),
+                WeekStart::default()
+            ),
             Some(dt("2026-06-15 04:00"))
         );
     }
@@ -408,7 +483,12 @@ mod tests {
     #[test]
     fn daily_cutoff_uses_yesterday_before_start() {
         assert_eq!(
-            cutoff_naive(Mode::Daily, dt("2026-06-15 03:30"), DailyStart::default()),
+            cutoff_naive(
+                Mode::Daily,
+                dt("2026-06-15 03:30"),
+                DailyStart::default(),
+                WeekStart::default()
+            ),
             Some(dt("2026-06-14 04:00"))
         );
     }
@@ -416,7 +496,12 @@ mod tests {
     #[test]
     fn weekly_cutoff_starts_on_monday() {
         assert_eq!(
-            cutoff_naive(Mode::Weekly, dt("2026-06-18 12:00"), DailyStart::default()),
+            cutoff_naive(
+                Mode::Weekly,
+                dt("2026-06-18 12:00"),
+                DailyStart::default(),
+                WeekStart::Monday
+            ),
             Some(dt("2026-06-15 04:00"))
         );
     }
@@ -424,15 +509,38 @@ mod tests {
     #[test]
     fn weekly_cutoff_uses_previous_week_before_monday_start() {
         assert_eq!(
-            cutoff_naive(Mode::Weekly, dt("2026-06-15 03:30"), DailyStart::default()),
+            cutoff_naive(
+                Mode::Weekly,
+                dt("2026-06-15 03:30"),
+                DailyStart::default(),
+                WeekStart::Monday
+            ),
             Some(dt("2026-06-08 04:00"))
+        );
+    }
+
+    #[test]
+    fn weekly_cutoff_can_start_on_sunday() {
+        assert_eq!(
+            cutoff_naive(
+                Mode::Weekly,
+                dt("2026-06-18 12:00"),
+                DailyStart::default(),
+                WeekStart::Sunday
+            ),
+            Some(dt("2026-06-14 04:00"))
         );
     }
 
     #[test]
     fn monthly_cutoff_starts_on_first_day() {
         assert_eq!(
-            cutoff_naive(Mode::Monthly, dt("2026-06-15 12:00"), DailyStart::default()),
+            cutoff_naive(
+                Mode::Monthly,
+                dt("2026-06-15 12:00"),
+                DailyStart::default(),
+                WeekStart::default()
+            ),
             Some(dt("2026-06-01 04:00"))
         );
     }
@@ -440,7 +548,12 @@ mod tests {
     #[test]
     fn monthly_cutoff_uses_previous_month_before_first_day_start() {
         assert_eq!(
-            cutoff_naive(Mode::Monthly, dt("2026-06-01 03:30"), DailyStart::default()),
+            cutoff_naive(
+                Mode::Monthly,
+                dt("2026-06-01 03:30"),
+                DailyStart::default(),
+                WeekStart::default()
+            ),
             Some(dt("2026-05-01 04:00"))
         );
     }
@@ -448,7 +561,12 @@ mod tests {
     #[test]
     fn all_time_has_no_cutoff() {
         assert_eq!(
-            cutoff_naive(Mode::AllTime, dt("2026-06-15 10:30"), DailyStart::default()),
+            cutoff_naive(
+                Mode::AllTime,
+                dt("2026-06-15 10:30"),
+                DailyStart::default(),
+                WeekStart::default()
+            ),
             None
         );
     }
@@ -459,6 +577,7 @@ mod tests {
             CalendarScale::Day,
             Local.with_ymd_and_hms(2026, 6, 15, 10, 30, 0).unwrap(),
             DailyStart::default(),
+            WeekStart::default(),
         )
         .unwrap();
 
@@ -473,13 +592,30 @@ mod tests {
             CalendarScale::Day,
             Local.with_ymd_and_hms(2026, 6, 15, 10, 30, 0).unwrap(),
             DailyStart::default(),
+            WeekStart::default(),
         )
         .unwrap();
-        let days = visible_periods(period, DailyStart::default()).unwrap();
+        let days = visible_periods(period, DailyStart::default(), WeekStart::default()).unwrap();
 
         assert_eq!(days.len(), 42);
         assert_eq!(days[0].start_millis, local_millis(2026, 6, 1, 4, 0));
         assert_eq!(days[41].start_millis, local_millis(2026, 7, 12, 4, 0));
+    }
+
+    #[test]
+    fn visible_days_honors_sunday_week_start() {
+        let period = current_period(
+            CalendarScale::Day,
+            Local.with_ymd_and_hms(2026, 6, 15, 10, 30, 0).unwrap(),
+            DailyStart::default(),
+            WeekStart::Sunday,
+        )
+        .unwrap();
+        let days = visible_periods(period, DailyStart::default(), WeekStart::Sunday).unwrap();
+
+        assert_eq!(days.len(), 42);
+        assert_eq!(days[0].start_millis, local_millis(2026, 5, 31, 4, 0));
+        assert_eq!(days[41].start_millis, local_millis(2026, 7, 11, 4, 0));
     }
 
     #[test]
@@ -488,11 +624,13 @@ mod tests {
             CalendarScale::Week,
             Local.with_ymd_and_hms(2026, 6, 18, 10, 30, 0).unwrap(),
             DailyStart::default(),
+            WeekStart::default(),
         )
         .unwrap();
         let next = shift_period(period, 1).unwrap();
-        let weeks = visible_periods(period, DailyStart::default()).unwrap();
-        let next_weeks = visible_periods(next, DailyStart::default()).unwrap();
+        let weeks = visible_periods(period, DailyStart::default(), WeekStart::default()).unwrap();
+        let next_weeks =
+            visible_periods(next, DailyStart::default(), WeekStart::default()).unwrap();
 
         assert_eq!(weeks.len(), 12);
         assert_eq!(weeks[0].start_millis, next_weeks[0].start_millis);
@@ -504,6 +642,7 @@ mod tests {
             CalendarScale::Month,
             Local.with_ymd_and_hms(2026, 6, 15, 10, 30, 0).unwrap(),
             DailyStart::default(),
+            WeekStart::default(),
         )
         .unwrap();
         let previous = shift_period(period, -1).unwrap();

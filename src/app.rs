@@ -41,6 +41,7 @@ pub struct CalendarState {
 pub struct AppState {
     pub config: Config,
     pub view: View,
+    pub show_help: bool,
     pub mode: Mode,
     pub stats: HashMap<Mode, UsageStats>,
     pub loading: HashSet<Mode>,
@@ -57,13 +58,19 @@ pub struct AppState {
 impl AppState {
     fn new(config: Config) -> Result<Self> {
         let next_refresh_due = Instant::now() + config.refresh_interval;
-        let selected =
-            time_window::current_period(CalendarScale::Day, Local::now(), config.daily_start)?;
-        let visible_periods = time_window::visible_periods(selected, config.daily_start)?;
+        let selected = time_window::current_period(
+            CalendarScale::Day,
+            Local::now(),
+            config.daily_start,
+            config.week_start,
+        )?;
+        let visible_periods =
+            time_window::visible_periods(selected, config.daily_start, config.week_start)?;
 
         Ok(Self {
             config,
             view: View::Dashboard,
+            show_help: false,
             mode: Mode::Daily,
             stats: HashMap::new(),
             loading: HashSet::new(),
@@ -157,8 +164,12 @@ impl AppState {
     ) -> Result<()> {
         let selected_start = local_from_millis(self.calendar.selected.start_millis)?;
         self.calendar.scale = scale;
-        self.calendar.selected =
-            time_window::current_period(scale, selected_start, self.config.daily_start)?;
+        self.calendar.selected = time_window::current_period(
+            scale,
+            selected_start,
+            self.config.daily_start,
+            self.config.week_start,
+        )?;
         self.sync_visible_periods()?;
         self.ensure_calendar_costs(tx);
         if self.view == View::CalendarDetail {
@@ -178,8 +189,11 @@ impl AppState {
     }
 
     fn sync_visible_periods(&mut self) -> Result<()> {
-        self.calendar.visible_periods =
-            time_window::visible_periods(self.calendar.selected, self.config.daily_start)?;
+        self.calendar.visible_periods = time_window::visible_periods(
+            self.calendar.selected,
+            self.config.daily_start,
+            self.config.week_start,
+        )?;
         Ok(())
     }
 
@@ -373,16 +387,35 @@ fn handle_key(
     app: &mut AppState,
     tx: &Sender<RefreshMessage>,
 ) -> bool {
+    if code == KeyCode::Char('?') {
+        app.show_help = !app.show_help;
+        return false;
+    }
+
+    if app.show_help {
+        match code {
+            KeyCode::Char('q') => return true,
+            KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => return true,
+            KeyCode::Esc => {
+                app.show_help = false;
+                return false;
+            }
+            _ => return false,
+        }
+    }
+
     match code {
         KeyCode::Char('q') => true,
         KeyCode::Esc => match app.view {
             View::Dashboard => true,
             View::CalendarOverview => {
+                app.show_help = false;
                 app.view = View::Dashboard;
                 app.error = None;
                 false
             }
             View::CalendarDetail => {
+                app.show_help = false;
                 app.view = View::CalendarOverview;
                 app.error = None;
                 false
@@ -449,6 +482,10 @@ fn handle_key(
 }
 
 fn handle_mouse(mouse: MouseEvent, area: Rect, app: &mut AppState, tx: &Sender<RefreshMessage>) {
+    if app.show_help {
+        return;
+    }
+
     if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
         return;
     }
@@ -500,7 +537,8 @@ fn maybe_auto_refresh(app: &mut AppState, tx: &Sender<RefreshMessage>) {
 }
 
 fn refresh_dashboard(config: Config, mode: Mode) -> Result<UsageStats> {
-    let cutoff_millis = time_window::cutoff_millis(mode, Local::now(), config.daily_start)?;
+    let cutoff_millis =
+        time_window::cutoff_millis(mode, Local::now(), config.daily_start, config.week_start)?;
     db::load_usage(&config.db_path, mode, cutoff_millis)
 }
 

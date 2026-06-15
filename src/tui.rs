@@ -3,35 +3,137 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Paragraph, Row, Table},
+    widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap},
     Frame,
 };
 
 use crate::{
     app::{AppState, View},
+    config::{ColorTheme, ThemeScope},
     db::{ModelUsage, UsageStats, UsageTotals},
     format,
-    time_window::{CalendarScale, Mode, PeriodKey},
+    time_window::{self, CalendarScale, Mode, PeriodKey},
 };
 
-const BORDER: Color = Color::Rgb(64, 74, 92);
-const TEXT: Color = Color::Rgb(220, 226, 235);
-const MUTED: Color = Color::Rgb(119, 133, 154);
-const TITLE: Color = Color::Rgb(170, 220, 255);
-const ACCENT: Color = Color::Rgb(80, 210, 190);
-const CALENDAR_ACCENT: Color = Color::Rgb(218, 170, 255);
-const COST: Color = Color::Rgb(255, 196, 118);
-const TOKENS: Color = Color::Rgb(155, 210, 255);
-const IO: Color = Color::Rgb(187, 162, 255);
-const CACHE: Color = Color::Rgb(146, 226, 160);
-const ERROR: Color = Color::Rgb(255, 117, 117);
-const HEAT_PRIMARY_BG: [u8; 7] = [23, 30, 66, 101, 136, 172, 208];
-const HEAT_DIM_BG: [u8; 7] = [235, 236, 237, 238, 239, 240, 241];
+#[derive(Clone, Copy)]
+struct Palette {
+    border: Color,
+    text: Color,
+    muted: Color,
+    title: Color,
+    accent: Color,
+    calendar_accent: Color,
+    cost: Color,
+    tokens: Color,
+    io: Color,
+    cache: Color,
+    error: Color,
+    key_bg: Color,
+    heat_primary_bg: [u8; 7],
+    heat_dim_bg: [u8; 7],
+}
 
 #[derive(Clone, Copy)]
 struct MetricStyle {
     value: Color,
     label: Color,
+}
+
+fn active_palette(app: &AppState) -> Palette {
+    let themed = palette_for(app.config.color_theme);
+    match app.config.theme_scope {
+        ThemeScope::All => themed,
+        ThemeScope::Calendar => Palette {
+            heat_primary_bg: themed.heat_primary_bg,
+            heat_dim_bg: themed.heat_dim_bg,
+            ..palette_for(ColorTheme::Aurora)
+        },
+    }
+}
+
+fn palette_for(theme: ColorTheme) -> Palette {
+    match theme {
+        ColorTheme::Aurora => Palette {
+            border: Color::Rgb(64, 74, 92),
+            text: Color::Rgb(220, 226, 235),
+            muted: Color::Rgb(119, 133, 154),
+            title: Color::Rgb(170, 220, 255),
+            accent: Color::Rgb(80, 210, 190),
+            calendar_accent: Color::Rgb(218, 170, 255),
+            cost: Color::Rgb(255, 196, 118),
+            tokens: Color::Rgb(155, 210, 255),
+            io: Color::Rgb(187, 162, 255),
+            cache: Color::Rgb(146, 226, 160),
+            error: Color::Rgb(255, 117, 117),
+            key_bg: Color::Rgb(156, 168, 185),
+            heat_primary_bg: [23, 30, 66, 101, 136, 172, 208],
+            heat_dim_bg: [235, 236, 237, 238, 239, 240, 241],
+        },
+        ColorTheme::Ember => Palette {
+            border: Color::Rgb(92, 70, 54),
+            text: Color::Rgb(238, 226, 211),
+            muted: Color::Rgb(160, 128, 108),
+            title: Color::Rgb(255, 184, 124),
+            accent: Color::Rgb(255, 143, 89),
+            calendar_accent: Color::Rgb(255, 205, 112),
+            cost: Color::Rgb(255, 210, 135),
+            tokens: Color::Rgb(255, 162, 117),
+            io: Color::Rgb(255, 128, 142),
+            cache: Color::Rgb(184, 221, 139),
+            error: Color::Rgb(255, 96, 96),
+            key_bg: Color::Rgb(178, 130, 94),
+            heat_primary_bg: [52, 88, 124, 160, 166, 202, 208],
+            heat_dim_bg: [235, 236, 237, 238, 239, 240, 241],
+        },
+        ColorTheme::Ocean => Palette {
+            border: Color::Rgb(48, 78, 96),
+            text: Color::Rgb(214, 234, 238),
+            muted: Color::Rgb(111, 147, 160),
+            title: Color::Rgb(139, 218, 233),
+            accent: Color::Rgb(80, 190, 220),
+            calendar_accent: Color::Rgb(144, 199, 255),
+            cost: Color::Rgb(165, 224, 220),
+            tokens: Color::Rgb(132, 211, 255),
+            io: Color::Rgb(166, 178, 255),
+            cache: Color::Rgb(128, 226, 190),
+            error: Color::Rgb(255, 107, 119),
+            key_bg: Color::Rgb(108, 157, 178),
+            heat_primary_bg: [17, 24, 31, 38, 44, 80, 116],
+            heat_dim_bg: [235, 236, 237, 238, 239, 240, 241],
+        },
+        ColorTheme::Forest => Palette {
+            border: Color::Rgb(58, 88, 67),
+            text: Color::Rgb(220, 235, 218),
+            muted: Color::Rgb(126, 154, 127),
+            title: Color::Rgb(177, 228, 156),
+            accent: Color::Rgb(108, 214, 139),
+            calendar_accent: Color::Rgb(223, 205, 120),
+            cost: Color::Rgb(231, 210, 126),
+            tokens: Color::Rgb(145, 220, 172),
+            io: Color::Rgb(156, 210, 215),
+            cache: Color::Rgb(112, 225, 136),
+            error: Color::Rgb(255, 116, 105),
+            key_bg: Color::Rgb(128, 164, 120),
+            heat_primary_bg: [22, 28, 34, 70, 76, 112, 148],
+            heat_dim_bg: [235, 236, 237, 238, 239, 240, 241],
+        },
+        ColorTheme::Graphite => Palette {
+            border: Color::Rgb(76, 80, 88),
+            text: Color::Rgb(224, 225, 228),
+            muted: Color::Rgb(132, 137, 146),
+            title: Color::Rgb(210, 215, 224),
+            accent: Color::Rgb(179, 186, 197),
+            calendar_accent: Color::Rgb(232, 214, 160),
+            cost: Color::Rgb(230, 216, 173),
+            tokens: Color::Rgb(192, 204, 220),
+            io: Color::Rgb(202, 194, 220),
+            cache: Color::Rgb(190, 214, 190),
+            error: Color::Rgb(255, 118, 118),
+            key_bg: Color::Rgb(148, 153, 162),
+            heat_primary_bg: [236, 237, 238, 239, 240, 245, 250],
+            heat_dim_bg: [232, 233, 234, 235, 236, 237, 238],
+        },
+    }
 }
 
 struct FramedGrid<'a> {
@@ -59,6 +161,7 @@ enum TabStyle {
 
 pub fn draw(frame: &mut Frame<'_>, app: &AppState) {
     let area = frame.area();
+    let palette = active_palette(app);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -68,7 +171,12 @@ pub fn draw(frame: &mut Frame<'_>, app: &AppState) {
         ])
         .split(area);
 
-    draw_tabs(frame, chunks[0], app);
+    if app.show_help {
+        draw_help(frame, area, app, palette);
+        return;
+    }
+
+    draw_tabs(frame, chunks[0], app, palette);
     match app.view {
         View::Dashboard => draw_stats_view(
             frame,
@@ -78,23 +186,151 @@ pub fn draw(frame: &mut Frame<'_>, app: &AppState) {
             app.current_stats()
                 .map(|stats| format!("{} by model", stats.mode.title()))
                 .unwrap_or_else(|| "Models".to_string()),
+            palette,
         ),
-        View::CalendarOverview => draw_calendar_overview(frame, chunks[1], app),
+        View::CalendarOverview => draw_calendar_overview(frame, chunks[1], app, palette),
         View::CalendarDetail => draw_stats_view(
             frame,
             chunks[1],
             app.selected_history_stats(),
             app.is_selected_history_loading(),
-            format!("{} by model", detail_period_label(app.calendar.selected)),
+            format!(
+                "{} by model",
+                detail_period_label(app.calendar.selected, app.config.week_start)
+            ),
+            palette,
         ),
     }
-    draw_footer(frame, chunks[2], app);
+    draw_footer(frame, chunks[2], app, palette);
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TabTarget {
     Mode(Mode),
     Calendar,
+}
+
+fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &AppState, palette: Palette) {
+    let config_path = app
+        .config
+        .config_path
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "config directory unavailable".to_string());
+    let themes = ColorTheme::ALL
+        .iter()
+        .map(|theme| theme.key())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let lines = vec![
+        Line::from(vec![Span::styled(
+            "Controls",
+            Style::default()
+                .fg(palette.title)
+                .add_modifier(Modifier::BOLD),
+        )]),
+        Line::from(""),
+        help_line(
+            "Tab / Shift+Tab",
+            "switch dashboard window or calendar scale",
+            palette,
+        ),
+        help_line("c", "open Calendar from the dashboard", palette),
+        help_line("hjkl / arrows", "move Calendar selection", palette),
+        help_line("Enter", "open selected Calendar period", palette),
+        help_line("Esc", "back one level; close help", palette),
+        help_line("r", "refresh current view", palette),
+        help_line("q", "quit", palette),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "Config",
+            Style::default()
+                .fg(palette.title)
+                .add_modifier(Modifier::BOLD),
+        )]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Edit: ", Style::default().fg(palette.muted)),
+            Span::styled(config_path, Style::default().fg(palette.text)),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            r#"daily_start = "04:00""#,
+            Style::default().fg(palette.text),
+        )),
+        Line::from(Span::styled(
+            "refresh_seconds = 60",
+            Style::default().fg(palette.text),
+        )),
+        Line::from(Span::styled(
+            r#"week_start = "monday" # monday or sunday"#,
+            Style::default().fg(palette.text),
+        )),
+        Line::from(Span::styled(
+            r#"color_theme = "aurora""#,
+            Style::default().fg(palette.text),
+        )),
+        Line::from(Span::styled(
+            r#"theme_scope = "calendar" # calendar or all"#,
+            Style::default().fg(palette.text),
+        )),
+        Line::from(Span::styled(
+            r#"scope = "all""#,
+            Style::default().fg(palette.text),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Themes: ", Style::default().fg(palette.muted)),
+            Span::styled(themes, Style::default().fg(palette.text)),
+        ]),
+        Line::from(vec![
+            Span::styled("Current: ", Style::default().fg(palette.muted)),
+            Span::styled(
+                format!(
+                    "{} / {} / week starts {}",
+                    app.config.color_theme.title(),
+                    app.config.theme_scope.title(),
+                    app.config.week_start.title()
+                ),
+                Style::default().fg(palette.text),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            key_span(" ? ", palette),
+            Span::styled(" close ", Style::default().fg(palette.muted)),
+            key_span(" Esc ", palette),
+            Span::styled(" close ", Style::default().fg(palette.muted)),
+            key_span(" q ", palette),
+            Span::styled(" quit", Style::default().fg(palette.muted)),
+        ]),
+    ];
+
+    let paragraph = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Help ")
+                .title_style(
+                    Style::default()
+                        .fg(palette.title)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .border_style(Style::default().fg(palette.border)),
+        )
+        .style(Style::default().fg(palette.text))
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(paragraph, area);
+}
+
+fn help_line(key: &'static str, description: &'static str, palette: Palette) -> Line<'static> {
+    Line::from(vec![
+        key_span(key, palette),
+        Span::styled(" ", Style::default().fg(palette.muted)),
+        Span::styled(description, Style::default().fg(palette.text)),
+    ])
 }
 
 pub fn tab_at_position(column: u16, row: u16, area: Rect) -> Option<TabTarget> {
@@ -133,12 +369,16 @@ pub fn tab_at_position(column: u16, row: u16, area: Rect) -> Option<TabTarget> {
     None
 }
 
-fn draw_tabs(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
+fn draw_tabs(frame: &mut Frame<'_>, area: Rect, app: &AppState, palette: Palette) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" expensive ")
-        .title_style(Style::default().fg(TITLE).add_modifier(Modifier::BOLD))
-        .border_style(Style::default().fg(BORDER));
+        .title_style(
+            Style::default()
+                .fg(palette.title)
+                .add_modifier(Modifier::BOLD),
+        )
+        .border_style(Style::default().fg(palette.border));
     let inner = area.inner(Margin {
         horizontal: 1,
         vertical: 1,
@@ -160,7 +400,7 @@ fn draw_tabs(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         if idx > 0 {
             spans.push(Span::raw(" "));
         }
-        spans.push(tab_span(mode.title(), mode_tab_style(app, *mode)));
+        spans.push(tab_span(mode.title(), mode_tab_style(app, *mode), palette));
     }
 
     frame.render_widget(Paragraph::new(Line::from(spans)), left_area);
@@ -172,6 +412,7 @@ fn draw_tabs(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
             } else {
                 TabStyle::Calendar
             },
+            palette,
         )))
         .alignment(Alignment::Right),
         calendar_area,
@@ -200,12 +441,14 @@ fn mode_tab_style(app: &AppState, mode: Mode) -> TabStyle {
     TabStyle::Normal
 }
 
-fn tab_span(label: &str, tab_style: TabStyle) -> Span<'static> {
+fn tab_span(label: &str, tab_style: TabStyle, palette: Palette) -> Span<'static> {
     let style = match tab_style {
-        TabStyle::Normal => Style::default().fg(MUTED),
-        TabStyle::Dashboard => Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        TabStyle::Normal => Style::default().fg(palette.muted),
+        TabStyle::Dashboard => Style::default()
+            .fg(palette.accent)
+            .add_modifier(Modifier::BOLD),
         TabStyle::Calendar => Style::default()
-            .fg(CALENDAR_ACCENT)
+            .fg(palette.calendar_accent)
             .add_modifier(Modifier::BOLD),
     };
     Span::styled(format!(" {label} "), style)
@@ -217,17 +460,18 @@ fn draw_stats_view(
     stats: Option<&UsageStats>,
     loading: bool,
     model_title: String,
+    palette: Palette,
 ) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(5), Constraint::Min(6)])
         .split(area);
 
-    draw_summary(frame, chunks[0], stats, loading);
-    draw_models(frame, chunks[1], stats, loading, &model_title);
+    draw_summary(frame, chunks[0], stats, loading, palette);
+    draw_models(frame, chunks[1], stats, loading, &model_title, palette);
 }
 
-fn draw_calendar_overview(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
+fn draw_calendar_overview(frame: &mut Frame<'_>, area: Rect, app: &AppState, palette: Palette) {
     let title = format!(
         " Calendar: {} | {} ",
         app.calendar.scale.title(),
@@ -236,8 +480,8 @@ fn draw_calendar_overview(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
-        .title_style(Style::default().fg(TITLE))
-        .border_style(Style::default().fg(BORDER));
+        .title_style(Style::default().fg(palette.title))
+        .border_style(Style::default().fg(palette.border));
     let inner = area.inner(Margin {
         horizontal: 1,
         vertical: 1,
@@ -245,25 +489,28 @@ fn draw_calendar_overview(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     frame.render_widget(block, area);
 
     match app.calendar.scale {
-        CalendarScale::Day => draw_day_calendar(frame, inner, app),
-        CalendarScale::Week => draw_period_grid(frame, inner, app, 4),
-        CalendarScale::Month => draw_period_grid(frame, inner, app, 3),
+        CalendarScale::Day => draw_day_calendar(frame, inner, app, palette),
+        CalendarScale::Week => draw_period_grid(frame, inner, app, 4, palette),
+        CalendarScale::Month => draw_period_grid(frame, inner, app, 3, palette),
     }
 }
 
-fn draw_day_calendar(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
+fn draw_day_calendar(frame: &mut Frame<'_>, area: Rect, app: &AppState, palette: Palette) {
     let selected_month = local_date(app.calendar.selected.start_millis)
         .map(|date| (date.year(), date.month()))
         .unwrap_or((0, 0));
     let max_cost = calendar_max_cost(app);
 
     if can_draw_framed_grid(area, 6, 7, 1) {
-        draw_framed_day_calendar(frame, area, app, selected_month, max_cost);
+        draw_framed_day_calendar(frame, area, app, selected_month, max_cost, palette);
         return;
     }
 
-    let headers = Row::new(["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"])
-        .style(Style::default().fg(TITLE).add_modifier(Modifier::BOLD));
+    let headers = Row::new(app.config.week_start.short_days()).style(
+        Style::default()
+            .fg(palette.title)
+            .add_modifier(Modifier::BOLD),
+    );
 
     let rows = app.calendar.visible_periods.chunks(7).map(|week| {
         Row::new(week.iter().map(|period| {
@@ -278,6 +525,7 @@ fn draw_day_calendar(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
                 max_cost,
                 app.calendar.selected == *period,
                 in_month,
+                palette,
             )
         }))
     });
@@ -300,12 +548,18 @@ fn draw_day_calendar(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     frame.render_widget(table, area);
 }
 
-fn draw_period_grid(frame: &mut Frame<'_>, area: Rect, app: &AppState, columns: usize) {
+fn draw_period_grid(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &AppState,
+    columns: usize,
+    palette: Palette,
+) {
     let row_count = app.calendar.visible_periods.len().div_ceil(columns);
     let max_cost = calendar_max_cost(app);
 
     if can_draw_framed_grid(area, row_count, columns, 0) {
-        draw_framed_period_grid(frame, area, app, columns, row_count, max_cost);
+        draw_framed_period_grid(frame, area, app, columns, row_count, max_cost, palette);
         return;
     }
 
@@ -317,11 +571,12 @@ fn draw_period_grid(frame: &mut Frame<'_>, area: Rect, app: &AppState, columns: 
             let cost = app.calendar_cost(*period);
             period_cell(
                 *period,
-                period_cell_label(*period, cost),
+                period_cell_label(*period, cost, app.config.week_start),
                 cost,
                 max_cost,
                 app.calendar.selected == *period,
                 true,
+                palette,
             )
         }))
     });
@@ -336,12 +591,18 @@ fn draw_framed_day_calendar(
     app: &AppState,
     selected_month: (i32, u32),
     max_cost: f64,
+    palette: Palette,
 ) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(0)])
         .split(area);
-    draw_day_headers(frame, chunks[0]);
+    draw_day_headers(
+        frame,
+        chunks[0],
+        app.config.week_start.short_days(),
+        palette,
+    );
     draw_framed_period_rows(
         frame,
         chunks[1],
@@ -353,6 +614,7 @@ fn draw_framed_day_calendar(
             selected: app.calendar.selected,
             max_cost,
         },
+        palette,
         |period| {
             local_date(period.start_millis)
                 .map(|date| (date.year(), date.month()) == selected_month)
@@ -369,6 +631,7 @@ fn draw_framed_period_grid(
     columns: usize,
     rows: usize,
     max_cost: f64,
+    palette: Palette,
 ) {
     draw_framed_period_rows(
         frame,
@@ -381,8 +644,9 @@ fn draw_framed_period_grid(
             selected: app.calendar.selected,
             max_cost,
         },
+        palette,
         |_| true,
-        period_framed_lines,
+        |period, cost| period_framed_lines(period, cost, app.config.week_start),
     );
 }
 
@@ -391,6 +655,7 @@ fn draw_framed_period_rows(
     area: Rect,
     app: &AppState,
     grid: FramedGrid<'_>,
+    palette: Palette,
     is_primary: impl Fn(PeriodKey) -> bool,
     lines: impl Fn(PeriodKey, Option<f64>) -> Vec<Line<'static>>,
 ) {
@@ -421,13 +686,18 @@ fn draw_framed_period_rows(
                 selected: grid.selected == period,
                 in_primary_range: is_primary(period),
             };
-            draw_framed_period_cell(frame, column_areas[column_idx], cell, lines(period, cost));
+            draw_framed_period_cell(
+                frame,
+                column_areas[column_idx],
+                cell,
+                lines(period, cost),
+                palette,
+            );
         }
     }
 }
 
-fn draw_day_headers(frame: &mut Frame<'_>, area: Rect) {
-    let headers = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+fn draw_day_headers(frame: &mut Frame<'_>, area: Rect, headers: [&str; 7], palette: Palette) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints(even_constraints(headers.len()))
@@ -436,7 +706,11 @@ fn draw_day_headers(frame: &mut Frame<'_>, area: Rect) {
     for (idx, header) in headers.iter().enumerate() {
         frame.render_widget(
             Paragraph::new(*header)
-                .style(Style::default().fg(TITLE).add_modifier(Modifier::BOLD))
+                .style(
+                    Style::default()
+                        .fg(palette.title)
+                        .add_modifier(Modifier::BOLD),
+                )
                 .alignment(Alignment::Center),
             chunks[idx],
         );
@@ -448,6 +722,7 @@ fn draw_framed_period_cell(
     area: Rect,
     cell: FramedCell,
     lines: Vec<Line<'static>>,
+    palette: Palette,
 ) {
     let style = period_style(
         cell.period,
@@ -455,6 +730,7 @@ fn draw_framed_period_cell(
         cell.max_cost,
         cell.selected,
         cell.in_primary_range,
+        palette,
     );
     let block = Block::default()
         .borders(Borders::ALL)
@@ -462,6 +738,7 @@ fn draw_framed_period_cell(
             style,
             cell.selected,
             cell.in_primary_range,
+            palette,
         ))
         .style(style);
     let paragraph = Paragraph::new(lines)
@@ -484,13 +761,18 @@ fn even_constraints(count: usize) -> Vec<Constraint> {
         .collect()
 }
 
-fn period_border_style(style: Style, selected: bool, in_primary_range: bool) -> Style {
+fn period_border_style(
+    style: Style,
+    selected: bool,
+    in_primary_range: bool,
+    palette: Palette,
+) -> Style {
     let color = if selected {
         Color::Black
     } else if in_primary_range {
-        BORDER
+        palette.border
     } else {
-        MUTED
+        palette.muted
     };
     let mut border = Style::default().fg(color);
     if let Some(bg) = style.bg {
@@ -506,9 +788,13 @@ fn day_framed_lines(period: PeriodKey, cost: Option<f64>) -> Vec<Line<'static>> 
     vec![Line::from(day), Line::from(cost_label(cost))]
 }
 
-fn period_framed_lines(period: PeriodKey, cost: Option<f64>) -> Vec<Line<'static>> {
+fn period_framed_lines(
+    period: PeriodKey,
+    cost: Option<f64>,
+    week_start: time_window::WeekStart,
+) -> Vec<Line<'static>> {
     vec![
-        Line::from(compact_period_label(period)),
+        Line::from(compact_period_label(period, week_start)),
         Line::from(cost_label(cost)),
     ]
 }
@@ -520,6 +806,7 @@ fn period_cell(
     max_cost: f64,
     selected: bool,
     in_primary_range: bool,
+    palette: Palette,
 ) -> Cell<'static> {
     Cell::from(label).style(period_style(
         period,
@@ -527,6 +814,7 @@ fn period_cell(
         max_cost,
         selected,
         in_primary_range,
+        palette,
     ))
 }
 
@@ -536,22 +824,23 @@ fn period_style(
     max_cost: f64,
     selected: bool,
     in_primary_range: bool,
+    palette: Palette,
 ) -> Style {
     if selected {
         return Style::default()
             .fg(Color::Black)
-            .bg(CALENDAR_ACCENT)
+            .bg(palette.calendar_accent)
             .add_modifier(Modifier::BOLD);
     }
 
     let base = if in_primary_range {
         Style::default().fg(match period.scale {
-            CalendarScale::Day => TEXT,
-            CalendarScale::Week => TOKENS,
-            CalendarScale::Month => COST,
+            CalendarScale::Day => palette.text,
+            CalendarScale::Week => palette.tokens,
+            CalendarScale::Month => palette.cost,
         })
     } else {
-        Style::default().fg(MUTED)
+        Style::default().fg(palette.muted)
     };
 
     let Some(cost) = cost else {
@@ -567,9 +856,10 @@ fn period_style(
         } else {
             Color::Indexed(230)
         };
-        base.fg(fg).bg(Color::Indexed(HEAT_PRIMARY_BG[bucket]))
+        base.fg(fg)
+            .bg(Color::Indexed(palette.heat_primary_bg[bucket]))
     } else {
-        base.bg(Color::Indexed(HEAT_DIM_BG[bucket]))
+        base.bg(Color::Indexed(palette.heat_dim_bg[bucket]))
     }
 }
 
@@ -587,10 +877,7 @@ fn heat_bucket(cost: f64, max_cost: f64) -> Option<usize> {
     }
 
     let ratio = (cost / max_cost).clamp(0.0, 1.0).sqrt();
-    Some(
-        ((ratio * (HEAT_PRIMARY_BG.len() - 1) as f64).round() as usize)
-            .clamp(0, HEAT_PRIMARY_BG.len() - 1),
-    )
+    Some(((ratio * 6.0).round() as usize).clamp(0, 6))
 }
 
 fn day_cell_label(period: PeriodKey, cost: Option<f64>) -> String {
@@ -600,8 +887,16 @@ fn day_cell_label(period: PeriodKey, cost: Option<f64>) -> String {
     format!("{day:>2} {}", cost_label(cost))
 }
 
-fn period_cell_label(period: PeriodKey, cost: Option<f64>) -> String {
-    format!("{} {}", compact_period_label(period), cost_label(cost))
+fn period_cell_label(
+    period: PeriodKey,
+    cost: Option<f64>,
+    week_start: time_window::WeekStart,
+) -> String {
+    format!(
+        "{} {}",
+        compact_period_label(period, week_start),
+        cost_label(cost)
+    )
 }
 
 fn cost_label(cost: Option<f64>) -> String {
@@ -620,19 +915,23 @@ fn overview_title(scale: CalendarScale, selected: PeriodKey) -> String {
     }
 }
 
-fn compact_period_label(period: PeriodKey) -> String {
+fn compact_period_label(period: PeriodKey, week_start: time_window::WeekStart) -> String {
     let Some(start) = local_date(period.start_millis) else {
         return "period".to_string();
     };
 
     match period.scale {
         CalendarScale::Day => format!("{} {}", start.format("%b"), start.day()),
-        CalendarScale::Week => format!("W{} {}", start.iso_week().week(), start.format("%b %d")),
+        CalendarScale::Week => format!(
+            "W{} {}",
+            time_window::week_number(start, week_start),
+            start.format("%b %d")
+        ),
         CalendarScale::Month => start.format("%b").to_string(),
     }
 }
 
-fn detail_period_label(period: PeriodKey) -> String {
+fn detail_period_label(period: PeriodKey, week_start: time_window::WeekStart) -> String {
     let Some(start) = local_date(period.start_millis) else {
         return period.scale.title().to_string();
     };
@@ -646,7 +945,7 @@ fn detail_period_label(period: PeriodKey) -> String {
                 .unwrap_or_else(|| "next week".to_string());
             format!(
                 "Week {}: {} {} - {end_label}",
-                start.iso_week().week(),
+                time_window::week_number(start, week_start),
                 start.format("%b"),
                 start.day()
             )
@@ -659,7 +958,13 @@ fn local_date(millis: i64) -> Option<DateTime<Local>> {
     DateTime::from_timestamp_millis(millis).map(|value| value.with_timezone(&Local))
 }
 
-fn draw_summary(frame: &mut Frame<'_>, area: Rect, stats: Option<&UsageStats>, loading: bool) {
+fn draw_summary(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    stats: Option<&UsageStats>,
+    loading: bool,
+    palette: Palette,
+) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -709,9 +1014,10 @@ fn draw_summary(frame: &mut Frame<'_>, area: Rect, stats: Option<&UsageStats>, l
         &cost,
         &messages,
         MetricStyle {
-            value: COST,
-            label: MUTED,
+            value: palette.cost,
+            label: palette.muted,
         },
+        palette,
     );
     draw_metric(
         frame,
@@ -720,9 +1026,10 @@ fn draw_summary(frame: &mut Frame<'_>, area: Rect, stats: Option<&UsageStats>, l
         &total_tokens,
         &token_sub,
         MetricStyle {
-            value: TOKENS,
-            label: MUTED,
+            value: palette.tokens,
+            label: palette.muted,
         },
+        palette,
     );
     draw_metric(
         frame,
@@ -731,9 +1038,10 @@ fn draw_summary(frame: &mut Frame<'_>, area: Rect, stats: Option<&UsageStats>, l
         &input_output,
         &io_sub,
         MetricStyle {
-            value: IO,
-            label: MUTED,
+            value: palette.io,
+            label: palette.muted,
         },
+        palette,
     );
     draw_metric(
         frame,
@@ -742,9 +1050,10 @@ fn draw_summary(frame: &mut Frame<'_>, area: Rect, stats: Option<&UsageStats>, l
         &cache,
         &cache_sub,
         MetricStyle {
-            value: CACHE,
-            label: MUTED,
+            value: palette.cache,
+            label: palette.muted,
         },
+        palette,
     );
 }
 
@@ -763,6 +1072,7 @@ fn draw_metric(
     value: &str,
     sub: &str,
     style: MetricStyle,
+    palette: Palette,
 ) {
     let paragraph = Paragraph::new(vec![
         Line::from(Span::styled(
@@ -781,7 +1091,7 @@ fn draw_metric(
             .borders(Borders::ALL)
             .title(format!(" {title} "))
             .title_style(Style::default().fg(style.value))
-            .border_style(Style::default().fg(BORDER)),
+            .border_style(Style::default().fg(palette.border)),
     )
     .alignment(Alignment::Center);
 
@@ -794,6 +1104,7 @@ fn draw_models(
     stats: Option<&UsageStats>,
     loading: bool,
     title: &str,
+    palette: Palette,
 ) {
     let Some(stats) = stats else {
         let message = if loading {
@@ -806,28 +1117,38 @@ fn draw_models(
                 Block::default()
                     .borders(Borders::ALL)
                     .title(format!(" {title} "))
-                    .title_style(Style::default().fg(TITLE))
-                    .border_style(Style::default().fg(BORDER)),
+                    .title_style(Style::default().fg(palette.title))
+                    .border_style(Style::default().fg(palette.border)),
             )
-            .style(Style::default().fg(if loading { TOKENS } else { MUTED }))
+            .style(Style::default().fg(if loading {
+                palette.tokens
+            } else {
+                palette.muted
+            }))
             .alignment(Alignment::Center);
         frame.render_widget(paragraph, area);
         return;
     };
 
     if area.width >= 112 {
-        draw_wide_models(frame, area, stats, title);
+        draw_wide_models(frame, area, stats, title, palette);
     } else {
-        draw_compact_models(frame, area, stats, title);
+        draw_compact_models(frame, area, stats, title, palette);
     }
 }
 
-fn draw_wide_models(frame: &mut Frame<'_>, area: Rect, stats: &UsageStats, title: &str) {
+fn draw_wide_models(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    stats: &UsageStats,
+    title: &str,
+    palette: Palette,
+) {
     let max_cost = stats.models.first().map(model_cost).unwrap_or(0.0);
     let rows = stats
         .models
         .iter()
-        .map(|model| wide_row(model, &stats.totals, max_cost));
+        .map(|model| wide_row(model, &stats.totals, max_cost, palette));
 
     let header = Row::new([
         Cell::from("Model"),
@@ -840,7 +1161,11 @@ fn draw_wide_models(frame: &mut Frame<'_>, area: Rect, stats: &UsageStats, title
         Cell::from("Write"),
         Cell::from("Cost %"),
     ])
-    .style(Style::default().fg(TITLE).add_modifier(Modifier::BOLD));
+    .style(
+        Style::default()
+            .fg(palette.title)
+            .add_modifier(Modifier::BOLD),
+    );
 
     let table = Table::new(
         rows,
@@ -861,20 +1186,26 @@ fn draw_wide_models(frame: &mut Frame<'_>, area: Rect, stats: &UsageStats, title
         Block::default()
             .borders(Borders::ALL)
             .title(format!(" {title} "))
-            .title_style(Style::default().fg(TITLE))
-            .border_style(Style::default().fg(BORDER)),
+            .title_style(Style::default().fg(palette.title))
+            .border_style(Style::default().fg(palette.border)),
     )
     .column_spacing(1);
 
     frame.render_widget(table, area);
 }
 
-fn draw_compact_models(frame: &mut Frame<'_>, area: Rect, stats: &UsageStats, title: &str) {
+fn draw_compact_models(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    stats: &UsageStats,
+    title: &str,
+    palette: Palette,
+) {
     let max_cost = stats.models.first().map(model_cost).unwrap_or(0.0);
     let rows = stats
         .models
         .iter()
-        .map(|model| compact_row(model, &stats.totals, max_cost));
+        .map(|model| compact_row(model, &stats.totals, max_cost, palette));
 
     let header = Row::new([
         Cell::from("Model"),
@@ -883,7 +1214,11 @@ fn draw_compact_models(frame: &mut Frame<'_>, area: Rect, stats: &UsageStats, ti
         Cell::from("Tokens"),
         Cell::from("Cost %"),
     ])
-    .style(Style::default().fg(TITLE).add_modifier(Modifier::BOLD));
+    .style(
+        Style::default()
+            .fg(palette.title)
+            .add_modifier(Modifier::BOLD),
+    );
 
     let table = Table::new(
         rows,
@@ -900,46 +1235,72 @@ fn draw_compact_models(frame: &mut Frame<'_>, area: Rect, stats: &UsageStats, ti
         Block::default()
             .borders(Borders::ALL)
             .title(format!(" {title} "))
-            .title_style(Style::default().fg(TITLE))
-            .border_style(Style::default().fg(BORDER)),
+            .title_style(Style::default().fg(palette.title))
+            .border_style(Style::default().fg(palette.border)),
     )
     .column_spacing(1);
 
     frame.render_widget(table, area);
 }
 
-fn wide_row(model: &ModelUsage, totals: &UsageTotals, max_cost: f64) -> Row<'static> {
+fn wide_row(
+    model: &ModelUsage,
+    totals: &UsageTotals,
+    max_cost: f64,
+    palette: Palette,
+) -> Row<'static> {
     Row::new([
-        styled_cell(model.display_name.clone(), ACCENT, true),
-        styled_cell(format::integer(model.totals.messages), MUTED, false),
-        styled_cell(format::precise_cost(model.totals.cost), COST, true),
-        styled_cell(format::tokens(model.totals.total_tokens()), TOKENS, true),
-        styled_cell(format::tokens(model.totals.input), IO, false),
-        styled_cell(format::tokens(model.totals.output), IO, false),
-        styled_cell(format::tokens(model.totals.cache_read), CACHE, false),
-        styled_cell(format::tokens(model.totals.cache_write), CACHE, false),
+        styled_cell(model.display_name.clone(), palette.accent, true),
+        styled_cell(format::integer(model.totals.messages), palette.muted, false),
+        styled_cell(format::precise_cost(model.totals.cost), palette.cost, true),
+        styled_cell(
+            format::tokens(model.totals.total_tokens()),
+            palette.tokens,
+            true,
+        ),
+        styled_cell(format::tokens(model.totals.input), palette.io, false),
+        styled_cell(format::tokens(model.totals.output), palette.io, false),
+        styled_cell(
+            format::tokens(model.totals.cache_read),
+            palette.cache,
+            false,
+        ),
+        styled_cell(
+            format::tokens(model.totals.cache_write),
+            palette.cache,
+            false,
+        ),
         styled_cell(
             share_cell(model.totals.cost, totals.cost, max_cost),
-            COST,
+            palette.cost,
             false,
         ),
     ])
-    .style(Style::default().fg(TEXT))
+    .style(Style::default().fg(palette.text))
 }
 
-fn compact_row(model: &ModelUsage, totals: &UsageTotals, max_cost: f64) -> Row<'static> {
+fn compact_row(
+    model: &ModelUsage,
+    totals: &UsageTotals,
+    max_cost: f64,
+    palette: Palette,
+) -> Row<'static> {
     Row::new([
-        styled_cell(model.display_name.clone(), ACCENT, true),
-        styled_cell(format::integer(model.totals.messages), MUTED, false),
-        styled_cell(format::precise_cost(model.totals.cost), COST, true),
-        styled_cell(format::tokens(model.totals.total_tokens()), TOKENS, true),
+        styled_cell(model.display_name.clone(), palette.accent, true),
+        styled_cell(format::integer(model.totals.messages), palette.muted, false),
+        styled_cell(format::precise_cost(model.totals.cost), palette.cost, true),
+        styled_cell(
+            format::tokens(model.totals.total_tokens()),
+            palette.tokens,
+            true,
+        ),
         styled_cell(
             share_cell(model.totals.cost, totals.cost, max_cost),
-            COST,
+            palette.cost,
             false,
         ),
     ])
-    .style(Style::default().fg(TEXT))
+    .style(Style::default().fg(palette.text))
 }
 
 fn styled_cell(value: String, color: Color, bold: bool) -> Cell<'static> {
@@ -970,62 +1331,71 @@ fn model_cost(model: &ModelUsage) -> f64 {
     model.totals.cost
 }
 
-fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
+fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &AppState, palette: Palette) {
     let (mut spans, status, status_color) = match app.view {
         View::Dashboard => (
             vec![
-                key_span(" Tab "),
-                Span::styled(" mode ", Style::default().fg(MUTED)),
-                key_span(" S-Tab "),
-                Span::styled(" back ", Style::default().fg(MUTED)),
-                key_span(" c "),
-                Span::styled(" calendar ", Style::default().fg(MUTED)),
-                key_span(" r "),
-                Span::styled(" refresh ", Style::default().fg(MUTED)),
-                key_span(" q "),
-                Span::styled(" quit | ", Style::default().fg(MUTED)),
+                key_span(" Tab ", palette),
+                Span::styled(" mode ", Style::default().fg(palette.muted)),
+                key_span(" S-Tab ", palette),
+                Span::styled(" back ", Style::default().fg(palette.muted)),
+                key_span(" c ", palette),
+                Span::styled(" calendar ", Style::default().fg(palette.muted)),
+                key_span(" ? ", palette),
+                Span::styled(" help ", Style::default().fg(palette.muted)),
+                key_span(" r ", palette),
+                Span::styled(" refresh ", Style::default().fg(palette.muted)),
+                key_span(" q ", palette),
+                Span::styled(" quit | ", Style::default().fg(palette.muted)),
             ],
             dashboard_status(app),
-            dashboard_status_color(app),
+            dashboard_status_color(app, palette),
         ),
         View::CalendarOverview => (
             vec![
-                key_span(" Tab "),
-                Span::styled(" scale ", Style::default().fg(MUTED)),
-                key_span(" hjkl "),
-                Span::styled(" move ", Style::default().fg(MUTED)),
-                key_span(" Enter "),
-                Span::styled(" open ", Style::default().fg(MUTED)),
-                key_span(" Esc "),
-                Span::styled(" back ", Style::default().fg(MUTED)),
-                key_span(" q "),
-                Span::styled(" quit | ", Style::default().fg(MUTED)),
+                key_span(" Tab ", palette),
+                Span::styled(" scale ", Style::default().fg(palette.muted)),
+                key_span(" hjkl ", palette),
+                Span::styled(" move ", Style::default().fg(palette.muted)),
+                key_span(" Enter ", palette),
+                Span::styled(" open ", Style::default().fg(palette.muted)),
+                key_span(" ? ", palette),
+                Span::styled(" help ", Style::default().fg(palette.muted)),
+                key_span(" Esc ", palette),
+                Span::styled(" back ", Style::default().fg(palette.muted)),
+                key_span(" q ", palette),
+                Span::styled(" quit | ", Style::default().fg(palette.muted)),
             ],
             calendar_status(app),
-            calendar_status_color(app),
+            calendar_status_color(app, palette),
         ),
         View::CalendarDetail => (
             vec![
-                key_span(" h/k "),
-                Span::styled(" prev ", Style::default().fg(MUTED)),
-                key_span(" j/l "),
-                Span::styled(" next ", Style::default().fg(MUTED)),
-                key_span(" Tab "),
-                Span::styled(" scale ", Style::default().fg(MUTED)),
-                key_span(" Esc "),
-                Span::styled(" back ", Style::default().fg(MUTED)),
-                key_span(" q "),
-                Span::styled(" quit | ", Style::default().fg(MUTED)),
+                key_span(" h/k ", palette),
+                Span::styled(" prev ", Style::default().fg(palette.muted)),
+                key_span(" j/l ", palette),
+                Span::styled(" next ", Style::default().fg(palette.muted)),
+                key_span(" Tab ", palette),
+                Span::styled(" scale ", Style::default().fg(palette.muted)),
+                key_span(" ? ", palette),
+                Span::styled(" help ", Style::default().fg(palette.muted)),
+                key_span(" Esc ", palette),
+                Span::styled(" back ", Style::default().fg(palette.muted)),
+                key_span(" q ", palette),
+                Span::styled(" quit | ", Style::default().fg(palette.muted)),
             ],
             history_status(app),
-            history_status_color(app),
+            history_status_color(app, palette),
         ),
     };
     spans.push(Span::styled(status, Style::default().fg(status_color)));
 
     let text = Line::from(spans);
 
-    frame.render_widget(Paragraph::new(text).style(Style::default().fg(MUTED)), area);
+    frame.render_widget(
+        Paragraph::new(text).style(Style::default().fg(palette.muted)),
+        area,
+    );
 }
 
 fn dashboard_status(app: &AppState) -> String {
@@ -1041,13 +1411,13 @@ fn dashboard_status(app: &AppState) -> String {
     }
 }
 
-fn dashboard_status_color(app: &AppState) -> Color {
+fn dashboard_status_color(app: &AppState, palette: Palette) -> Color {
     if app.error.is_some() {
-        ERROR
+        palette.error
     } else if app.is_current_loading() {
-        TOKENS
+        palette.tokens
     } else {
-        MUTED
+        palette.muted
     }
 }
 
@@ -1057,17 +1427,20 @@ fn calendar_status(app: &AppState) -> String {
     } else if app.calendar_loading {
         "loading calendar".to_string()
     } else {
-        format!("selected {}", detail_period_label(app.calendar.selected))
+        format!(
+            "selected {}",
+            detail_period_label(app.calendar.selected, app.config.week_start)
+        )
     }
 }
 
-fn calendar_status_color(app: &AppState) -> Color {
+fn calendar_status_color(app: &AppState, palette: Palette) -> Color {
     if app.error.is_some() {
-        ERROR
+        palette.error
     } else if app.calendar_loading {
-        TOKENS
+        palette.tokens
     } else {
-        MUTED
+        palette.muted
     }
 }
 
@@ -1084,23 +1457,18 @@ fn history_status(app: &AppState) -> String {
     }
 }
 
-fn history_status_color(app: &AppState) -> Color {
+fn history_status_color(app: &AppState, palette: Palette) -> Color {
     if app.error.is_some() {
-        ERROR
+        palette.error
     } else if app.is_selected_history_loading() {
-        TOKENS
+        palette.tokens
     } else {
-        MUTED
+        palette.muted
     }
 }
 
-fn key_span(label: &'static str) -> Span<'static> {
-    Span::styled(
-        label,
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::Rgb(156, 168, 185)),
-    )
+fn key_span(label: &'static str, palette: Palette) -> Span<'static> {
+    Span::styled(label, Style::default().fg(Color::Black).bg(palette.key_bg))
 }
 
 fn cutoff_label(stats: &UsageStats) -> String {
@@ -1145,8 +1513,8 @@ mod tests {
     use super::*;
     use crate::{
         app::CalendarState,
-        config::{Config, Scope},
-        time_window::{self, DailyStart},
+        config::{ColorTheme, Config, Scope, ThemeScope},
+        time_window::{self, DailyStart, WeekStart},
     };
 
     #[test]
@@ -1201,16 +1569,17 @@ mod tests {
             start_millis: 1000,
             end_millis: 2000,
         };
+        let palette = palette_for(ColorTheme::Aurora);
 
         assert_eq!(heat_bucket(0.0, 10.0), None);
-        assert_eq!(heat_bucket(10.0, 10.0), Some(HEAT_PRIMARY_BG.len() - 1));
+        assert_eq!(heat_bucket(10.0, 10.0), Some(6));
 
-        let style = period_style(period, Some(2.5), 10.0, false, true);
+        let style = period_style(period, Some(2.5), 10.0, false, true, palette);
         assert!(matches!(style.bg, Some(Color::Indexed(_))));
 
-        let dimmed = period_style(period, Some(2.5), 10.0, false, false);
+        let dimmed = period_style(period, Some(2.5), 10.0, false, false, palette);
         assert!(matches!(dimmed.bg, Some(Color::Indexed(_))));
-        assert_eq!(dimmed.fg, Some(MUTED));
+        assert_eq!(dimmed.fg, Some(palette.muted));
     }
 
     #[test]
@@ -1288,6 +1657,7 @@ mod tests {
             CalendarScale::Day,
             Local.with_ymd_and_hms(2026, 6, 15, 10, 0, 0).unwrap(),
             DailyStart::default(),
+            WeekStart::default(),
         )
         .unwrap();
         let mut app = app_with_calendar(selected);
@@ -1308,6 +1678,7 @@ mod tests {
             CalendarScale::Day,
             Local.with_ymd_and_hms(2026, 6, 15, 10, 0, 0).unwrap(),
             DailyStart::default(),
+            WeekStart::default(),
         )
         .unwrap();
         let mut app = app_with_calendar(selected);
@@ -1325,6 +1696,7 @@ mod tests {
             CalendarScale::Week,
             Local.with_ymd_and_hms(2026, 6, 18, 10, 0, 0).unwrap(),
             DailyStart::default(),
+            WeekStart::default(),
         )
         .unwrap();
         let mut app = app_with_calendar(selected);
@@ -1343,6 +1715,7 @@ mod tests {
             CalendarScale::Day,
             Local.with_ymd_and_hms(2026, 6, 15, 10, 0, 0).unwrap(),
             DailyStart::default(),
+            WeekStart::default(),
         )
         .unwrap();
         let mut stats = sample_stats(Mode::Daily, Some(selected.start_millis));
@@ -1356,6 +1729,21 @@ mod tests {
         assert!(output.contains("Jun 15 by model"));
         assert!(output.contains("$3.75"));
         assert!(output.contains("Jun 15 04:00 - Jun 16 04:00"));
+    }
+
+    #[test]
+    fn renders_help_with_config_options() {
+        let mut app = app_loading(Mode::Daily);
+        app.show_help = true;
+
+        let output = render(&app, 120, 32);
+
+        assert!(output.contains("Help"));
+        assert!(output.contains("Config"));
+        assert!(output.contains("week_start"));
+        assert!(output.contains("color_theme"));
+        assert!(output.contains("theme_scope"));
+        assert!(output.contains("/tmp/expensive/config.toml"));
     }
 
     fn render(app: &AppState, width: u16, height: u16) -> String {
@@ -1383,6 +1771,7 @@ mod tests {
         AppState {
             config: test_config(),
             view: View::Dashboard,
+            show_help: false,
             mode,
             stats: stats_by_mode,
             loading: HashSet::new(),
@@ -1401,6 +1790,7 @@ mod tests {
         AppState {
             config: test_config(),
             view: View::Dashboard,
+            show_help: false,
             mode,
             stats: HashMap::new(),
             loading: HashSet::from([mode]),
@@ -1419,14 +1809,19 @@ mod tests {
         AppState {
             config: test_config(),
             view: View::CalendarOverview,
+            show_help: false,
             mode: Mode::Daily,
             stats: HashMap::new(),
             loading: HashSet::new(),
             calendar: CalendarState {
                 scale: selected.scale,
                 selected,
-                visible_periods: time_window::visible_periods(selected, DailyStart::default())
-                    .unwrap(),
+                visible_periods: time_window::visible_periods(
+                    selected,
+                    DailyStart::default(),
+                    WeekStart::default(),
+                )
+                .unwrap(),
             },
             calendar_costs: HashMap::new(),
             calendar_loading: false,
@@ -1443,23 +1838,33 @@ mod tests {
             CalendarScale::Day,
             Local.with_ymd_and_hms(2026, 6, 15, 10, 0, 0).unwrap(),
             DailyStart::default(),
+            WeekStart::default(),
         )
         .unwrap();
 
         CalendarState {
             scale: CalendarScale::Day,
             selected,
-            visible_periods: time_window::visible_periods(selected, DailyStart::default()).unwrap(),
+            visible_periods: time_window::visible_periods(
+                selected,
+                DailyStart::default(),
+                WeekStart::default(),
+            )
+            .unwrap(),
         }
     }
 
     fn test_config() -> Config {
         Config {
             db_path: PathBuf::from("/tmp/opencode.db"),
+            config_path: Some(PathBuf::from("/tmp/expensive/config.toml")),
             daily_start: DailyStart::default(),
+            week_start: WeekStart::default(),
             refresh_interval: Duration::from_secs(60),
             auto_refresh: true,
             scope: Scope::All,
+            color_theme: ColorTheme::Aurora,
+            theme_scope: ThemeScope::Calendar,
         }
     }
 
