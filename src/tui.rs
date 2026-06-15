@@ -14,6 +14,23 @@ use crate::{
     time_window::Mode,
 };
 
+const BORDER: Color = Color::Rgb(64, 74, 92);
+const TEXT: Color = Color::Rgb(220, 226, 235);
+const MUTED: Color = Color::Rgb(119, 133, 154);
+const TITLE: Color = Color::Rgb(170, 220, 255);
+const ACCENT: Color = Color::Rgb(80, 210, 190);
+const COST: Color = Color::Rgb(255, 196, 118);
+const TOKENS: Color = Color::Rgb(155, 210, 255);
+const IO: Color = Color::Rgb(187, 162, 255);
+const CACHE: Color = Color::Rgb(146, 226, 160);
+const ERROR: Color = Color::Rgb(255, 117, 117);
+
+#[derive(Clone, Copy)]
+struct MetricStyle {
+    value: Color,
+    label: Color,
+}
+
 pub fn draw(frame: &mut Frame<'_>, app: &AppState) {
     let area = frame.area();
     let chunks = Layout::default()
@@ -53,15 +70,12 @@ fn draw_tabs(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
             Block::default()
                 .borders(Borders::ALL)
                 .title(" expensive ")
-                .border_style(Style::default().fg(Color::DarkGray)),
+                .title_style(Style::default().fg(TITLE).add_modifier(Modifier::BOLD))
+                .border_style(Style::default().fg(BORDER)),
         )
         .select(app.mode.index())
-        .style(Style::default().fg(Color::Gray))
-        .highlight_style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )
+        .style(Style::default().fg(MUTED))
+        .highlight_style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
         .divider(" ");
 
     frame.render_widget(tabs, area);
@@ -110,10 +124,50 @@ fn draw_summary(frame: &mut Frame<'_>, area: Rect, stats: Option<&UsageStats>, l
         .unwrap_or_else(|| "--".to_string());
     let cache_sub = metric_sub("read / write", loading);
 
-    draw_metric(frame, chunks[0], "Cost", &cost, &messages);
-    draw_metric(frame, chunks[1], "Total Tokens", &total_tokens, &token_sub);
-    draw_metric(frame, chunks[2], "Input / Output", &input_output, &io_sub);
-    draw_metric(frame, chunks[3], "Cache", &cache, &cache_sub);
+    draw_metric(
+        frame,
+        chunks[0],
+        "Cost",
+        &cost,
+        &messages,
+        MetricStyle {
+            value: COST,
+            label: MUTED,
+        },
+    );
+    draw_metric(
+        frame,
+        chunks[1],
+        "Total Tokens",
+        &total_tokens,
+        &token_sub,
+        MetricStyle {
+            value: TOKENS,
+            label: MUTED,
+        },
+    );
+    draw_metric(
+        frame,
+        chunks[2],
+        "Input / Output",
+        &input_output,
+        &io_sub,
+        MetricStyle {
+            value: IO,
+            label: MUTED,
+        },
+    );
+    draw_metric(
+        frame,
+        chunks[3],
+        "Cache",
+        &cache,
+        &cache_sub,
+        MetricStyle {
+            value: CACHE,
+            label: MUTED,
+        },
+    );
 }
 
 fn metric_sub(label: &str, loading: bool) -> String {
@@ -124,24 +178,32 @@ fn metric_sub(label: &str, loading: bool) -> String {
     }
 }
 
-fn draw_metric(frame: &mut Frame<'_>, area: Rect, title: &str, value: &str, sub: &str) {
+fn draw_metric(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    title: &str,
+    value: &str,
+    sub: &str,
+    style: MetricStyle,
+) {
     let paragraph = Paragraph::new(vec![
         Line::from(Span::styled(
             value.to_string(),
             Style::default()
-                .fg(Color::White)
+                .fg(style.value)
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
             sub.to_string(),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(style.label),
         )),
     ])
     .block(
         Block::default()
             .borders(Borders::ALL)
             .title(format!(" {title} "))
-            .border_style(Style::default().fg(Color::DarkGray)),
+            .title_style(Style::default().fg(style.value))
+            .border_style(Style::default().fg(BORDER)),
     )
     .alignment(Alignment::Center);
 
@@ -160,8 +222,10 @@ fn draw_models(frame: &mut Frame<'_>, area: Rect, stats: Option<&UsageStats>, lo
                 Block::default()
                     .borders(Borders::ALL)
                     .title(" Models ")
-                    .border_style(Style::default().fg(Color::DarkGray)),
+                    .title_style(Style::default().fg(TITLE))
+                    .border_style(Style::default().fg(BORDER)),
             )
+            .style(Style::default().fg(if loading { TOKENS } else { MUTED }))
             .alignment(Alignment::Center);
         frame.render_widget(paragraph, area);
         return;
@@ -192,11 +256,7 @@ fn draw_wide_models(frame: &mut Frame<'_>, area: Rect, stats: &UsageStats) {
         Cell::from("Write"),
         Cell::from("Cost %"),
     ])
-    .style(
-        Style::default()
-            .fg(Color::Gray)
-            .add_modifier(Modifier::BOLD),
-    );
+    .style(Style::default().fg(TITLE).add_modifier(Modifier::BOLD));
 
     let table = Table::new(
         rows,
@@ -217,7 +277,8 @@ fn draw_wide_models(frame: &mut Frame<'_>, area: Rect, stats: &UsageStats) {
         Block::default()
             .borders(Borders::ALL)
             .title(format!(" {} by model ", stats.mode.title()))
-            .border_style(Style::default().fg(Color::DarkGray)),
+            .title_style(Style::default().fg(TITLE))
+            .border_style(Style::default().fg(BORDER)),
     )
     .column_spacing(1);
 
@@ -238,11 +299,7 @@ fn draw_compact_models(frame: &mut Frame<'_>, area: Rect, stats: &UsageStats) {
         Cell::from("Tokens"),
         Cell::from("Cost %"),
     ])
-    .style(
-        Style::default()
-            .fg(Color::Gray)
-            .add_modifier(Modifier::BOLD),
-    );
+    .style(Style::default().fg(TITLE).add_modifier(Modifier::BOLD));
 
     let table = Table::new(
         rows,
@@ -259,7 +316,8 @@ fn draw_compact_models(frame: &mut Frame<'_>, area: Rect, stats: &UsageStats) {
         Block::default()
             .borders(Borders::ALL)
             .title(format!(" {} by model ", stats.mode.title()))
-            .border_style(Style::default().fg(Color::DarkGray)),
+            .title_style(Style::default().fg(TITLE))
+            .border_style(Style::default().fg(BORDER)),
     )
     .column_spacing(1);
 
@@ -268,28 +326,44 @@ fn draw_compact_models(frame: &mut Frame<'_>, area: Rect, stats: &UsageStats) {
 
 fn wide_row(model: &ModelUsage, totals: &UsageTotals, max_cost: f64) -> Row<'static> {
     Row::new([
-        Cell::from(model.display_name.clone()),
-        Cell::from(format::integer(model.totals.messages)),
-        Cell::from(format::precise_cost(model.totals.cost)),
-        Cell::from(format::tokens(model.totals.total_tokens())),
-        Cell::from(format::tokens(model.totals.input)),
-        Cell::from(format::tokens(model.totals.output)),
-        Cell::from(format::tokens(model.totals.cache_read)),
-        Cell::from(format::tokens(model.totals.cache_write)),
-        Cell::from(share_cell(model.totals.cost, totals.cost, max_cost)),
+        styled_cell(model.display_name.clone(), ACCENT, true),
+        styled_cell(format::integer(model.totals.messages), MUTED, false),
+        styled_cell(format::precise_cost(model.totals.cost), COST, true),
+        styled_cell(format::tokens(model.totals.total_tokens()), TOKENS, true),
+        styled_cell(format::tokens(model.totals.input), IO, false),
+        styled_cell(format::tokens(model.totals.output), IO, false),
+        styled_cell(format::tokens(model.totals.cache_read), CACHE, false),
+        styled_cell(format::tokens(model.totals.cache_write), CACHE, false),
+        styled_cell(
+            share_cell(model.totals.cost, totals.cost, max_cost),
+            COST,
+            false,
+        ),
     ])
-    .style(Style::default().fg(Color::White))
+    .style(Style::default().fg(TEXT))
 }
 
 fn compact_row(model: &ModelUsage, totals: &UsageTotals, max_cost: f64) -> Row<'static> {
     Row::new([
-        Cell::from(model.display_name.clone()),
-        Cell::from(format::integer(model.totals.messages)),
-        Cell::from(format::precise_cost(model.totals.cost)),
-        Cell::from(format::tokens(model.totals.total_tokens())),
-        Cell::from(share_cell(model.totals.cost, totals.cost, max_cost)),
+        styled_cell(model.display_name.clone(), ACCENT, true),
+        styled_cell(format::integer(model.totals.messages), MUTED, false),
+        styled_cell(format::precise_cost(model.totals.cost), COST, true),
+        styled_cell(format::tokens(model.totals.total_tokens()), TOKENS, true),
+        styled_cell(
+            share_cell(model.totals.cost, totals.cost, max_cost),
+            COST,
+            false,
+        ),
     ])
-    .style(Style::default().fg(Color::White))
+    .style(Style::default().fg(TEXT))
+}
+
+fn styled_cell(value: String, color: Color, bold: bool) -> Cell<'static> {
+    let mut style = Style::default().fg(color);
+    if bold {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    Cell::from(value).style(style)
 }
 
 fn share_cell(value: f64, total: f64, max: f64) -> String {
@@ -313,15 +387,18 @@ fn model_cost(model: &ModelUsage) -> f64 {
 }
 
 fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
-    let status = if let Some(error) = &app.error {
-        format!("error: {error}")
+    let (status, status_color) = if let Some(error) = &app.error {
+        (format!("error: {error}"), ERROR)
     } else if let Some(stats) = app.current_stats() {
         let cutoff = cutoff_label(stats);
-        format!("{} | {cutoff}", format::timestamp(stats.refreshed_at))
+        (
+            format!("{} | {cutoff}", format::timestamp(stats.refreshed_at)),
+            MUTED,
+        )
     } else if app.is_current_loading() {
-        "loading".to_string()
+        ("loading".to_string(), TOKENS)
     } else {
-        "idle".to_string()
+        ("idle".to_string(), MUTED)
     };
 
     let text = Line::from(vec![
@@ -329,22 +406,29 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
             " Tab ",
             Style::default()
                 .fg(Color::Black)
-                .bg(Color::Cyan)
+                .bg(ACCENT)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(" mode "),
-        Span::styled(" S-Tab ", Style::default().fg(Color::Black).bg(Color::Gray)),
-        Span::raw(" back "),
-        Span::styled(" r ", Style::default().fg(Color::Black).bg(Color::Gray)),
-        Span::raw(" refresh "),
-        Span::styled(" q ", Style::default().fg(Color::Black).bg(Color::Gray)),
-        Span::raw(format!(" quit | {status}")),
+        Span::styled(" mode ", Style::default().fg(MUTED)),
+        key_span(" S-Tab "),
+        Span::styled(" back ", Style::default().fg(MUTED)),
+        key_span(" r "),
+        Span::styled(" refresh ", Style::default().fg(MUTED)),
+        key_span(" q "),
+        Span::styled(" quit | ", Style::default().fg(MUTED)),
+        Span::styled(status, Style::default().fg(status_color)),
     ]);
 
-    frame.render_widget(
-        Paragraph::new(text).style(Style::default().fg(Color::Gray)),
-        area,
-    );
+    frame.render_widget(Paragraph::new(text).style(Style::default().fg(MUTED)), area);
+}
+
+fn key_span(label: &'static str) -> Span<'static> {
+    Span::styled(
+        label,
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Rgb(156, 168, 185)),
+    )
 }
 
 fn cutoff_label(stats: &UsageStats) -> String {
