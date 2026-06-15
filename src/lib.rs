@@ -2,7 +2,7 @@
 //!
 //! `expensive` is primarily a binary crate. It provides a Ratatui-based TUI
 //! that reads OpenCode's local SQLite database directly and aggregates assistant
-//! message usage into daily, weekly, monthly, and all-time views.
+//! message usage into daily, weekly, monthly, all-time, and calendar views.
 //!
 //! The public modules are exposed to keep the binary small and testable. They
 //! cover configuration, OpenCode database aggregation, time-window calculation,

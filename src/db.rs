@@ -4,13 +4,13 @@
 //! module reads those rows directly and produces the same cost/token categories
 //! the TUI displays, grouped by provider, model, and variant.
 
-use std::path::Path;
+use std::{collections::HashMap, path::Path};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
 use rusqlite::{params, Connection, OpenFlags};
 
-use crate::time_window::Mode;
+use crate::time_window::{Mode, PeriodKey};
 
 #[derive(Clone, Debug, Default)]
 pub struct UsageTotals {
@@ -51,11 +51,36 @@ pub struct UsageStats {
     pub mode: Mode,
     pub refreshed_at: DateTime<Local>,
     pub cutoff_millis: Option<i64>,
+    pub end_millis: Option<i64>,
     pub totals: UsageTotals,
     pub models: Vec<ModelUsage>,
 }
 
+#[derive(Clone, Debug)]
+pub struct PeriodCost {
+    pub period: PeriodKey,
+    pub cost: f64,
+}
+
 pub fn load_usage(path: &Path, mode: Mode, cutoff_millis: Option<i64>) -> Result<UsageStats> {
+    load_usage_range(path, mode, cutoff_millis, None)
+}
+
+pub fn load_usage_between(
+    path: &Path,
+    mode: Mode,
+    start_millis: i64,
+    end_millis: i64,
+) -> Result<UsageStats> {
+    load_usage_range(path, mode, Some(start_millis), Some(end_millis))
+}
+
+fn load_usage_range(
+    path: &Path,
+    mode: Mode,
+    start_millis: Option<i64>,
+    end_millis: Option<i64>,
+) -> Result<UsageStats> {
     let connection = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -77,12 +102,13 @@ pub fn load_usage(path: &Path, mode: Mode, cutoff_millis: Option<i64>) -> Result
         FROM message
         WHERE json_extract(data, '$.role') = 'assistant'
             AND (?1 IS NULL OR time_created >= ?1)
+            AND (?2 IS NULL OR time_created < ?2)
         GROUP BY provider, model_id, variant
         ORDER BY cost DESC
         "#,
     )?;
 
-    let rows = statement.query_map(params![cutoff_millis], |row| {
+    let rows = statement.query_map(params![start_millis, end_millis], |row| {
         let provider: String = row.get("provider")?;
         let model_id: String = row.get("model_id")?;
         let variant: String = row.get("variant")?;
@@ -115,10 +141,78 @@ pub fn load_usage(path: &Path, mode: Mode, cutoff_millis: Option<i64>) -> Result
     Ok(UsageStats {
         mode,
         refreshed_at: Local::now(),
-        cutoff_millis,
+        cutoff_millis: start_millis,
+        end_millis,
         totals,
         models,
     })
+}
+
+pub fn load_period_costs(path: &Path, periods: &[PeriodKey]) -> Result<Vec<PeriodCost>> {
+    if periods.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let start_millis = periods
+        .iter()
+        .map(|period| period.start_millis)
+        .min()
+        .expect("periods is not empty");
+    let end_millis = periods
+        .iter()
+        .map(|period| period.end_millis)
+        .max()
+        .expect("periods is not empty");
+
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("opening {}", path.display()))?;
+
+    let mut statement = connection.prepare(
+        r#"
+        SELECT
+            time_created,
+            COALESCE(json_extract(data, '$.cost'), 0) AS cost
+        FROM message
+        WHERE json_extract(data, '$.role') = 'assistant'
+            AND time_created >= ?1
+            AND time_created < ?2
+        "#,
+    )?;
+
+    let mut costs = periods
+        .iter()
+        .copied()
+        .map(|period| (period, 0.0))
+        .collect::<HashMap<_, _>>();
+
+    let rows = statement.query_map(params![start_millis, end_millis], |row| {
+        let time_created: i64 = row.get("time_created")?;
+        let cost: f64 = row.get("cost")?;
+        Ok((time_created, cost))
+    })?;
+
+    for row in rows {
+        let (time_created, cost) = row?;
+        if let Some(period) = periods
+            .iter()
+            .copied()
+            .find(|period| period.contains(time_created))
+        {
+            *costs.entry(period).or_insert(0.0) += cost;
+        }
+    }
+
+    Ok(periods
+        .iter()
+        .copied()
+        .map(|period| PeriodCost {
+            period,
+            cost: costs.remove(&period).unwrap_or(0.0),
+        })
+        .collect())
 }
 
 fn read_u64(row: &rusqlite::Row<'_>, name: &str) -> rusqlite::Result<u64> {
@@ -156,6 +250,7 @@ fn clean_part<'a>(value: &'a str, fallback: &'a str) -> &'a str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::time_window::CalendarScale;
     use rusqlite::Connection;
     use tempfile::NamedTempFile;
 
@@ -249,6 +344,58 @@ mod tests {
         let stats = load_usage(file.path(), Mode::Daily, Some(1500)).unwrap();
         assert_eq!(stats.totals.messages, 1);
         assert_eq!(stats.totals.total_tokens(), 4);
+    }
+
+    #[test]
+    fn applies_bounded_range() {
+        let file = NamedTempFile::new().unwrap();
+        let connection = Connection::open(file.path()).unwrap();
+        create_message_table(&connection);
+
+        insert_usage_message(&connection, "before", 999, "m", 1.0);
+        insert_usage_message(&connection, "inside", 1500, "m", 2.0);
+        insert_usage_message(&connection, "end", 2000, "m", 4.0);
+        drop(connection);
+
+        let stats = load_usage_between(file.path(), Mode::Daily, 1000, 2000).unwrap();
+
+        assert_eq!(stats.cutoff_millis, Some(1000));
+        assert_eq!(stats.end_millis, Some(2000));
+        assert_eq!(stats.totals.messages, 1);
+        assert!((stats.totals.cost - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn loads_period_costs_in_requested_order() {
+        let file = NamedTempFile::new().unwrap();
+        let connection = Connection::open(file.path()).unwrap();
+        create_message_table(&connection);
+
+        insert_usage_message(&connection, "first", 1500, "m", 1.5);
+        insert_usage_message(&connection, "second", 2500, "m", 2.5);
+        insert_usage_message(&connection, "outside", 3000, "m", 4.0);
+        insert_message(&connection, "user", 1500, r#"{"role":"user"}"#);
+        drop(connection);
+
+        let periods = vec![
+            PeriodKey {
+                scale: CalendarScale::Day,
+                start_millis: 1000,
+                end_millis: 2000,
+            },
+            PeriodKey {
+                scale: CalendarScale::Day,
+                start_millis: 2000,
+                end_millis: 3000,
+            },
+        ];
+        let costs = load_period_costs(file.path(), &periods).unwrap();
+
+        assert_eq!(costs.len(), 2);
+        assert_eq!(costs[0].period, periods[0]);
+        assert_eq!(costs[1].period, periods[1]);
+        assert!((costs[0].cost - 1.5).abs() < f64::EPSILON);
+        assert!((costs[1].cost - 2.5).abs() < f64::EPSILON);
     }
 
     #[test]

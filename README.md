@@ -17,6 +17,7 @@ can keep open while you work.
 - cache read and cache write tokens
 - model-level breakdown with message counts, cost, tokens, and share of spend
 - daily, weekly, monthly, and all-time views
+- calendar view for day, week, and month spend
 
 Daily usage defaults to "since 04:00" in your local timezone, which fits the
 usual late-night coding accounting better than a strict midnight cutoff.
@@ -53,11 +54,17 @@ Controls:
 
 | Key / Mouse | Action |
 | --- | --- |
-| `Tab` | Next time window |
-| `Shift+Tab` | Previous time window |
-| click a top tab | Jump to that time window |
+| `Tab` | Next time window, or next calendar scale |
+| `Shift+Tab` | Previous time window, or previous calendar scale |
+| click a top tab | Jump to that time window or Calendar |
+| `c` | Open Calendar |
+| arrows / `hjkl` | Move Calendar selection |
+| `Enter` | Open selected Calendar period |
+| `h` / `k` | Previous period from Calendar detail |
+| `j` / `l` | Next period from Calendar detail |
 | `r` | Refresh now |
-| `q` / `Esc` | Quit |
+| `Esc` | Back one level; quit from the dashboard |
+| `q` | Quit |
 
 By default, `expensive` refreshes every 60 seconds. The database query is cheap;
 on the machine this was built on, direct SQLite aggregation was roughly two
