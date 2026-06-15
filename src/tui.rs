@@ -59,6 +59,35 @@ pub fn draw(frame: &mut Frame<'_>, app: &AppState) {
     draw_footer(frame, chunks[3], app);
 }
 
+pub fn mode_at_tab_position(column: u16, row: u16, area: Rect) -> Option<Mode> {
+    if area.width < 3 || area.height < 3 || row != area.y.saturating_add(1) {
+        return None;
+    }
+
+    let tabs_right = area.x.saturating_add(area.width).saturating_sub(1);
+    let mut x = area.x.saturating_add(1);
+    for (idx, mode) in Mode::ALL.iter().enumerate() {
+        let title_width = mode.title().chars().count() as u16;
+        let hit_start = x;
+        let hit_end = x
+            .saturating_add(title_width)
+            .saturating_add(2)
+            .min(tabs_right);
+
+        if column >= hit_start && column < hit_end {
+            return Some(*mode);
+        }
+
+        if idx == Mode::ALL.len() - 1 || hit_end >= tabs_right {
+            break;
+        }
+
+        x = hit_end.saturating_add(1);
+    }
+
+    None
+}
+
 fn draw_tabs(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     let titles = Mode::ALL
         .iter()
@@ -506,6 +535,26 @@ mod tests {
         assert_eq!(share.find('⠄'), larger_share.find('⣿'));
         assert_eq!(share, "1.4%   ⠄⠄⠄⠄⠄⠄⠄⠄");
         assert_eq!(larger_share, "98.6%  ⣿⣿⣿⣿⣿⣿⣿⣿");
+    }
+
+    #[test]
+    fn maps_tab_click_positions_to_modes() {
+        let area = Rect::new(0, 0, 100, 24);
+
+        assert_eq!(mode_at_tab_position(2, 1, area), Some(Mode::Daily));
+        assert_eq!(mode_at_tab_position(10, 1, area), Some(Mode::Weekly));
+        assert_eq!(mode_at_tab_position(19, 1, area), Some(Mode::Monthly));
+        assert_eq!(mode_at_tab_position(30, 1, area), Some(Mode::AllTime));
+    }
+
+    #[test]
+    fn ignores_clicks_outside_tab_labels() {
+        let area = Rect::new(0, 0, 100, 24);
+
+        assert_eq!(mode_at_tab_position(2, 0, area), None);
+        assert_eq!(mode_at_tab_position(8, 1, area), None);
+        assert_eq!(mode_at_tab_position(80, 1, area), None);
+        assert_eq!(mode_at_tab_position(2, 2, area), None);
     }
 
     #[test]

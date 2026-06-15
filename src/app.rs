@@ -9,11 +9,14 @@ use std::{
 use anyhow::Result;
 use chrono::{DateTime, Local};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+        MouseButton, MouseEvent, MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use ratatui::{backend::CrosstermBackend, Terminal};
+use ratatui::{backend::CrosstermBackend, layout::Rect, Terminal};
 
 use crate::{
     config::Config,
@@ -105,14 +108,18 @@ struct RefreshMessage {
 pub fn run(config: Config) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     let result = run_loop(&mut terminal, config);
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
 
     result
@@ -130,13 +137,18 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Confi
         terminal.draw(|frame| tui::draw(frame, &app))?;
 
         if event::poll(Duration::from_millis(200))? {
-            let Event::Key(key) = event::read()? else {
-                continue;
-            };
-
-            if key.kind == KeyEventKind::Press && handle_key(key.code, key.modifiers, &mut app, &tx)
-            {
-                return Ok(());
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    if handle_key(key.code, key.modifiers, &mut app, &tx) {
+                        return Ok(());
+                    }
+                }
+                Event::Mouse(mouse) => {
+                    let size = terminal.size()?;
+                    let area = Rect::new(0, 0, size.width, size.height);
+                    handle_mouse(mouse, area, &mut app, &tx);
+                }
+                _ => {}
             }
         }
     }
@@ -165,6 +177,16 @@ fn handle_key(
             false
         }
         _ => false,
+    }
+}
+
+fn handle_mouse(mouse: MouseEvent, area: Rect, app: &mut AppState, tx: &Sender<RefreshMessage>) {
+    if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+        return;
+    }
+
+    if let Some(mode) = tui::mode_at_tab_position(mouse.column, mouse.row, area) {
+        app.switch_mode(mode, tx);
     }
 }
 
