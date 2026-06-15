@@ -153,6 +153,19 @@ struct FramedCell {
 }
 
 #[derive(Clone, Copy)]
+struct HelpBinding {
+    key: &'static str,
+    description: &'static str,
+}
+
+#[derive(Clone, Copy)]
+struct HelpColumns {
+    key_width: usize,
+    description_width: usize,
+    left_pad: usize,
+}
+
+#[derive(Clone, Copy)]
 enum TabStyle {
     Normal,
     Dashboard,
@@ -261,30 +274,66 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &AppState, palette: Palette
     });
     frame.render_widget(block, modal);
 
-    let lines = vec![
-        section_title("Controls", palette),
-        Line::from(""),
-        help_line(
-            "Tab / Shift+Tab",
-            "switch dashboard window or calendar scale",
-            palette,
-        ),
-        help_line("c", "open Calendar from the dashboard", palette),
-        help_line("hjkl / arrows", "move Calendar selection", palette),
-        help_line("Enter", "open selected Calendar period", palette),
-        help_line("Esc", "back one level; close help", palette),
-        help_line("r", "refresh current view", palette),
-        help_line("q", "quit", palette),
+    let control_bindings = [
+        HelpBinding {
+            key: "Tab / Shift+Tab",
+            description: "switch dashboard window or calendar scale",
+        },
+        HelpBinding {
+            key: "c",
+            description: "open Calendar from the dashboard",
+        },
+        HelpBinding {
+            key: "hjkl / arrows",
+            description: "move Calendar selection",
+        },
+        HelpBinding {
+            key: "Enter",
+            description: "open selected Calendar period",
+        },
+        HelpBinding {
+            key: "Esc",
+            description: "back one level; close help",
+        },
+        HelpBinding {
+            key: "r",
+            description: "refresh current view",
+        },
+        HelpBinding {
+            key: "q",
+            description: "quit",
+        },
+    ];
+    let config_bindings = [
+        HelpBinding {
+            key: "j/k",
+            description: "select a config row",
+        },
+        HelpBinding {
+            key: "Space / Enter",
+            description: "toggle or cycle the selected value",
+        },
+        HelpBinding {
+            key: "h/l",
+            description: "cycle choices",
+        },
+    ];
+    let all_bindings = control_bindings
+        .iter()
+        .chain(config_bindings.iter())
+        .copied()
+        .collect::<Vec<_>>();
+    let help_columns = help_columns(&all_bindings, inner.width as usize);
+
+    let mut lines = vec![section_title("Controls", palette), Line::from("")];
+    lines.extend(help_binding_lines(&control_bindings, help_columns, palette));
+    lines.extend([
         Line::from(""),
         section_title("Config", palette),
         Line::from(""),
-        help_line("j/k", "select a config row", palette),
-        help_line(
-            "Space / Enter",
-            "toggle or cycle the selected value",
-            palette,
-        ),
-        help_line("h/l", "cycle choices", palette),
+    ]);
+    lines.extend(help_binding_lines(&config_bindings, help_columns, palette));
+    lines.extend([
         Line::from(""),
         config_editor_line(ConfigEditorItem::AutoRefresh, app, palette),
         config_editor_line(ConfigEditorItem::WeekStart, app, palette),
@@ -303,7 +352,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &AppState, palette: Palette
             Span::styled(" quit", Style::default().fg(palette.muted)),
         ])
         .alignment(Alignment::Center),
-    ];
+    ]);
 
     let paragraph = Paragraph::new(lines)
         .style(Style::default().fg(palette.text))
@@ -470,19 +519,148 @@ fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
         && row < area.y.saturating_add(area.height)
 }
 
-fn help_line(key: &'static str, description: &'static str, palette: Palette) -> Line<'static> {
-    const HELP_KEY_WIDTH: usize = 17;
+fn help_columns(bindings: &[HelpBinding], available_width: usize) -> HelpColumns {
+    const HELP_GAP: usize = 2;
+    const MIN_DESCRIPTION_WIDTH: usize = 18;
 
-    Line::from(vec![
-        Span::styled(
-            format!("{key:>HELP_KEY_WIDTH$}  "),
-            Style::default()
-                .fg(palette.accent)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(description, Style::default().fg(palette.text)),
-    ])
-    .alignment(Alignment::Center)
+    let widest_key = bindings
+        .iter()
+        .map(|binding| text_width(binding.key))
+        .max()
+        .unwrap_or(1);
+    let max_key_width = available_width
+        .saturating_sub(HELP_GAP + MIN_DESCRIPTION_WIDTH)
+        .max(1);
+    let key_width = widest_key.min(max_key_width).max(1);
+    let description_width = available_width.saturating_sub(key_width + HELP_GAP).max(1);
+    let table_width = bindings
+        .iter()
+        .map(|binding| {
+            key_width + HELP_GAP + text_width(binding.description).min(description_width)
+        })
+        .max()
+        .unwrap_or(key_width + HELP_GAP)
+        .min(available_width);
+
+    HelpColumns {
+        key_width,
+        description_width,
+        left_pad: available_width.saturating_sub(table_width) / 2,
+    }
+}
+
+fn help_binding_lines(
+    bindings: &[HelpBinding],
+    columns: HelpColumns,
+    palette: Palette,
+) -> Vec<Line<'static>> {
+    bindings
+        .iter()
+        .flat_map(|binding| help_binding_line(*binding, columns, palette))
+        .collect()
+}
+
+fn help_binding_line(
+    binding: HelpBinding,
+    columns: HelpColumns,
+    palette: Palette,
+) -> Vec<Line<'static>> {
+    wrap_text(binding.description, columns.description_width)
+        .into_iter()
+        .enumerate()
+        .map(|(idx, description)| {
+            if idx == 0 {
+                Line::from(vec![
+                    Span::raw(" ".repeat(columns.left_pad)),
+                    Span::styled(
+                        format!(
+                            "{:>width$}",
+                            fit_text(binding.key, columns.key_width),
+                            width = columns.key_width
+                        ),
+                        Style::default()
+                            .fg(palette.accent)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw("  "),
+                    Span::styled(description, Style::default().fg(palette.text)),
+                ])
+            } else {
+                Line::from(vec![
+                    Span::raw(" ".repeat(columns.left_pad + columns.key_width + 2)),
+                    Span::styled(description, Style::default().fg(palette.text)),
+                ])
+            }
+        })
+        .collect()
+}
+
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut current = String::new();
+
+    for word in text.split_whitespace() {
+        let word_width = text_width(word);
+        if current.is_empty() {
+            if word_width <= width {
+                current.push_str(word);
+            } else {
+                lines.extend(split_long_word(word, width));
+            }
+            continue;
+        }
+
+        if text_width(&current) + 1 + word_width <= width {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            lines.push(current);
+            current = String::new();
+            if word_width <= width {
+                current.push_str(word);
+            } else {
+                lines.extend(split_long_word(word, width));
+            }
+        }
+    }
+
+    if !current.is_empty() {
+        lines.push(current);
+    }
+
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+fn split_long_word(word: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for ch in word.chars() {
+        current.push(ch);
+        if text_width(&current) >= width {
+            lines.push(current);
+            current = String::new();
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+fn fit_text(text: &str, width: usize) -> String {
+    if text_width(text) <= width {
+        return text.to_string();
+    }
+
+    text.chars().take(width).collect()
+}
+
+fn text_width(text: &str) -> usize {
+    text.chars().count()
 }
 
 fn section_title(title: &'static str, palette: Palette) -> Line<'static> {
@@ -2124,6 +2302,34 @@ mod tests {
         assert!(output.contains("/tmp/expensive/config.toml"));
     }
 
+    #[test]
+    fn aligns_help_binding_descriptions_to_one_column() {
+        let mut app = app_loading(Mode::Daily);
+        app.show_help = true;
+
+        let output = render(&app, 120, 32);
+        let descriptions = [
+            "switch dashboard window or calendar scale",
+            "open Calendar from the dashboard",
+            "move Calendar selection",
+            "open selected Calendar period",
+            "back one level; close help",
+            "refresh current view",
+            "select a config row",
+            "toggle or cycle the selected value",
+            "cycle choices",
+        ];
+        let starts = descriptions
+            .iter()
+            .map(|description| description_start(&output, description))
+            .collect::<Vec<_>>();
+
+        assert!(
+            starts.iter().all(|start| *start == starts[0]),
+            "description starts were not aligned: {starts:?}"
+        );
+    }
+
     fn render(app: &AppState, width: u16, height: u16) -> String {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -2140,6 +2346,16 @@ mod tests {
             output.push('\n');
         }
         output
+    }
+
+    fn description_start(output: &str, description: &str) -> usize {
+        output
+            .lines()
+            .find_map(|line| {
+                line.find(description)
+                    .map(|byte_idx| line[..byte_idx].chars().count())
+            })
+            .unwrap_or_else(|| panic!("missing help description {description:?}"))
     }
 
     fn app_with_stats(mode: Mode, stats: UsageStats) -> AppState {
