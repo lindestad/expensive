@@ -25,6 +25,8 @@ const TOKENS: Color = Color::Rgb(155, 210, 255);
 const IO: Color = Color::Rgb(187, 162, 255);
 const CACHE: Color = Color::Rgb(146, 226, 160);
 const ERROR: Color = Color::Rgb(255, 117, 117);
+const HEAT_PRIMARY_BG: [u8; 7] = [23, 30, 66, 101, 136, 172, 208];
+const HEAT_DIM_BG: [u8; 7] = [235, 236, 237, 238, 239, 240, 241];
 
 #[derive(Clone, Copy)]
 struct MetricStyle {
@@ -239,15 +241,19 @@ fn draw_day_calendar(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     let selected_month = local_date(app.calendar.selected.start_millis)
         .map(|date| (date.year(), date.month()))
         .unwrap_or((0, 0));
+    let max_cost = calendar_max_cost(app);
 
     let rows = app.calendar.visible_periods.chunks(7).map(|week| {
         Row::new(week.iter().map(|period| {
             let in_month = local_date(period.start_millis)
                 .map(|date| (date.year(), date.month()) == selected_month)
                 .unwrap_or(false);
+            let cost = app.calendar_cost(*period);
             period_cell(
                 *period,
-                day_cell_label(*period, app.calendar_cost(*period)),
+                day_cell_label(*period, cost),
+                cost,
+                max_cost,
                 app.calendar.selected == *period,
                 in_month,
             )
@@ -276,11 +282,15 @@ fn draw_period_grid(frame: &mut Frame<'_>, area: Rect, app: &AppState, columns: 
     let constraints = (0..columns)
         .map(|_| Constraint::Ratio(1, columns as u32))
         .collect::<Vec<_>>();
+    let max_cost = calendar_max_cost(app);
     let rows = app.calendar.visible_periods.chunks(columns).map(|periods| {
         Row::new(periods.iter().map(|period| {
+            let cost = app.calendar_cost(*period);
             period_cell(
                 *period,
-                period_cell_label(*period, app.calendar_cost(*period)),
+                period_cell_label(*period, cost),
+                cost,
+                max_cost,
                 app.calendar.selected == *period,
                 true,
             )
@@ -294,15 +304,35 @@ fn draw_period_grid(frame: &mut Frame<'_>, area: Rect, app: &AppState, columns: 
 fn period_cell(
     period: PeriodKey,
     label: String,
+    cost: Option<f64>,
+    max_cost: f64,
     selected: bool,
     in_primary_range: bool,
 ) -> Cell<'static> {
-    let style = if selected {
-        Style::default()
+    Cell::from(label).style(period_style(
+        period,
+        cost,
+        max_cost,
+        selected,
+        in_primary_range,
+    ))
+}
+
+fn period_style(
+    period: PeriodKey,
+    cost: Option<f64>,
+    max_cost: f64,
+    selected: bool,
+    in_primary_range: bool,
+) -> Style {
+    if selected {
+        return Style::default()
             .fg(Color::Black)
-            .bg(ACCENT)
-            .add_modifier(Modifier::BOLD)
-    } else if in_primary_range {
+            .bg(CALENDAR_ACCENT)
+            .add_modifier(Modifier::BOLD);
+    }
+
+    let base = if in_primary_range {
         Style::default().fg(match period.scale {
             CalendarScale::Day => TEXT,
             CalendarScale::Week => TOKENS,
@@ -312,7 +342,43 @@ fn period_cell(
         Style::default().fg(MUTED)
     };
 
-    Cell::from(label).style(style)
+    let Some(cost) = cost else {
+        return base;
+    };
+    let Some(bucket) = heat_bucket(cost, max_cost) else {
+        return base;
+    };
+
+    if in_primary_range {
+        let fg = if bucket >= 5 {
+            Color::Black
+        } else {
+            Color::Indexed(230)
+        };
+        base.fg(fg).bg(Color::Indexed(HEAT_PRIMARY_BG[bucket]))
+    } else {
+        base.bg(Color::Indexed(HEAT_DIM_BG[bucket]))
+    }
+}
+
+fn calendar_max_cost(app: &AppState) -> f64 {
+    app.calendar
+        .visible_periods
+        .iter()
+        .filter_map(|period| app.calendar_cost(*period))
+        .fold(0.0, f64::max)
+}
+
+fn heat_bucket(cost: f64, max_cost: f64) -> Option<usize> {
+    if cost <= 0.0 || max_cost <= 0.0 {
+        return None;
+    }
+
+    let ratio = (cost / max_cost).clamp(0.0, 1.0).sqrt();
+    Some(
+        ((ratio * (HEAT_PRIMARY_BG.len() - 1) as f64).round() as usize)
+            .clamp(0, HEAT_PRIMARY_BG.len() - 1),
+    )
 }
 
 fn day_cell_label(period: PeriodKey, cost: Option<f64>) -> String {
@@ -909,6 +975,25 @@ mod tests {
         assert_eq!(share.find('⠄'), larger_share.find('⣿'));
         assert_eq!(share, "1.4%   ⠄⠄⠄⠄⠄⠄⠄⠄");
         assert_eq!(larger_share, "98.6%  ⣿⣿⣿⣿⣿⣿⣿⣿");
+    }
+
+    #[test]
+    fn maps_calendar_costs_to_indexed_heat_colors() {
+        let period = PeriodKey {
+            scale: CalendarScale::Day,
+            start_millis: 1000,
+            end_millis: 2000,
+        };
+
+        assert_eq!(heat_bucket(0.0, 10.0), None);
+        assert_eq!(heat_bucket(10.0, 10.0), Some(HEAT_PRIMARY_BG.len() - 1));
+
+        let style = period_style(period, Some(2.5), 10.0, false, true);
+        assert!(matches!(style.bg, Some(Color::Indexed(_))));
+
+        let dimmed = period_style(period, Some(2.5), 10.0, false, false);
+        assert!(matches!(dimmed.bg, Some(Color::Indexed(_))));
+        assert_eq!(dimmed.fg, Some(MUTED));
     }
 
     #[test]
