@@ -1,3 +1,9 @@
+//! Time-window calculations for usage aggregation.
+//!
+//! The dashboard supports daily, weekly, monthly, and all-time views. Daily,
+//! weekly, and monthly windows all honor the configured daily start time, so a
+//! `04:00` start means the "day" runs from 04:00 local time to the next 04:00.
+
 use std::{fmt, str::FromStr};
 
 use anyhow::{anyhow, bail, Result};

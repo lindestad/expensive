@@ -1,3 +1,9 @@
+//! Configuration loading for the `expensive` binary.
+//!
+//! This module resolves CLI flags, optional TOML config, and OpenCode database
+//! discovery into a single [`Config`]. The intended precedence is:
+//! command-line arguments, config file values, then built-in defaults.
+
 use std::{
     env, fs,
     path::{Path, PathBuf},

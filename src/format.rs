@@ -1,3 +1,8 @@
+//! Display formatting helpers used by the dashboard.
+//!
+//! These functions keep terminal-facing number, cost, timestamp, token, and
+//! percentage formatting consistent across the summary cards and model table.
+
 use chrono::{DateTime, Local};
 
 pub fn cost(value: f64) -> String {

@@ -19,9 +19,11 @@
 //! expensive
 //! ```
 
+#[doc(hidden)]
 pub mod app;
 pub mod config;
 pub mod db;
 pub mod format;
 pub mod time_window;
+#[doc(hidden)]
 pub mod tui;

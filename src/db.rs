@@ -1,3 +1,9 @@
+//! Aggregation over OpenCode's local SQLite database.
+//!
+//! OpenCode stores usage details in JSON inside assistant message rows. This
+//! module reads those rows directly and produces the same cost/token categories
+//! the TUI displays, grouped by provider, model, and variant.
+
 use std::path::Path;
 
 use anyhow::{Context, Result};
