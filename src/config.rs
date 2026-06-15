@@ -53,7 +53,11 @@ struct FileConfig {
 
 pub fn load(cli: Cli) -> Result<Config> {
     let file_config = load_file_config()?;
+    let db_path = discover_db_path(cli.db.clone());
+    resolve_config(cli, file_config, db_path)
+}
 
+fn resolve_config(cli: Cli, file_config: FileConfig, db_path: PathBuf) -> Result<Config> {
     let daily_start = match (cli.daily_start, file_config.daily_start.as_deref()) {
         (Some(value), _) => value,
         (None, Some(value)) => value.parse()?,
@@ -76,7 +80,7 @@ pub fn load(cli: Cli) -> Result<Config> {
     };
 
     Ok(Config {
-        db_path: discover_db_path(cli.db),
+        db_path,
         daily_start,
         refresh_interval: Duration::from_secs(refresh_seconds),
         auto_refresh: !cli.no_refresh,
@@ -137,5 +141,96 @@ fn opencode_db_path() -> Option<PathBuf> {
         None
     } else {
         Some(PathBuf::from(path))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{path::PathBuf, time::Duration};
+
+    use super::*;
+
+    fn cli() -> Cli {
+        Cli {
+            db: None,
+            daily_start: None,
+            refresh: None,
+            no_refresh: false,
+            scope: None,
+        }
+    }
+
+    #[test]
+    fn default_config_matches_dashboard_expectations() {
+        let config = resolve_config(
+            cli(),
+            FileConfig::default(),
+            PathBuf::from("/tmp/opencode.db"),
+        )
+        .unwrap();
+
+        assert_eq!(config.db_path, PathBuf::from("/tmp/opencode.db"));
+        assert_eq!(config.daily_start, DailyStart::default());
+        assert_eq!(config.refresh_interval, Duration::from_secs(60));
+        assert!(config.auto_refresh);
+        assert_eq!(config.scope, Scope::All);
+    }
+
+    #[test]
+    fn cli_values_override_file_config() {
+        let mut cli = cli();
+        cli.daily_start = Some("06:30".parse().unwrap());
+        cli.refresh = Some(10);
+        cli.no_refresh = true;
+        cli.scope = Some(Scope::All);
+
+        let file_config = FileConfig {
+            daily_start: Some("04:00".to_string()),
+            refresh_seconds: Some(60),
+            scope: Some("all".to_string()),
+        };
+
+        let config = resolve_config(cli, file_config, PathBuf::from("/tmp/opencode.db")).unwrap();
+
+        assert_eq!(
+            config.daily_start,
+            DailyStart {
+                hour: 6,
+                minute: 30
+            }
+        );
+        assert_eq!(config.refresh_interval, Duration::from_secs(10));
+        assert!(!config.auto_refresh);
+        assert_eq!(config.scope, Scope::All);
+    }
+
+    #[test]
+    fn rejects_zero_refresh_interval() {
+        let mut cli = cli();
+        cli.refresh = Some(0);
+
+        let error = resolve_config(
+            cli,
+            FileConfig::default(),
+            PathBuf::from("/tmp/opencode.db"),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("refresh interval"));
+    }
+
+    #[test]
+    fn rejects_unknown_file_scope() {
+        let file_config = FileConfig {
+            scope: Some("current".to_string()),
+            ..FileConfig::default()
+        };
+
+        let error = resolve_config(cli(), file_config, PathBuf::from("/tmp/opencode.db"))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("unsupported scope"));
     }
 }

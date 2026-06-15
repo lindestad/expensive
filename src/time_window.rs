@@ -214,6 +214,22 @@ mod tests {
     }
 
     #[test]
+    fn monthly_cutoff_uses_previous_month_before_first_day_start() {
+        assert_eq!(
+            cutoff_naive(Mode::Monthly, dt("2026-06-01 03:30"), DailyStart::default()),
+            Some(dt("2026-05-01 04:00"))
+        );
+    }
+
+    #[test]
+    fn all_time_has_no_cutoff() {
+        assert_eq!(
+            cutoff_naive(Mode::AllTime, dt("2026-06-15 10:30"), DailyStart::default()),
+            None
+        );
+    }
+
+    #[test]
     fn parses_daily_start() {
         assert_eq!(
             "4:30".parse::<DailyStart>().unwrap(),

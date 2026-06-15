@@ -360,3 +360,186 @@ fn cutoff_label(stats: &UsageStats) -> String {
         })
         .unwrap_or_else(|| "since cutoff".to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::{HashMap, HashSet},
+        path::PathBuf,
+        time::{Duration, Instant},
+    };
+
+    use chrono::TimeZone;
+    use ratatui::{backend::TestBackend, buffer::Buffer, Terminal};
+
+    use super::*;
+    use crate::{
+        config::{Config, Scope},
+        time_window::DailyStart,
+    };
+
+    #[test]
+    fn renders_loaded_daily_summary_and_model_breakdown() {
+        let stats = sample_stats(Mode::Daily, Some(local_millis(2026, 6, 15, 4, 0, 0)));
+        let app = app_with_stats(Mode::Daily, stats);
+
+        let output = render(&app, 120, 24);
+
+        assert!(output.contains("Daily"));
+        assert!(output.contains("Weekly"));
+        assert!(output.contains("$3.75"));
+        assert!(output.contains("2 msgs"));
+        assert!(output.contains("110"));
+        assert!(output.contains("11 / 22"));
+        assert!(output.contains("33 / 44"));
+        assert!(output.contains("Daily by model"));
+        assert!(output.contains("provider/gpt-test (high)"));
+        assert!(output.contains("$2.5000"));
+        assert!(output.contains("######## 66.7%"));
+        assert!(output.contains("since Jun 15 04:00"));
+    }
+
+    #[test]
+    fn renders_all_time_footer_without_cutoff() {
+        let stats = sample_stats(Mode::AllTime, None);
+        let app = app_with_stats(Mode::AllTime, stats);
+
+        let output = render(&app, 100, 24);
+
+        assert!(output.contains("All Time"));
+        assert!(output.contains("All Time by model"));
+        assert!(output.contains("all time"));
+    }
+
+    #[test]
+    fn renders_loading_state_when_current_mode_is_refreshing() {
+        let app = app_loading(Mode::Weekly);
+
+        let output = render(&app, 100, 24);
+
+        assert!(output.contains("Weekly"));
+        assert!(output.contains("refreshing"));
+        assert!(output.contains("Loading OpenCode usage"));
+        assert!(output.contains("loading"));
+    }
+
+    #[test]
+    fn renders_error_footer() {
+        let mut app = app_loading(Mode::Monthly);
+        app.loading.clear();
+        app.error = Some("database is locked".to_string());
+
+        let output = render(&app, 100, 24);
+
+        assert!(output.contains("Monthly"));
+        assert!(output.contains("error: database is locked"));
+    }
+
+    fn render(app: &AppState, width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        buffer_text(terminal.backend().buffer())
+    }
+
+    fn buffer_text(buffer: &Buffer) -> String {
+        let mut output = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                output.push_str(buffer[(x, y)].symbol());
+            }
+            output.push('\n');
+        }
+        output
+    }
+
+    fn app_with_stats(mode: Mode, stats: UsageStats) -> AppState {
+        let mut stats_by_mode = HashMap::new();
+        stats_by_mode.insert(mode, stats);
+
+        AppState {
+            config: test_config(),
+            mode,
+            stats: stats_by_mode,
+            loading: HashSet::new(),
+            error: None,
+            last_refresh_started: None,
+            next_refresh_due: Instant::now() + Duration::from_secs(60),
+        }
+    }
+
+    fn app_loading(mode: Mode) -> AppState {
+        AppState {
+            config: test_config(),
+            mode,
+            stats: HashMap::new(),
+            loading: HashSet::from([mode]),
+            error: None,
+            last_refresh_started: None,
+            next_refresh_due: Instant::now() + Duration::from_secs(60),
+        }
+    }
+
+    fn test_config() -> Config {
+        Config {
+            db_path: PathBuf::from("/tmp/opencode.db"),
+            daily_start: DailyStart::default(),
+            refresh_interval: Duration::from_secs(60),
+            auto_refresh: true,
+            scope: Scope::All,
+        }
+    }
+
+    fn sample_stats(mode: Mode, cutoff_millis: Option<i64>) -> UsageStats {
+        let high = ModelUsage {
+            provider: "provider".to_string(),
+            model_id: "gpt-test".to_string(),
+            variant: "high".to_string(),
+            display_name: "provider/gpt-test (high)".to_string(),
+            totals: UsageTotals {
+                messages: 1,
+                cost: 2.5,
+                input: 1,
+                output: 2,
+                cache_read: 3,
+                cache_write: 4,
+            },
+        };
+        let default = ModelUsage {
+            provider: "provider".to_string(),
+            model_id: "gpt-test".to_string(),
+            variant: "default".to_string(),
+            display_name: "provider/gpt-test".to_string(),
+            totals: UsageTotals {
+                messages: 1,
+                cost: 1.25,
+                input: 10,
+                output: 20,
+                cache_read: 30,
+                cache_write: 40,
+            },
+        };
+
+        UsageStats {
+            mode,
+            refreshed_at: Local.with_ymd_and_hms(2026, 6, 15, 10, 0, 0).unwrap(),
+            cutoff_millis,
+            totals: UsageTotals {
+                messages: 2,
+                cost: 3.75,
+                input: 11,
+                output: 22,
+                cache_read: 33,
+                cache_write: 44,
+            },
+            models: vec![high, default],
+        }
+    }
+
+    fn local_millis(year: i32, month: u32, day: u32, hour: u32, minute: u32, second: u32) -> i64 {
+        Local
+            .with_ymd_and_hms(year, month, day, hour, minute, second)
+            .unwrap()
+            .timestamp_millis()
+    }
+}

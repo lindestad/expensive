@@ -245,12 +245,84 @@ mod tests {
         assert_eq!(stats.totals.total_tokens(), 4);
     }
 
+    #[test]
+    fn treats_missing_optional_usage_fields_as_zero() {
+        let file = NamedTempFile::new().unwrap();
+        let connection = Connection::open(file.path()).unwrap();
+        create_message_table(&connection);
+
+        insert_message(
+            &connection,
+            "a",
+            1000,
+            r#"{"role":"assistant","modelID":"","providerID":"","cost":null}"#,
+        );
+        drop(connection);
+
+        let stats = load_usage(file.path(), Mode::AllTime, None).unwrap();
+
+        assert_eq!(stats.totals.messages, 1);
+        assert_eq!(stats.totals.cost, 0.0);
+        assert_eq!(stats.totals.total_tokens(), 0);
+        assert_eq!(stats.models[0].display_name, "unknown");
+    }
+
+    #[test]
+    fn sorts_models_by_cost_descending() {
+        let file = NamedTempFile::new().unwrap();
+        let connection = Connection::open(file.path()).unwrap();
+        create_message_table(&connection);
+
+        insert_usage_message(&connection, "cheap", 1000, "cheap", 0.5);
+        insert_usage_message(&connection, "expensive", 2000, "expensive", 2.0);
+        drop(connection);
+
+        let stats = load_usage(file.path(), Mode::AllTime, None).unwrap();
+
+        assert_eq!(stats.models[0].display_name, "provider/expensive");
+        assert_eq!(stats.models[1].display_name, "provider/cheap");
+    }
+
     fn insert_message(connection: &Connection, id: &str, time: i64, data: &str) {
         connection
             .execute(
                 "INSERT INTO message (id, session_id, time_created, time_updated, data)
                  VALUES (?1, 'session', ?2, ?2, ?3)",
                 (id, time, data),
+            )
+            .unwrap();
+    }
+
+    fn insert_usage_message(
+        connection: &Connection,
+        id: &str,
+        time: i64,
+        model_id: &str,
+        cost: f64,
+    ) {
+        let data = format!(
+            r#"{{
+                "role":"assistant",
+                "cost":{cost},
+                "tokens":{{"input":1,"output":1,"cache":{{"read":1,"write":1}}}},
+                "modelID":"{model_id}",
+                "providerID":"provider"
+            }}"#
+        );
+        insert_message(connection, id, time, &data);
+    }
+
+    fn create_message_table(connection: &Connection) {
+        connection
+            .execute(
+                "CREATE TABLE message (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    time_created INTEGER NOT NULL,
+                    time_updated INTEGER NOT NULL,
+                    data TEXT NOT NULL
+                )",
+                [],
             )
             .unwrap();
     }
