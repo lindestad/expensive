@@ -23,7 +23,15 @@ usual late-night coding accounting better than a strict midnight cutoff.
 
 ## Install
 
-From this repo:
+Install the published crate:
+
+```bash
+cargo install --locked expensive
+```
+
+## Development
+
+Install from a local checkout:
 
 ```bash
 cargo install --locked --path .
