@@ -3,6 +3,13 @@ name = "expensive"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+description = "Terminal dashboard for OpenCode token usage and spend"
+repository = "https://github.com/lindestad/expensive"
+homepage = "https://github.com/lindestad/expensive"
+documentation = "https://docs.rs/expensive"
+readme = "README.md"
+keywords = ["opencode", "tui", "tokens", "ratatui"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 anyhow = "1"
