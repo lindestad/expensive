@@ -26,7 +26,7 @@ usual late-night coding accounting better than a strict midnight cutoff.
 From this repo:
 
 ```bash
-cargo install --path .
+cargo install --locked --path .
 ```
 
 Or run without installing:
