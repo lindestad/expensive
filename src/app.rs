@@ -232,6 +232,18 @@ impl AppState {
         Ok(())
     }
 
+    fn select_calendar_period(
+        &mut self,
+        period: PeriodKey,
+        tx: &Sender<RefreshMessage>,
+    ) -> Result<()> {
+        self.calendar.scale = period.scale;
+        self.calendar.selected = period;
+        self.sync_visible_periods()?;
+        self.ensure_calendar_costs(tx);
+        Ok(())
+    }
+
     fn sync_visible_periods(&mut self) -> Result<()> {
         self.calendar.visible_periods = time_window::visible_periods(
             self.calendar.selected,
@@ -646,6 +658,15 @@ fn handle_mouse(mouse: MouseEvent, area: Rect, app: &mut AppState, tx: &Sender<R
                 }
             }
         }
+        return;
+    }
+
+    if let Some(period) = tui::calendar_period_at_position(mouse.column, mouse.row, area, app) {
+        apply_calendar_action(app, tx, |app, tx| {
+            app.select_calendar_period(period, tx)?;
+            app.open_calendar_detail(tx);
+            Ok(())
+        });
     }
 }
 
@@ -746,6 +767,8 @@ fn local_from_millis(millis: i64) -> Result<DateTime<Local>> {
 mod tests {
     use std::{fs, path::PathBuf};
 
+    use chrono::TimeZone;
+
     use crate::{
         config::Scope,
         time_window::{DailyStart, WeekStart},
@@ -791,6 +814,45 @@ mod tests {
         assert!(fs::read_to_string(config_path)
             .unwrap()
             .contains(r#"color_theme = "ember""#));
+    }
+
+    #[test]
+    fn clicking_calendar_period_selects_and_opens_detail() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config_path = tempdir.path().join("config.toml");
+        let mut app = AppState::new(test_config(config_path)).unwrap();
+        let selected = time_window::current_period(
+            CalendarScale::Day,
+            Local.with_ymd_and_hms(2026, 6, 15, 10, 0, 0).unwrap(),
+            DailyStart::default(),
+            WeekStart::default(),
+        )
+        .unwrap();
+        app.view = View::CalendarOverview;
+        app.calendar.scale = CalendarScale::Day;
+        app.calendar.selected = selected;
+        app.calendar.visible_periods =
+            time_window::visible_periods(selected, DailyStart::default(), WeekStart::default())
+                .unwrap();
+        for period in &app.calendar.visible_periods {
+            app.calendar_costs.insert(*period, 0.0);
+        }
+        let (tx, _rx) = mpsc::channel();
+
+        handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 2,
+                row: 7,
+                modifiers: KeyModifiers::NONE,
+            },
+            Rect::new(0, 0, 120, 24),
+            &mut app,
+            &tx,
+        );
+
+        assert_eq!(app.view, View::CalendarDetail);
+        assert_eq!(app.calendar.selected, selected);
     }
 
     fn test_config(config_path: PathBuf) -> Config {

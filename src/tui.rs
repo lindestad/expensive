@@ -209,6 +209,32 @@ pub enum TabTarget {
     Calendar,
 }
 
+pub fn calendar_period_at_position(
+    column: u16,
+    row: u16,
+    area: Rect,
+    app: &AppState,
+) -> Option<PeriodKey> {
+    if app.view != View::CalendarOverview {
+        return None;
+    }
+
+    let body = main_body_area(area);
+    let inner = body.inner(Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+    if !rect_contains(inner, column, row) {
+        return None;
+    }
+
+    match app.calendar.scale {
+        CalendarScale::Day => day_period_at_position(column, row, inner, app),
+        CalendarScale::Week => period_grid_at_position(column, row, inner, app, 4),
+        CalendarScale::Month => period_grid_at_position(column, row, inner, app, 3),
+    }
+}
+
 fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &AppState, palette: Palette) {
     let config_path = app
         .config
@@ -284,6 +310,164 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &AppState, palette: Palette
         .wrap(Wrap { trim: false });
 
     frame.render_widget(paragraph, inner);
+}
+
+fn main_body_area(area: Rect) -> Rect {
+    Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(11),
+            Constraint::Length(1),
+        ])
+        .split(area)[1]
+}
+
+fn day_period_at_position(column: u16, row: u16, area: Rect, app: &AppState) -> Option<PeriodKey> {
+    if can_draw_framed_grid(area, 6, 7, 1) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(0)])
+            .split(area);
+        return framed_grid_period_at_position(
+            column,
+            row,
+            chunks[1],
+            &app.calendar.visible_periods,
+            7,
+            6,
+        );
+    }
+
+    compact_grid_period_at_position(
+        column,
+        row,
+        Rect::new(
+            area.x,
+            area.y.saturating_add(1),
+            area.width,
+            area.height.saturating_sub(1),
+        ),
+        &app.calendar.visible_periods,
+        7,
+        6,
+        &[
+            Constraint::Percentage(14),
+            Constraint::Percentage(14),
+            Constraint::Percentage(14),
+            Constraint::Percentage(14),
+            Constraint::Percentage(14),
+            Constraint::Percentage(15),
+            Constraint::Percentage(15),
+        ],
+    )
+}
+
+fn period_grid_at_position(
+    column: u16,
+    row: u16,
+    area: Rect,
+    app: &AppState,
+    columns: usize,
+) -> Option<PeriodKey> {
+    let rows = app.calendar.visible_periods.len().div_ceil(columns);
+    if can_draw_framed_grid(area, rows, columns, 0) {
+        return framed_grid_period_at_position(
+            column,
+            row,
+            area,
+            &app.calendar.visible_periods,
+            columns,
+            rows,
+        );
+    }
+
+    let constraints = (0..columns)
+        .map(|_| Constraint::Ratio(1, columns as u32))
+        .collect::<Vec<_>>();
+    compact_grid_period_at_position(
+        column,
+        row,
+        area,
+        &app.calendar.visible_periods,
+        columns,
+        rows,
+        &constraints,
+    )
+}
+
+fn framed_grid_period_at_position(
+    column: u16,
+    row: u16,
+    area: Rect,
+    periods: &[PeriodKey],
+    columns: usize,
+    rows: usize,
+) -> Option<PeriodKey> {
+    if !rect_contains(area, column, row) {
+        return None;
+    }
+
+    let row_areas = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(even_constraints(rows))
+        .split(area);
+    let row_idx = row_areas
+        .iter()
+        .position(|area| rect_contains(*area, column, row))?;
+    let column_areas = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(even_constraints(columns))
+        .split(row_areas[row_idx]);
+    let column_idx = column_areas
+        .iter()
+        .position(|area| rect_contains(*area, column, row))?;
+
+    periods.get(row_idx * columns + column_idx).copied()
+}
+
+fn compact_grid_period_at_position(
+    column: u16,
+    row: u16,
+    area: Rect,
+    periods: &[PeriodKey],
+    columns: usize,
+    rows: usize,
+    column_constraints: &[Constraint],
+) -> Option<PeriodKey> {
+    if !rect_contains(area, column, row) {
+        return None;
+    }
+
+    let row_idx = row.checked_sub(area.y)? as usize;
+    if row_idx >= rows {
+        return None;
+    }
+
+    let column_idx = column_at_position(column, area, column_constraints, 1)?;
+    periods.get(row_idx * columns + column_idx).copied()
+}
+
+fn column_at_position(
+    column: u16,
+    area: Rect,
+    constraints: &[Constraint],
+    spacing: u16,
+) -> Option<usize> {
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(constraints)
+        .spacing(spacing)
+        .split(area)
+        .iter()
+        .position(|area| column >= area.x && column < area.x.saturating_add(area.width))
+}
+
+fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
+    column >= area.x
+        && column < area.x.saturating_add(area.width)
+        && row >= area.y
+        && row < area.y.saturating_add(area.height)
 }
 
 fn help_line(key: &'static str, description: &'static str, palette: Palette) -> Line<'static> {
@@ -1737,6 +1921,74 @@ mod tests {
         assert_eq!(tab_at_position(8, 1, area), None);
         assert_eq!(tab_at_position(80, 1, area), None);
         assert_eq!(tab_at_position(2, 2, area), None);
+    }
+
+    #[test]
+    fn maps_compact_day_calendar_click_to_period() {
+        let selected = time_window::current_period(
+            CalendarScale::Day,
+            Local.with_ymd_and_hms(2026, 6, 15, 10, 0, 0).unwrap(),
+            DailyStart::default(),
+            WeekStart::default(),
+        )
+        .unwrap();
+        let app = app_with_calendar(selected);
+        let area = Rect::new(0, 0, 120, 24);
+        let inner = main_body_area(area).inner(Margin {
+            horizontal: 1,
+            vertical: 1,
+        });
+
+        assert_eq!(
+            calendar_period_at_position(inner.x + 1, inner.y + 3, area, &app),
+            Some(selected)
+        );
+        assert_eq!(
+            calendar_period_at_position(inner.x + 1, inner.y, area, &app),
+            None
+        );
+    }
+
+    #[test]
+    fn maps_framed_week_calendar_click_to_period() {
+        let selected = time_window::current_period(
+            CalendarScale::Week,
+            Local.with_ymd_and_hms(2026, 6, 18, 10, 0, 0).unwrap(),
+            DailyStart::default(),
+            WeekStart::default(),
+        )
+        .unwrap();
+        let app = app_with_calendar(selected);
+        let area = Rect::new(0, 0, 120, 24);
+        let inner = main_body_area(area).inner(Margin {
+            horizontal: 1,
+            vertical: 1,
+        });
+        let idx = app
+            .calendar
+            .visible_periods
+            .iter()
+            .position(|period| *period == selected)
+            .unwrap();
+        let row_areas = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(even_constraints(3))
+            .split(inner);
+        let column_areas = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints(even_constraints(4))
+            .split(row_areas[idx / 4]);
+        let cell = column_areas[idx % 4];
+
+        assert_eq!(
+            calendar_period_at_position(
+                cell.x + cell.width / 2,
+                cell.y + cell.height / 2,
+                area,
+                &app
+            ),
+            Some(selected)
+        );
     }
 
     #[test]
