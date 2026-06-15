@@ -1,1 +1,19 @@
 /target/
+
+# Local runtime/config files
+/.env
+/.env.*
+/config.toml
+/*.db
+/*.db-shm
+/*.db-wal
+
+# Test and coverage output
+/coverage/
+/tarpaulin-report.html
+
+# Editor/merge leftovers
+*.swp
+*.swo
+*~
+*.orig
