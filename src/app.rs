@@ -465,7 +465,17 @@ fn handle_mouse(mouse: MouseEvent, area: Rect, app: &mut AppState, tx: &Sender<R
                     }
                 }
             },
-            tui::TabTarget::Calendar => app.enter_calendar(tx),
+            tui::TabTarget::Calendar => {
+                if app.view == View::Dashboard {
+                    app.enter_calendar(tx);
+                } else {
+                    app.view = View::Dashboard;
+                    app.error = None;
+                    if !app.stats.contains_key(&app.mode) {
+                        app.trigger_dashboard_refresh(tx);
+                    }
+                }
+            }
         }
     }
 }
