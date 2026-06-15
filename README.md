@@ -2,6 +2,9 @@
 
 A small terminal dashboard for OpenCode spend.
 
+<img width="1278" height="719" alt="image" src="https://github.com/user-attachments/assets/13e191cd-f0f6-46aa-bbe2-352f66b87d87" />
+
+
 `expensive` reads OpenCode's local SQLite database directly and turns the same
 kind of accounting you get from `opencode stats` into a live, fast dashboard you
 can keep open while you work.
