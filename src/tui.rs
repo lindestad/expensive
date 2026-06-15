@@ -369,7 +369,7 @@ fn styled_cell(value: String, color: Color, bold: bool) -> Cell<'static> {
 fn share_cell(value: f64, total: f64, max: f64) -> String {
     let percentage = format::percent(value, total);
     let bar = braille_bar(value, max, 8);
-    format!("{percentage} {bar}")
+    format!("{percentage:<6} {bar}")
 }
 
 fn braille_bar(value: f64, max: f64, width: usize) -> String {
@@ -480,7 +480,7 @@ mod tests {
         assert!(output.contains("Daily by model"));
         assert!(output.contains("provider/gpt-test (high)"));
         assert!(output.contains("$2.5000"));
-        assert!(output.contains("66.7% ⣿⣿⣿⣿⣿⣿⣿⣿"));
+        assert!(output.contains("66.7%  ⣿⣿⣿⣿⣿⣿⣿⣿"));
         assert!(output.contains("since Jun 15 04:00"));
     }
 
@@ -496,6 +496,16 @@ mod tests {
         assert!(output.contains("33.3%"));
         assert!(output.contains("⣿"));
         assert!(!output.contains("#"));
+    }
+
+    #[test]
+    fn aligns_cost_percent_bars_after_variable_width_percentages() {
+        let share = share_cell(1.4, 100.0, 98.6);
+        let larger_share = share_cell(98.6, 100.0, 98.6);
+
+        assert_eq!(share.find('⠄'), larger_share.find('⣿'));
+        assert_eq!(share, "1.4%   ⠄⠄⠄⠄⠄⠄⠄⠄");
+        assert_eq!(larger_share, "98.6%  ⣿⣿⣿⣿⣿⣿⣿⣿");
     }
 
     #[test]
