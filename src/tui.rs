@@ -3,7 +3,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap},
+    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap},
     Frame,
 };
 
@@ -171,11 +171,6 @@ pub fn draw(frame: &mut Frame<'_>, app: &AppState) {
         ])
         .split(area);
 
-    if app.show_help {
-        draw_help(frame, area, app, palette);
-        return;
-    }
-
     draw_tabs(frame, chunks[0], app, palette);
     match app.view {
         View::Dashboard => draw_stats_view(
@@ -202,6 +197,10 @@ pub fn draw(frame: &mut Frame<'_>, app: &AppState) {
         ),
     }
     draw_footer(frame, chunks[2], app, palette);
+
+    if app.show_help {
+        draw_help(frame, area, app, palette);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -223,13 +222,27 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &AppState, palette: Palette
         .collect::<Vec<_>>()
         .join(", ");
 
-    let lines = vec![
-        Line::from(vec![Span::styled(
-            "Controls",
+    let modal = centered_rect(area, 92, 26);
+    frame.render_widget(Clear, modal);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Help ")
+        .title_alignment(Alignment::Center)
+        .title_style(
             Style::default()
                 .fg(palette.title)
                 .add_modifier(Modifier::BOLD),
-        )]),
+        )
+        .border_style(Style::default().fg(palette.border));
+    let inner = modal.inner(Margin {
+        horizontal: 3,
+        vertical: 1,
+    });
+    frame.render_widget(block, modal);
+
+    let lines = vec![
+        section_title("Controls", palette),
         Line::from(""),
         help_line(
             "Tab / Shift+Tab",
@@ -243,59 +256,31 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &AppState, palette: Palette
         help_line("r", "refresh current view", palette),
         help_line("q", "quit", palette),
         Line::from(""),
-        Line::from(vec![Span::styled(
-            "Config",
-            Style::default()
-                .fg(palette.title)
-                .add_modifier(Modifier::BOLD),
-        )]),
+        section_title("Config", palette),
         Line::from(""),
-        Line::from(vec![
-            Span::styled("Edit: ", Style::default().fg(palette.muted)),
-            Span::styled(config_path, Style::default().fg(palette.text)),
-        ]),
+        config_line("file", config_path, palette),
         Line::from(""),
-        Line::from(Span::styled(
-            r#"daily_start = "04:00""#,
-            Style::default().fg(palette.text),
-        )),
-        Line::from(Span::styled(
-            "refresh_seconds = 60",
-            Style::default().fg(palette.text),
-        )),
-        Line::from(Span::styled(
-            r#"week_start = "monday" # monday or sunday"#,
-            Style::default().fg(palette.text),
-        )),
-        Line::from(Span::styled(
-            r#"color_theme = "aurora""#,
-            Style::default().fg(palette.text),
-        )),
-        Line::from(Span::styled(
+        centered_text(r#"daily_start = "04:00""#, palette.text),
+        centered_text("refresh_seconds = 60", palette.text),
+        centered_text(r#"week_start = "monday" # monday or sunday"#, palette.text),
+        centered_text(r#"color_theme = "aurora""#, palette.text),
+        centered_text(
             r#"theme_scope = "calendar" # calendar or all"#,
-            Style::default().fg(palette.text),
-        )),
-        Line::from(Span::styled(
-            r#"scope = "all""#,
-            Style::default().fg(palette.text),
-        )),
+            palette.text,
+        ),
+        centered_text(r#"scope = "all""#, palette.text),
         Line::from(""),
-        Line::from(vec![
-            Span::styled("Themes: ", Style::default().fg(palette.muted)),
-            Span::styled(themes, Style::default().fg(palette.text)),
-        ]),
-        Line::from(vec![
-            Span::styled("Current: ", Style::default().fg(palette.muted)),
-            Span::styled(
-                format!(
-                    "{} / {} / week starts {}",
-                    app.config.color_theme.title(),
-                    app.config.theme_scope.title(),
-                    app.config.week_start.title()
-                ),
-                Style::default().fg(palette.text),
+        config_line("themes", themes, palette),
+        config_line(
+            "current",
+            format!(
+                "{} / {} / week starts {}",
+                app.config.color_theme.title(),
+                app.config.theme_scope.title(),
+                app.config.week_start.title()
             ),
-        ]),
+            palette,
+        ),
         Line::from(""),
         Line::from(vec![
             key_span(" ? ", palette),
@@ -304,33 +289,71 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &AppState, palette: Palette
             Span::styled(" close ", Style::default().fg(palette.muted)),
             key_span(" q ", palette),
             Span::styled(" quit", Style::default().fg(palette.muted)),
-        ]),
+        ])
+        .alignment(Alignment::Center),
     ];
 
     let paragraph = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Help ")
-                .title_style(
-                    Style::default()
-                        .fg(palette.title)
-                        .add_modifier(Modifier::BOLD),
-                )
-                .border_style(Style::default().fg(palette.border)),
-        )
         .style(Style::default().fg(palette.text))
         .wrap(Wrap { trim: false });
 
-    frame.render_widget(paragraph, area);
+    frame.render_widget(paragraph, inner);
 }
 
 fn help_line(key: &'static str, description: &'static str, palette: Palette) -> Line<'static> {
+    const HELP_KEY_WIDTH: usize = 17;
+
     Line::from(vec![
-        key_span(key, palette),
-        Span::styled(" ", Style::default().fg(palette.muted)),
+        Span::styled(
+            format!("{key:>HELP_KEY_WIDTH$}  "),
+            Style::default()
+                .fg(palette.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(description, Style::default().fg(palette.text)),
     ])
+    .alignment(Alignment::Center)
+}
+
+fn section_title(title: &'static str, palette: Palette) -> Line<'static> {
+    Line::from(Span::styled(
+        title,
+        Style::default()
+            .fg(palette.title)
+            .add_modifier(Modifier::BOLD),
+    ))
+    .alignment(Alignment::Center)
+}
+
+fn config_line(label: &'static str, value: String, palette: Palette) -> Line<'static> {
+    const CONFIG_LABEL_WIDTH: usize = 17;
+
+    Line::from(vec![
+        Span::styled(
+            format!("{label:>CONFIG_LABEL_WIDTH$}  "),
+            Style::default().fg(palette.muted),
+        ),
+        Span::styled(value, Style::default().fg(palette.text)),
+    ])
+    .alignment(Alignment::Center)
+}
+
+fn centered_text(text: &'static str, color: Color) -> Line<'static> {
+    Line::from(Span::styled(text, Style::default().fg(color))).alignment(Alignment::Center)
+}
+
+fn centered_rect(area: Rect, max_width: u16, max_height: u16) -> Rect {
+    let width = area.width.saturating_sub(4).min(max_width).max(40);
+    let height = area.height.saturating_sub(4).min(max_height).max(12);
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+
+    Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    )
 }
 
 pub fn tab_at_position(column: u16, row: u16, area: Rect) -> Option<TabTarget> {
