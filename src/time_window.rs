@@ -98,6 +98,15 @@ impl CalendarScale {
             CalendarScale::Month => Mode::Monthly,
         }
     }
+
+    pub fn from_mode(mode: Mode) -> Option<Self> {
+        match mode {
+            Mode::Daily => Some(CalendarScale::Day),
+            Mode::Weekly => Some(CalendarScale::Week),
+            Mode::Monthly => Some(CalendarScale::Month),
+            Mode::AllTime => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

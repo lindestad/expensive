@@ -19,6 +19,7 @@ const TEXT: Color = Color::Rgb(220, 226, 235);
 const MUTED: Color = Color::Rgb(119, 133, 154);
 const TITLE: Color = Color::Rgb(170, 220, 255);
 const ACCENT: Color = Color::Rgb(80, 210, 190);
+const CALENDAR_ACCENT: Color = Color::Rgb(218, 170, 255);
 const COST: Color = Color::Rgb(255, 196, 118);
 const TOKENS: Color = Color::Rgb(155, 210, 255);
 const IO: Color = Color::Rgb(187, 162, 255);
@@ -29,6 +30,13 @@ const ERROR: Color = Color::Rgb(255, 117, 117);
 struct MetricStyle {
     value: Color,
     label: Color,
+}
+
+#[derive(Clone, Copy)]
+enum TabStyle {
+    Normal,
+    Dashboard,
+    Calendar,
 }
 
 pub fn draw(frame: &mut Frame<'_>, app: &AppState) {
@@ -134,17 +142,18 @@ fn draw_tabs(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         if idx > 0 {
             spans.push(Span::raw(" "));
         }
-        spans.push(tab_span(
-            mode.title(),
-            app.view == View::Dashboard && app.mode == *mode,
-        ));
+        spans.push(tab_span(mode.title(), mode_tab_style(app, *mode)));
     }
 
     frame.render_widget(Paragraph::new(Line::from(spans)), left_area);
     frame.render_widget(
         Paragraph::new(Line::from(tab_span(
             CALENDAR_TAB,
-            app.view != View::Dashboard,
+            if app.view == View::Dashboard {
+                TabStyle::Normal
+            } else {
+                TabStyle::Calendar
+            },
         )))
         .alignment(Alignment::Right),
         calendar_area,
@@ -157,11 +166,29 @@ fn tab_width(label: &str) -> u16 {
     label.chars().count() as u16 + 2
 }
 
-fn tab_span(label: &str, selected: bool) -> Span<'static> {
-    let style = if selected {
-        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(MUTED)
+fn mode_tab_style(app: &AppState, mode: Mode) -> TabStyle {
+    if app.view == View::Dashboard && app.mode == mode {
+        return TabStyle::Dashboard;
+    }
+
+    if app.view != View::Dashboard
+        && CalendarScale::from_mode(mode)
+            .map(|scale| scale == app.calendar.scale)
+            .unwrap_or(false)
+    {
+        return TabStyle::Calendar;
+    }
+
+    TabStyle::Normal
+}
+
+fn tab_span(label: &str, tab_style: TabStyle) -> Span<'static> {
+    let style = match tab_style {
+        TabStyle::Normal => Style::default().fg(MUTED),
+        TabStyle::Dashboard => Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        TabStyle::Calendar => Style::default()
+            .fg(CALENDAR_ACCENT)
+            .add_modifier(Modifier::BOLD),
     };
     Span::styled(format!(" {label} "), style)
 }

@@ -455,7 +455,16 @@ fn handle_mouse(mouse: MouseEvent, area: Rect, app: &mut AppState, tx: &Sender<R
 
     if let Some(target) = tui::tab_at_position(mouse.column, mouse.row, area) {
         match target {
-            tui::TabTarget::Mode(mode) => app.switch_mode(mode, tx),
+            tui::TabTarget::Mode(mode) => match app.view {
+                View::Dashboard => app.switch_mode(mode, tx),
+                View::CalendarOverview | View::CalendarDetail => {
+                    if let Some(scale) = CalendarScale::from_mode(mode) {
+                        apply_calendar_action(app, tx, |app, tx| app.set_calendar_scale(scale, tx));
+                    } else {
+                        app.switch_mode(mode, tx);
+                    }
+                }
+            },
             tui::TabTarget::Calendar => app.enter_calendar(tx),
         }
     }
