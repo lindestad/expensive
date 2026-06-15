@@ -34,6 +34,22 @@ struct MetricStyle {
     label: Color,
 }
 
+struct FramedGrid<'a> {
+    periods: &'a [PeriodKey],
+    columns: usize,
+    rows: usize,
+    selected: PeriodKey,
+    max_cost: f64,
+}
+
+struct FramedCell {
+    period: PeriodKey,
+    cost: Option<f64>,
+    max_cost: f64,
+    selected: bool,
+    in_primary_range: bool,
+}
+
 #[derive(Clone, Copy)]
 enum TabStyle {
     Normal,
@@ -236,12 +252,18 @@ fn draw_calendar_overview(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
 }
 
 fn draw_day_calendar(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
-    let headers = Row::new(["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"])
-        .style(Style::default().fg(TITLE).add_modifier(Modifier::BOLD));
     let selected_month = local_date(app.calendar.selected.start_millis)
         .map(|date| (date.year(), date.month()))
         .unwrap_or((0, 0));
     let max_cost = calendar_max_cost(app);
+
+    if can_draw_framed_grid(area, 6, 7, 1) {
+        draw_framed_day_calendar(frame, area, app, selected_month, max_cost);
+        return;
+    }
+
+    let headers = Row::new(["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"])
+        .style(Style::default().fg(TITLE).add_modifier(Modifier::BOLD));
 
     let rows = app.calendar.visible_periods.chunks(7).map(|week| {
         Row::new(week.iter().map(|period| {
@@ -279,10 +301,17 @@ fn draw_day_calendar(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
 }
 
 fn draw_period_grid(frame: &mut Frame<'_>, area: Rect, app: &AppState, columns: usize) {
+    let row_count = app.calendar.visible_periods.len().div_ceil(columns);
+    let max_cost = calendar_max_cost(app);
+
+    if can_draw_framed_grid(area, row_count, columns, 0) {
+        draw_framed_period_grid(frame, area, app, columns, row_count, max_cost);
+        return;
+    }
+
     let constraints = (0..columns)
         .map(|_| Constraint::Ratio(1, columns as u32))
         .collect::<Vec<_>>();
-    let max_cost = calendar_max_cost(app);
     let rows = app.calendar.visible_periods.chunks(columns).map(|periods| {
         Row::new(periods.iter().map(|period| {
             let cost = app.calendar_cost(*period);
@@ -299,6 +328,189 @@ fn draw_period_grid(frame: &mut Frame<'_>, area: Rect, app: &AppState, columns: 
 
     let table = Table::new(rows, constraints).column_spacing(1);
     frame.render_widget(table, area);
+}
+
+fn draw_framed_day_calendar(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &AppState,
+    selected_month: (i32, u32),
+    max_cost: f64,
+) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(area);
+    draw_day_headers(frame, chunks[0]);
+    draw_framed_period_rows(
+        frame,
+        chunks[1],
+        app,
+        FramedGrid {
+            periods: &app.calendar.visible_periods,
+            columns: 7,
+            rows: 6,
+            selected: app.calendar.selected,
+            max_cost,
+        },
+        |period| {
+            local_date(period.start_millis)
+                .map(|date| (date.year(), date.month()) == selected_month)
+                .unwrap_or(false)
+        },
+        day_framed_lines,
+    );
+}
+
+fn draw_framed_period_grid(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &AppState,
+    columns: usize,
+    rows: usize,
+    max_cost: f64,
+) {
+    draw_framed_period_rows(
+        frame,
+        area,
+        app,
+        FramedGrid {
+            periods: &app.calendar.visible_periods,
+            columns,
+            rows,
+            selected: app.calendar.selected,
+            max_cost,
+        },
+        |_| true,
+        period_framed_lines,
+    );
+}
+
+fn draw_framed_period_rows(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &AppState,
+    grid: FramedGrid<'_>,
+    is_primary: impl Fn(PeriodKey) -> bool,
+    lines: impl Fn(PeriodKey, Option<f64>) -> Vec<Line<'static>>,
+) {
+    let row_areas = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(even_constraints(grid.rows))
+        .split(area);
+
+    for row_idx in 0..grid.rows {
+        let column_areas = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints(even_constraints(grid.columns))
+            .split(row_areas[row_idx]);
+
+        for column_idx in 0..grid.columns {
+            let Some(period) = grid
+                .periods
+                .get(row_idx * grid.columns + column_idx)
+                .copied()
+            else {
+                continue;
+            };
+            let cost = app.calendar_cost(period);
+            let cell = FramedCell {
+                period,
+                cost,
+                max_cost: grid.max_cost,
+                selected: grid.selected == period,
+                in_primary_range: is_primary(period),
+            };
+            draw_framed_period_cell(frame, column_areas[column_idx], cell, lines(period, cost));
+        }
+    }
+}
+
+fn draw_day_headers(frame: &mut Frame<'_>, area: Rect) {
+    let headers = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(even_constraints(headers.len()))
+        .split(area);
+
+    for (idx, header) in headers.iter().enumerate() {
+        frame.render_widget(
+            Paragraph::new(*header)
+                .style(Style::default().fg(TITLE).add_modifier(Modifier::BOLD))
+                .alignment(Alignment::Center),
+            chunks[idx],
+        );
+    }
+}
+
+fn draw_framed_period_cell(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    cell: FramedCell,
+    lines: Vec<Line<'static>>,
+) {
+    let style = period_style(
+        cell.period,
+        cell.cost,
+        cell.max_cost,
+        cell.selected,
+        cell.in_primary_range,
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(period_border_style(
+            style,
+            cell.selected,
+            cell.in_primary_range,
+        ))
+        .style(style);
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .style(style)
+        .alignment(Alignment::Center);
+    frame.render_widget(paragraph, area);
+}
+
+fn can_draw_framed_grid(area: Rect, rows: usize, columns: usize, extra_rows: u16) -> bool {
+    let rows = rows as u16;
+    let columns = columns as u16;
+    area.height >= rows.saturating_mul(4).saturating_add(extra_rows)
+        && area.width >= columns.saturating_mul(11)
+}
+
+fn even_constraints(count: usize) -> Vec<Constraint> {
+    (0..count)
+        .map(|_| Constraint::Ratio(1, count as u32))
+        .collect()
+}
+
+fn period_border_style(style: Style, selected: bool, in_primary_range: bool) -> Style {
+    let color = if selected {
+        Color::Black
+    } else if in_primary_range {
+        BORDER
+    } else {
+        MUTED
+    };
+    let mut border = Style::default().fg(color);
+    if let Some(bg) = style.bg {
+        border = border.bg(bg);
+    }
+    border
+}
+
+fn day_framed_lines(period: PeriodKey, cost: Option<f64>) -> Vec<Line<'static>> {
+    let day = local_date(period.start_millis)
+        .map(|date| date.day().to_string())
+        .unwrap_or_else(|| "?".to_string());
+    vec![Line::from(day), Line::from(cost_label(cost))]
+}
+
+fn period_framed_lines(period: PeriodKey, cost: Option<f64>) -> Vec<Line<'static>> {
+    vec![
+        Line::from(compact_period_label(period)),
+        Line::from(cost_label(cost)),
+    ]
 }
 
 fn period_cell(
@@ -1083,6 +1295,23 @@ mod tests {
         assert!(output.contains("Mon"));
         assert!(output.contains("15 $4.25"));
         assert!(output.contains("selected Jun 15"));
+    }
+
+    #[test]
+    fn renders_framed_calendar_cells_when_large_enough() {
+        let selected = time_window::current_period(
+            CalendarScale::Day,
+            Local.with_ymd_and_hms(2026, 6, 15, 10, 0, 0).unwrap(),
+            DailyStart::default(),
+        )
+        .unwrap();
+        let mut app = app_with_calendar(selected);
+        app.calendar_costs.insert(selected, 4.25);
+
+        let output = render(&app, 120, 36);
+
+        assert!(output.contains("$4.25"));
+        assert!(output.matches('┌').count() > 10);
     }
 
     #[test]
