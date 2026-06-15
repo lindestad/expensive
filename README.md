@@ -104,6 +104,7 @@ Example:
 daily_start = "04:00"
 week_start = "monday"
 refresh_seconds = 60
+auto_refresh = true
 color_theme = "aurora"
 theme_scope = "calendar"
 scope = "all"
@@ -111,7 +112,8 @@ scope = "all"
 
 Only `scope = "all"` is supported today.
 
-`week_start` can be `monday` or `sunday`. Themes are `aurora`, `ember`,
+`week_start` can be `monday` or `sunday`. `auto_refresh` can be `true` or
+`false`. Themes are `aurora`, `ember`,
 `ocean`, `forest`, and `graphite`. `theme_scope = "calendar"` applies the
 theme to the Calendar heatmap only; `theme_scope = "all"` applies it to the
 entire TUI.

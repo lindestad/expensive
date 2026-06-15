@@ -19,9 +19,9 @@ use crossterm::{
 use ratatui::{backend::CrosstermBackend, layout::Rect, Terminal};
 
 use crate::{
-    config::Config,
+    config::{self, ColorTheme, Config, ThemeScope},
     db::{self, UsageStats},
-    time_window::{self, CalendarScale, Mode, PeriodKey},
+    time_window::{self, CalendarScale, Mode, PeriodKey, WeekStart},
     tui,
 };
 
@@ -38,10 +38,44 @@ pub struct CalendarState {
     pub visible_periods: Vec<PeriodKey>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfigNotice {
+    pub message: String,
+    pub is_error: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConfigEditorItem {
+    AutoRefresh,
+    WeekStart,
+    ColorTheme,
+    ThemeScope,
+}
+
+impl ConfigEditorItem {
+    pub const ALL: [Self; 4] = [
+        Self::AutoRefresh,
+        Self::WeekStart,
+        Self::ColorTheme,
+        Self::ThemeScope,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::AutoRefresh => "auto_refresh",
+            Self::WeekStart => "week_start",
+            Self::ColorTheme => "color_theme",
+            Self::ThemeScope => "theme_scope",
+        }
+    }
+}
+
 pub struct AppState {
     pub config: Config,
     pub view: View,
     pub show_help: bool,
+    pub config_selection: usize,
+    pub config_notice: Option<ConfigNotice>,
     pub mode: Mode,
     pub stats: HashMap<Mode, UsageStats>,
     pub loading: HashSet<Mode>,
@@ -71,6 +105,8 @@ impl AppState {
             config,
             view: View::Dashboard,
             show_help: false,
+            config_selection: 0,
+            config_notice: None,
             mode: Mode::Daily,
             stats: HashMap::new(),
             loading: HashSet::new(),
@@ -107,6 +143,10 @@ impl AppState {
 
     pub fn calendar_cost(&self, period: PeriodKey) -> Option<f64> {
         self.calendar_costs.get(&period).copied()
+    }
+
+    pub fn selected_config_item(&self) -> ConfigEditorItem {
+        ConfigEditorItem::ALL[self.config_selection.min(ConfigEditorItem::ALL.len() - 1)]
     }
 
     fn switch_mode(&mut self, mode: Mode, tx: &Sender<RefreshMessage>) {
@@ -171,9 +211,13 @@ impl AppState {
             self.config.week_start,
         )?;
         self.sync_visible_periods()?;
-        self.ensure_calendar_costs(tx);
-        if self.view == View::CalendarDetail {
-            self.trigger_history_refresh(tx);
+        match self.view {
+            View::Dashboard => {}
+            View::CalendarOverview => self.ensure_calendar_costs(tx),
+            View::CalendarDetail => {
+                self.ensure_calendar_costs(tx);
+                self.trigger_history_refresh(tx);
+            }
         }
         Ok(())
     }
@@ -316,6 +360,74 @@ impl AppState {
             }
         }
     }
+
+    fn move_config_selection(&mut self, steps: i32) {
+        let len = ConfigEditorItem::ALL.len() as i32;
+        let idx = self.config_selection as i32;
+        self.config_selection = (idx + steps).rem_euclid(len) as usize;
+    }
+
+    fn edit_selected_config(&mut self, direction: i32, tx: &Sender<RefreshMessage>) -> Result<()> {
+        match self.selected_config_item() {
+            ConfigEditorItem::AutoRefresh => {
+                self.config.auto_refresh = !self.config.auto_refresh;
+                if self.config.auto_refresh {
+                    self.next_refresh_due = Instant::now() + self.config.refresh_interval;
+                }
+            }
+            ConfigEditorItem::WeekStart => {
+                self.config.week_start = cycle_week_start(self.config.week_start, direction);
+                self.realign_calendar_for_config(tx)?;
+            }
+            ConfigEditorItem::ColorTheme => {
+                self.config.color_theme =
+                    cycle_value(&ColorTheme::ALL, self.config.color_theme, direction);
+            }
+            ConfigEditorItem::ThemeScope => {
+                self.config.theme_scope = cycle_value(
+                    &[ThemeScope::Calendar, ThemeScope::All],
+                    self.config.theme_scope,
+                    direction,
+                );
+            }
+        }
+
+        self.save_config_notice();
+        Ok(())
+    }
+
+    fn realign_calendar_for_config(&mut self, tx: &Sender<RefreshMessage>) -> Result<()> {
+        let selected_start = local_from_millis(self.calendar.selected.start_millis)?;
+        self.calendar.selected = time_window::current_period(
+            self.calendar.scale,
+            selected_start,
+            self.config.daily_start,
+            self.config.week_start,
+        )?;
+        self.sync_visible_periods()?;
+        self.ensure_calendar_costs(tx);
+        if self.view == View::CalendarDetail {
+            self.trigger_history_refresh(tx);
+        }
+        Ok(())
+    }
+
+    fn save_config_notice(&mut self) {
+        match config::save(&self.config) {
+            Ok(()) => {
+                self.config_notice = Some(ConfigNotice {
+                    message: "saved config".to_string(),
+                    is_error: false,
+                });
+            }
+            Err(error) => {
+                self.config_notice = Some(ConfigNotice {
+                    message: format!("config not saved: {error:#}"),
+                    is_error: true,
+                });
+            }
+        }
+    }
 }
 
 enum RefreshMessage {
@@ -396,6 +508,26 @@ fn handle_key(
         match code {
             KeyCode::Char('q') => return true,
             KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => return true,
+            KeyCode::Up | KeyCode::Char('k') => {
+                app.move_config_selection(-1);
+                return false;
+            }
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+                app.move_config_selection(1);
+                return false;
+            }
+            KeyCode::BackTab => {
+                app.move_config_selection(-1);
+                return false;
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                apply_config_action(app, tx, |app, tx| app.edit_selected_config(-1, tx));
+                return false;
+            }
+            KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter | KeyCode::Char(' ') => {
+                apply_config_action(app, tx, |app, tx| app.edit_selected_config(1, tx));
+                return false;
+            }
             KeyCode::Esc => {
                 app.show_help = false;
                 return false;
@@ -578,8 +710,100 @@ fn apply_calendar_action(
     }
 }
 
+fn apply_config_action(
+    app: &mut AppState,
+    tx: &Sender<RefreshMessage>,
+    action: impl FnOnce(&mut AppState, &Sender<RefreshMessage>) -> Result<()>,
+) {
+    if let Err(error) = action(app, tx) {
+        app.config_notice = Some(ConfigNotice {
+            message: format!("config not applied: {error:#}"),
+            is_error: true,
+        });
+    }
+}
+
+fn cycle_week_start(current: WeekStart, direction: i32) -> WeekStart {
+    cycle_value(&[WeekStart::Monday, WeekStart::Sunday], current, direction)
+}
+
+fn cycle_value<T: Copy + Eq>(values: &[T], current: T, direction: i32) -> T {
+    let current_idx = values
+        .iter()
+        .position(|value| *value == current)
+        .unwrap_or(0) as i32;
+    let next_idx = (current_idx + direction.signum()).rem_euclid(values.len() as i32) as usize;
+    values[next_idx]
+}
+
 fn local_from_millis(millis: i64) -> Result<DateTime<Local>> {
     DateTime::from_timestamp_millis(millis)
         .map(|value| value.with_timezone(&Local))
         .ok_or_else(|| anyhow::anyhow!("timestamp is outside the supported range"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, path::PathBuf};
+
+    use crate::{
+        config::Scope,
+        time_window::{DailyStart, WeekStart},
+    };
+
+    use super::*;
+
+    #[test]
+    fn help_space_toggles_auto_refresh_and_saves_config() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config_path = tempdir.path().join("config.toml");
+        let mut app = AppState::new(test_config(config_path.clone())).unwrap();
+        app.show_help = true;
+        let (tx, _rx) = mpsc::channel();
+
+        let should_quit = handle_key(KeyCode::Char(' '), KeyModifiers::NONE, &mut app, &tx);
+
+        assert!(!should_quit);
+        assert!(!app.config.auto_refresh);
+        assert_eq!(
+            app.config_notice.as_ref().map(|notice| notice.is_error),
+            Some(false)
+        );
+        assert!(fs::read_to_string(config_path)
+            .unwrap()
+            .contains("auto_refresh = false"));
+    }
+
+    #[test]
+    fn help_cycles_selected_option_and_saves_config() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config_path = tempdir.path().join("config.toml");
+        let mut app = AppState::new(test_config(config_path.clone())).unwrap();
+        app.show_help = true;
+        let (tx, _rx) = mpsc::channel();
+
+        handle_key(KeyCode::Down, KeyModifiers::NONE, &mut app, &tx);
+        handle_key(KeyCode::Down, KeyModifiers::NONE, &mut app, &tx);
+        handle_key(KeyCode::Right, KeyModifiers::NONE, &mut app, &tx);
+
+        assert_eq!(app.selected_config_item(), ConfigEditorItem::ColorTheme);
+        assert_eq!(app.config.color_theme, ColorTheme::Ember);
+        assert!(fs::read_to_string(config_path)
+            .unwrap()
+            .contains(r#"color_theme = "ember""#));
+    }
+
+    fn test_config(config_path: PathBuf) -> Config {
+        Config {
+            db_path: PathBuf::from("/tmp/opencode.db"),
+            config_path: Some(config_path),
+            daily_start: DailyStart::default(),
+            week_start: WeekStart::default(),
+            refresh_interval: Duration::from_secs(60),
+            auto_refresh: true,
+            scope: Scope::All,
+            color_theme: ColorTheme::Aurora,
+            theme_scope: ThemeScope::Calendar,
+        }
+    }
 }

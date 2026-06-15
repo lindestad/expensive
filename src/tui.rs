@@ -8,11 +8,11 @@ use ratatui::{
 };
 
 use crate::{
-    app::{AppState, View},
+    app::{AppState, ConfigEditorItem, View},
     config::{ColorTheme, ThemeScope},
     db::{ModelUsage, UsageStats, UsageTotals},
     format,
-    time_window::{self, CalendarScale, Mode, PeriodKey},
+    time_window::{self, CalendarScale, Mode, PeriodKey, WeekStart},
 };
 
 #[derive(Clone, Copy)]
@@ -216,13 +216,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &AppState, palette: Palette
         .as_ref()
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| "config directory unavailable".to_string());
-    let themes = ColorTheme::ALL
-        .iter()
-        .map(|theme| theme.key())
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    let modal = centered_rect(area, 92, 26);
+    let modal = centered_rect(area, 96, 30);
     frame.render_widget(Clear, modal);
 
     let block = Block::default()
@@ -258,29 +252,21 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &AppState, palette: Palette
         Line::from(""),
         section_title("Config", palette),
         Line::from(""),
-        config_line("file", config_path, palette),
-        Line::from(""),
-        centered_text(r#"daily_start = "04:00""#, palette.text),
-        centered_text("refresh_seconds = 60", palette.text),
-        centered_text(r#"week_start = "monday" # monday or sunday"#, palette.text),
-        centered_text(r#"color_theme = "aurora""#, palette.text),
-        centered_text(
-            r#"theme_scope = "calendar" # calendar or all"#,
-            palette.text,
-        ),
-        centered_text(r#"scope = "all""#, palette.text),
-        Line::from(""),
-        config_line("themes", themes, palette),
-        config_line(
-            "current",
-            format!(
-                "{} / {} / week starts {}",
-                app.config.color_theme.title(),
-                app.config.theme_scope.title(),
-                app.config.week_start.title()
-            ),
+        help_line("j/k", "select a config row", palette),
+        help_line(
+            "Space / Enter",
+            "toggle or cycle the selected value",
             palette,
         ),
+        help_line("h/l", "cycle choices", palette),
+        Line::from(""),
+        config_editor_line(ConfigEditorItem::AutoRefresh, app, palette),
+        config_editor_line(ConfigEditorItem::WeekStart, app, palette),
+        config_editor_line(ConfigEditorItem::ColorTheme, app, palette),
+        config_editor_line(ConfigEditorItem::ThemeScope, app, palette),
+        config_notice_line(app, palette),
+        Line::from(""),
+        config_line("file", config_path, palette),
         Line::from(""),
         Line::from(vec![
             key_span(" ? ", palette),
@@ -338,10 +324,6 @@ fn config_line(label: &'static str, value: String, palette: Palette) -> Line<'st
     .alignment(Alignment::Center)
 }
 
-fn centered_text(text: &'static str, color: Color) -> Line<'static> {
-    Line::from(Span::styled(text, Style::default().fg(color))).alignment(Alignment::Center)
-}
-
 fn centered_rect(area: Rect, max_width: u16, max_height: u16) -> Rect {
     let width = area.width.saturating_sub(4).min(max_width).max(40);
     let height = area.height.saturating_sub(4).min(max_height).max(12);
@@ -354,6 +336,125 @@ fn centered_rect(area: Rect, max_width: u16, max_height: u16) -> Rect {
         width,
         height,
     )
+}
+
+fn config_editor_line(item: ConfigEditorItem, app: &AppState, palette: Palette) -> Line<'static> {
+    let selected = app.selected_config_item() == item;
+    let mut spans = vec![config_editor_label(item.label(), selected, palette)];
+
+    match item {
+        ConfigEditorItem::AutoRefresh => {
+            spans.push(checkbox_span(app.config.auto_refresh, palette));
+            spans.push(Span::styled(
+                if app.config.auto_refresh {
+                    "  refreshes automatically"
+                } else {
+                    "  manual refresh only"
+                },
+                Style::default().fg(palette.muted),
+            ));
+        }
+        ConfigEditorItem::WeekStart => push_options(
+            &mut spans,
+            &[
+                (app.config.week_start == WeekStart::Monday, "monday"),
+                (app.config.week_start == WeekStart::Sunday, "sunday"),
+            ],
+            palette,
+        ),
+        ConfigEditorItem::ColorTheme => push_options(
+            &mut spans,
+            &[
+                (app.config.color_theme == ColorTheme::Aurora, "aurora"),
+                (app.config.color_theme == ColorTheme::Ember, "ember"),
+                (app.config.color_theme == ColorTheme::Ocean, "ocean"),
+                (app.config.color_theme == ColorTheme::Forest, "forest"),
+                (app.config.color_theme == ColorTheme::Graphite, "graphite"),
+            ],
+            palette,
+        ),
+        ConfigEditorItem::ThemeScope => push_options(
+            &mut spans,
+            &[
+                (app.config.theme_scope == ThemeScope::Calendar, "calendar"),
+                (app.config.theme_scope == ThemeScope::All, "all"),
+            ],
+            palette,
+        ),
+    }
+
+    Line::from(spans).alignment(Alignment::Center)
+}
+
+fn config_editor_label(label: &'static str, selected: bool, palette: Palette) -> Span<'static> {
+    const CONFIG_EDITOR_LABEL_WIDTH: usize = 18;
+    let marker = if selected { ">" } else { " " };
+    let style = if selected {
+        Style::default()
+            .fg(palette.calendar_accent)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(palette.muted)
+    };
+
+    Span::styled(
+        format!("{marker} {label:>CONFIG_EDITOR_LABEL_WIDTH$}  "),
+        style,
+    )
+}
+
+fn checkbox_span(checked: bool, palette: Palette) -> Span<'static> {
+    let label = if checked { "[x]" } else { "[ ]" };
+    Span::styled(
+        label,
+        Style::default()
+            .fg(Color::Black)
+            .bg(if checked {
+                palette.calendar_accent
+            } else {
+                palette.muted
+            })
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
+fn push_options(
+    spans: &mut Vec<Span<'static>>,
+    options: &[(bool, &'static str)],
+    palette: Palette,
+) {
+    for (idx, (active, label)) in options.iter().enumerate() {
+        if idx > 0 {
+            spans.push(Span::raw(" "));
+        }
+
+        let style = if *active {
+            Style::default()
+                .fg(Color::Black)
+                .bg(palette.calendar_accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(palette.muted)
+        };
+
+        spans.push(Span::styled(format!(" {label} "), style));
+    }
+}
+
+fn config_notice_line(app: &AppState, palette: Palette) -> Line<'static> {
+    let Some(notice) = &app.config_notice else {
+        return Line::from("");
+    };
+
+    Line::from(Span::styled(
+        notice.message.clone(),
+        Style::default().fg(if notice.is_error {
+            palette.error
+        } else {
+            palette.accent
+        }),
+    ))
+    .alignment(Alignment::Center)
 }
 
 pub fn tab_at_position(column: u16, row: u16, area: Rect) -> Option<TabTarget> {
@@ -1766,6 +1867,8 @@ mod tests {
         assert!(output.contains("week_start"));
         assert!(output.contains("color_theme"));
         assert!(output.contains("theme_scope"));
+        assert!(output.contains("[x]"));
+        assert!(output.contains("Space / Enter"));
         assert!(output.contains("/tmp/expensive/config.toml"));
     }
 
@@ -1795,6 +1898,8 @@ mod tests {
             config: test_config(),
             view: View::Dashboard,
             show_help: false,
+            config_selection: 0,
+            config_notice: None,
             mode,
             stats: stats_by_mode,
             loading: HashSet::new(),
@@ -1814,6 +1919,8 @@ mod tests {
             config: test_config(),
             view: View::Dashboard,
             show_help: false,
+            config_selection: 0,
+            config_notice: None,
             mode,
             stats: HashMap::new(),
             loading: HashSet::from([mode]),
@@ -1833,6 +1940,8 @@ mod tests {
             config: test_config(),
             view: View::CalendarOverview,
             show_help: false,
+            config_selection: 0,
+            config_notice: None,
             mode: Mode::Daily,
             stats: HashMap::new(),
             loading: HashSet::new(),

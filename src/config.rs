@@ -23,6 +23,20 @@ pub enum Scope {
     All,
 }
 
+impl Scope {
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::All => "all",
+        }
+    }
+}
+
+impl fmt::Display for Scope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.key())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
 pub enum ColorTheme {
     #[default]
@@ -175,6 +189,7 @@ struct FileConfig {
     daily_start: Option<String>,
     week_start: Option<String>,
     refresh_seconds: Option<u64>,
+    auto_refresh: Option<bool>,
     scope: Option<String>,
     color_theme: Option<String>,
     theme_scope: Option<String>,
@@ -208,6 +223,11 @@ fn resolve_config(
     if refresh_seconds == 0 {
         return Err(anyhow!("refresh interval must be at least 1 second"));
     }
+    let auto_refresh = if cli.no_refresh {
+        false
+    } else {
+        file_config.auto_refresh.unwrap_or(true)
+    };
 
     let scope = match (cli.scope, file_config.scope.as_deref()) {
         (Some(value), _) => value,
@@ -237,7 +257,7 @@ fn resolve_config(
         daily_start,
         week_start,
         refresh_interval: Duration::from_secs(refresh_seconds),
-        auto_refresh: !cli.no_refresh,
+        auto_refresh,
         scope,
         color_theme,
         theme_scope,
@@ -259,6 +279,40 @@ fn load_file_config() -> Result<FileConfig> {
 
 pub fn config_path() -> Option<PathBuf> {
     dirs::config_dir().map(|path| path.join("expensive").join("config.toml"))
+}
+
+pub fn save(config: &Config) -> Result<()> {
+    let path = config
+        .config_path
+        .as_ref()
+        .ok_or_else(|| anyhow!("config path is unavailable"))?;
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+
+    fs::write(path, format_config(config)).with_context(|| format!("writing {}", path.display()))
+}
+
+fn format_config(config: &Config) -> String {
+    format!(
+        concat!(
+            "daily_start = \"{}\"\n",
+            "week_start = \"{}\"\n",
+            "refresh_seconds = {}\n",
+            "auto_refresh = {}\n",
+            "color_theme = \"{}\"\n",
+            "theme_scope = \"{}\"\n",
+            "scope = \"{}\"\n",
+        ),
+        config.daily_start,
+        config.week_start,
+        config.refresh_interval.as_secs(),
+        config.auto_refresh,
+        config.color_theme,
+        config.theme_scope,
+        config.scope,
+    )
 }
 
 fn discover_db_path(cli_path: Option<PathBuf>) -> PathBuf {
@@ -302,7 +356,7 @@ fn opencode_db_path() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, time::Duration};
+    use std::{fs, path::PathBuf, time::Duration};
 
     use super::*;
 
@@ -355,6 +409,7 @@ mod tests {
             daily_start: Some("04:00".to_string()),
             week_start: Some("monday".to_string()),
             refresh_seconds: Some(60),
+            auto_refresh: Some(true),
             scope: Some("all".to_string()),
             color_theme: Some("ember".to_string()),
             theme_scope: Some("calendar".to_string()),
@@ -382,6 +437,7 @@ mod tests {
     fn file_config_supports_theme_and_week_start() {
         let file_config = FileConfig {
             week_start: Some("sunday".to_string()),
+            auto_refresh: Some(false),
             color_theme: Some("forest".to_string()),
             theme_scope: Some("all".to_string()),
             ..FileConfig::default()
@@ -391,8 +447,37 @@ mod tests {
             resolve_config(cli(), file_config, PathBuf::from("/tmp/opencode.db"), None).unwrap();
 
         assert_eq!(config.week_start, WeekStart::Sunday);
+        assert!(!config.auto_refresh);
         assert_eq!(config.color_theme, ColorTheme::Forest);
         assert_eq!(config.theme_scope, ThemeScope::All);
+    }
+
+    #[test]
+    fn saves_editable_config_values() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("expensive").join("config.toml");
+        let config = Config {
+            db_path: PathBuf::from("/tmp/opencode.db"),
+            config_path: Some(path.clone()),
+            daily_start: "05:30".parse().unwrap(),
+            week_start: WeekStart::Sunday,
+            refresh_interval: Duration::from_secs(15),
+            auto_refresh: false,
+            scope: Scope::All,
+            color_theme: ColorTheme::Forest,
+            theme_scope: ThemeScope::All,
+        };
+
+        save(&config).unwrap();
+
+        let content = fs::read_to_string(path).unwrap();
+        assert!(content.contains(r#"daily_start = "05:30""#));
+        assert!(content.contains(r#"week_start = "sunday""#));
+        assert!(content.contains("refresh_seconds = 15"));
+        assert!(content.contains("auto_refresh = false"));
+        assert!(content.contains(r#"color_theme = "forest""#));
+        assert!(content.contains(r#"theme_scope = "all""#));
+        assert!(content.contains(r#"scope = "all""#));
     }
 
     #[test]
