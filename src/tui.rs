@@ -627,7 +627,7 @@ fn compact_period_label(period: PeriodKey) -> String {
 
     match period.scale {
         CalendarScale::Day => format!("{} {}", start.format("%b"), start.day()),
-        CalendarScale::Week => format!("{} {}", start.format("%b"), start.day()),
+        CalendarScale::Week => format!("W{} {}", start.iso_week().week(), start.format("%b %d")),
         CalendarScale::Month => start.format("%b").to_string(),
     }
 }
@@ -644,7 +644,12 @@ fn detail_period_label(period: PeriodKey) -> String {
             let end_label = end
                 .map(|date| format!("{} {}", date.format("%b"), date.day()))
                 .unwrap_or_else(|| "next week".to_string());
-            format!("{} {} - {end_label}", start.format("%b"), start.day())
+            format!(
+                "Week {}: {} {} - {end_label}",
+                start.iso_week().week(),
+                start.format("%b"),
+                start.day()
+            )
         }
         CalendarScale::Month => start.format("%B %Y").to_string(),
     }
@@ -1312,6 +1317,24 @@ mod tests {
 
         assert!(output.contains("$4.25"));
         assert!(output.matches('┌').count() > 10);
+    }
+
+    #[test]
+    fn renders_week_calendar_with_week_numbers() {
+        let selected = time_window::current_period(
+            CalendarScale::Week,
+            Local.with_ymd_and_hms(2026, 6, 18, 10, 0, 0).unwrap(),
+            DailyStart::default(),
+        )
+        .unwrap();
+        let mut app = app_with_calendar(selected);
+        app.calendar_costs.insert(selected, 6.5);
+
+        let output = render(&app, 120, 24);
+
+        assert!(output.contains("W25"));
+        assert!(output.contains("$6.50"));
+        assert!(output.contains("selected Week 25"));
     }
 
     #[test]
