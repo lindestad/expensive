@@ -165,6 +165,13 @@ struct HelpColumns {
     left_pad: usize,
 }
 
+struct HelpContent<'a> {
+    config_path: &'a str,
+    control_bindings: &'a [HelpBinding],
+    config_bindings: &'a [HelpBinding],
+    columns: HelpColumns,
+}
+
 #[derive(Clone, Copy)]
 struct ConfigColumns {
     label_width: usize,
@@ -330,38 +337,161 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &AppState, palette: Palette
         .copied()
         .collect::<Vec<_>>();
     let help_columns = help_columns(&all_bindings, inner.width as usize);
+    let help_content = HelpContent {
+        config_path: &config_path,
+        control_bindings: &control_bindings,
+        config_bindings: &config_bindings,
+        columns: help_columns,
+    };
 
-    let mut lines = vec![section_title("Controls", palette), Line::from("")];
-    lines.extend(help_binding_lines(&control_bindings, help_columns, palette));
-    lines.extend([
-        Line::from(""),
-        section_title("Config", palette),
-        Line::from(""),
-    ]);
-    lines.extend(help_binding_lines(&config_bindings, help_columns, palette));
-    lines.extend([Line::from("")]);
-    lines.extend(config_editor_lines(app, palette, inner.width as usize));
-    lines.extend([
-        config_notice_line(app, palette),
-        Line::from(""),
-        config_line("file", config_path, palette),
-        Line::from(""),
-        Line::from(vec![
-            key_span(" ? ", palette),
-            Span::styled(" close ", Style::default().fg(palette.muted)),
-            key_span(" Esc ", palette),
-            Span::styled(" close ", Style::default().fg(palette.muted)),
-            key_span(" q ", palette),
-            Span::styled(" quit", Style::default().fg(palette.muted)),
-        ])
-        .alignment(Alignment::Center),
-    ]);
+    let lines = help_lines(
+        app,
+        palette,
+        inner.width as usize,
+        inner.height as usize,
+        help_content,
+    );
 
     let paragraph = Paragraph::new(lines)
         .style(Style::default().fg(palette.text))
         .wrap(Wrap { trim: false });
 
     frame.render_widget(paragraph, inner);
+}
+
+fn help_lines(
+    app: &AppState,
+    palette: Palette,
+    width: usize,
+    height: usize,
+    content: HelpContent<'_>,
+) -> Vec<Line<'static>> {
+    let full_lines = full_help_lines(app, palette, width, &content);
+    if full_lines.len() <= height {
+        full_lines
+    } else {
+        compact_help_lines(app, palette, width, height, &content)
+    }
+}
+
+fn full_help_lines(
+    app: &AppState,
+    palette: Palette,
+    width: usize,
+    content: &HelpContent<'_>,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![section_title("Controls", palette), Line::from("")];
+    lines.extend(help_binding_lines(
+        content.control_bindings,
+        content.columns,
+        palette,
+    ));
+    lines.extend([
+        Line::from(""),
+        section_title("Config", palette),
+        Line::from(""),
+    ]);
+    lines.extend(help_binding_lines(
+        content.config_bindings,
+        content.columns,
+        palette,
+    ));
+    lines.extend([Line::from("")]);
+    lines.extend(config_editor_lines(
+        app,
+        palette,
+        width,
+        CONFIG_EDITOR_VISIBLE_ROWS,
+        true,
+    ));
+    lines.extend([
+        config_notice_line(app, palette),
+        Line::from(""),
+        config_line("file", content.config_path.to_string(), palette),
+        Line::from(""),
+        help_footer_line(palette),
+    ]);
+    lines
+}
+
+fn compact_help_lines(
+    app: &AppState,
+    palette: Palette,
+    width: usize,
+    height: usize,
+    content: &HelpContent<'_>,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![section_title("Config", palette)];
+    if height >= 10 {
+        lines.push(Line::from(""));
+        lines.extend(help_binding_lines(
+            content.config_bindings,
+            content.columns,
+            palette,
+        ));
+        lines.push(Line::from(""));
+    } else if height >= 6 {
+        lines.push(compact_config_controls_line(palette));
+    }
+
+    let include_footer = height >= 9;
+    let remaining = height.saturating_sub(lines.len() + usize::from(include_footer));
+    let (visible_rows, show_indicator) = config_rows_for_budget(remaining);
+    if visible_rows > 0 {
+        lines.extend(config_editor_lines(
+            app,
+            palette,
+            width,
+            visible_rows,
+            show_indicator,
+        ));
+    }
+
+    if include_footer && lines.len() < height {
+        lines.push(help_footer_line(palette));
+    }
+
+    lines.truncate(height);
+    lines
+}
+
+fn config_rows_for_budget(budget: usize) -> (usize, bool) {
+    let total = ConfigEditorItem::ALL.len();
+    if budget == 0 {
+        return (0, false);
+    }
+    if budget >= total {
+        return (total, false);
+    }
+    if budget == 1 {
+        return (1, false);
+    }
+
+    (budget.saturating_sub(1).max(1).min(total), true)
+}
+
+fn compact_config_controls_line(palette: Palette) -> Line<'static> {
+    Line::from(vec![
+        key_span(" j/k ", palette),
+        Span::styled(" select ", Style::default().fg(palette.muted)),
+        key_span(" h/l ", palette),
+        Span::styled(" edit ", Style::default().fg(palette.muted)),
+        key_span(" Space ", palette),
+        Span::styled(" toggle", Style::default().fg(palette.muted)),
+    ])
+    .alignment(Alignment::Center)
+}
+
+fn help_footer_line(palette: Palette) -> Line<'static> {
+    Line::from(vec![
+        key_span(" ? ", palette),
+        Span::styled(" close ", Style::default().fg(palette.muted)),
+        key_span(" Esc ", palette),
+        Span::styled(" close ", Style::default().fg(palette.muted)),
+        key_span(" q ", palette),
+        Span::styled(" quit", Style::default().fg(palette.muted)),
+    ])
+    .alignment(Alignment::Center)
 }
 
 fn main_body_area(area: Rect) -> Rect {
@@ -707,11 +837,14 @@ fn config_editor_lines(
     app: &AppState,
     palette: Palette,
     available_width: usize,
+    visible_rows: usize,
+    show_indicator: bool,
 ) -> Vec<Line<'static>> {
     let items = ConfigEditorItem::ALL;
-    let visible_rows = CONFIG_EDITOR_VISIBLE_ROWS.min(items.len()).max(1);
+    let visible_rows = visible_rows.min(items.len()).max(1);
     let max_scroll = items.len().saturating_sub(visible_rows);
-    let scroll = app.config_scroll.min(max_scroll);
+    let scroll = config_render_scroll(app.config_scroll, app.config_selection, visible_rows);
+    let scroll = scroll.min(max_scroll);
     let visible_items = &items[scroll..items.len().min(scroll + visible_rows)];
     let columns = config_columns(&items, app, available_width);
     let mut lines = visible_items
@@ -719,7 +852,7 @@ fn config_editor_lines(
         .map(|item| config_editor_line(*item, app, columns, palette))
         .collect::<Vec<_>>();
 
-    if items.len() > visible_rows {
+    if show_indicator && items.len() > visible_rows {
         lines.push(config_scroll_indicator(
             scroll,
             visible_items.len(),
@@ -729,6 +862,20 @@ fn config_editor_lines(
     }
 
     lines
+}
+
+fn config_render_scroll(current_scroll: usize, selection: usize, visible_rows: usize) -> usize {
+    if visible_rows == 0 {
+        return current_scroll;
+    }
+
+    if selection < current_scroll {
+        selection
+    } else if selection >= current_scroll.saturating_add(visible_rows) {
+        selection.saturating_add(1).saturating_sub(visible_rows)
+    } else {
+        current_scroll
+    }
 }
 
 fn config_scroll_indicator(
@@ -2490,6 +2637,22 @@ mod tests {
             "config value starts were not aligned: {starts:?}"
         );
         assert!(output.contains("3-6 / 6"));
+    }
+
+    #[test]
+    fn small_help_popup_keeps_selected_config_row_visible() {
+        let mut app = app_loading(Mode::Daily);
+        app.show_help = true;
+        app.config_selection = 5;
+        app.config_scroll = 0;
+
+        let output = render(&app, 80, 16);
+
+        assert!(output.contains("Config"));
+        assert!(output.contains("theme_scope"));
+        assert!(output.contains("calendar"));
+        assert!(output.contains("5-6 / 6"));
+        assert!(!output.contains("auto_refresh"));
     }
 
     fn render(app: &AppState, width: u16, height: u16) -> String {
