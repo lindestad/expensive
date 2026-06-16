@@ -21,7 +21,7 @@ use ratatui::{backend::CrosstermBackend, layout::Rect, Terminal};
 use crate::{
     config::{self, ColorTheme, Config, ThemeScope},
     db::{self, UsageStats},
-    time_window::{self, CalendarScale, Mode, PeriodKey, WeekStart},
+    time_window::{self, CalendarScale, DailyStart, Mode, PeriodKey, WeekStart},
     tui,
 };
 
@@ -47,6 +47,8 @@ pub struct ConfigNotice {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConfigEditorItem {
     AutoRefresh,
+    DailyStart,
+    RefreshSeconds,
     WeekStart,
     ColorTheme,
     ThemeScope,
@@ -55,8 +57,10 @@ pub enum ConfigEditorItem {
 pub const CONFIG_EDITOR_VISIBLE_ROWS: usize = 4;
 
 impl ConfigEditorItem {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 6] = [
         Self::AutoRefresh,
+        Self::DailyStart,
+        Self::RefreshSeconds,
         Self::WeekStart,
         Self::ColorTheme,
         Self::ThemeScope,
@@ -65,6 +69,8 @@ impl ConfigEditorItem {
     pub fn label(self) -> &'static str {
         match self {
             Self::AutoRefresh => "auto_refresh",
+            Self::DailyStart => "daily_start",
+            Self::RefreshSeconds => "refresh_seconds",
             Self::WeekStart => "week_start",
             Self::ColorTheme => "color_theme",
             Self::ThemeScope => "theme_scope",
@@ -408,9 +414,18 @@ impl AppState {
                     self.next_refresh_due = Instant::now() + self.config.refresh_interval;
                 }
             }
+            ConfigEditorItem::DailyStart => {
+                self.config.daily_start = shift_daily_start(self.config.daily_start, direction);
+                self.apply_time_window_config_change(tx)?;
+            }
+            ConfigEditorItem::RefreshSeconds => {
+                self.config.refresh_interval =
+                    shift_refresh_interval(self.config.refresh_interval, direction);
+                self.next_refresh_due = Instant::now() + self.config.refresh_interval;
+            }
             ConfigEditorItem::WeekStart => {
                 self.config.week_start = cycle_week_start(self.config.week_start, direction);
-                self.realign_calendar_for_config(tx)?;
+                self.apply_time_window_config_change(tx)?;
             }
             ConfigEditorItem::ColorTheme => {
                 self.config.color_theme =
@@ -429,6 +444,16 @@ impl AppState {
         Ok(())
     }
 
+    fn apply_time_window_config_change(&mut self, tx: &Sender<RefreshMessage>) -> Result<()> {
+        match self.view {
+            View::Dashboard => self.trigger_dashboard_refresh(tx),
+            View::CalendarOverview | View::CalendarDetail => {
+                self.realign_calendar_for_config(tx)?
+            }
+        }
+        Ok(())
+    }
+
     fn realign_calendar_for_config(&mut self, tx: &Sender<RefreshMessage>) -> Result<()> {
         let selected_start = local_from_millis(self.calendar.selected.start_millis)?;
         self.calendar.selected = time_window::current_period(
@@ -438,9 +463,13 @@ impl AppState {
             self.config.week_start,
         )?;
         self.sync_visible_periods()?;
-        self.ensure_calendar_costs(tx);
-        if self.view == View::CalendarDetail {
-            self.trigger_history_refresh(tx);
+        match self.view {
+            View::Dashboard => {}
+            View::CalendarOverview => self.ensure_calendar_costs(tx),
+            View::CalendarDetail => {
+                self.ensure_calendar_costs(tx);
+                self.trigger_history_refresh(tx);
+            }
         }
         Ok(())
     }
@@ -774,6 +803,32 @@ fn cycle_week_start(current: WeekStart, direction: i32) -> WeekStart {
     cycle_value(&[WeekStart::Monday, WeekStart::Sunday], current, direction)
 }
 
+fn shift_daily_start(current: DailyStart, direction: i32) -> DailyStart {
+    const DAY_MINUTES: i32 = 24 * 60;
+    const STEP_MINUTES: i32 = 15;
+
+    let current_minutes = (current.hour * 60 + current.minute) as i32;
+    let shifted = (current_minutes + direction.signum() * STEP_MINUTES).rem_euclid(DAY_MINUTES);
+
+    DailyStart {
+        hour: (shifted / 60) as u32,
+        minute: (shifted % 60) as u32,
+    }
+}
+
+fn shift_refresh_interval(current: Duration, direction: i32) -> Duration {
+    const STEP_SECONDS: u64 = 15;
+
+    let current = current.as_secs().max(1);
+    let next = if direction < 0 {
+        current.saturating_sub(STEP_SECONDS).max(1)
+    } else {
+        current.saturating_add(STEP_SECONDS)
+    };
+
+    Duration::from_secs(next)
+}
+
 fn cycle_value<T: Copy + Eq>(values: &[T], current: T, direction: i32) -> T {
     let current_idx = values
         .iter()
@@ -843,7 +898,7 @@ mod tests {
             &tx,
         );
 
-        assert_eq!(app.selected_config_item(), ConfigEditorItem::WeekStart);
+        assert_eq!(app.selected_config_item(), ConfigEditorItem::DailyStart);
 
         handle_mouse(
             MouseEvent {
@@ -868,8 +923,9 @@ mod tests {
         app.show_help = true;
         let (tx, _rx) = mpsc::channel();
 
-        handle_key(KeyCode::Down, KeyModifiers::NONE, &mut app, &tx);
-        handle_key(KeyCode::Down, KeyModifiers::NONE, &mut app, &tx);
+        for _ in 0..4 {
+            handle_key(KeyCode::Down, KeyModifiers::NONE, &mut app, &tx);
+        }
         handle_key(KeyCode::Right, KeyModifiers::NONE, &mut app, &tx);
 
         assert_eq!(app.selected_config_item(), ConfigEditorItem::ColorTheme);
@@ -877,6 +933,51 @@ mod tests {
         assert!(fs::read_to_string(config_path)
             .unwrap()
             .contains(r#"color_theme = "ember""#));
+    }
+
+    #[test]
+    fn help_edits_timing_config_and_saves() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config_path = tempdir.path().join("config.toml");
+        let mut app = AppState::new(test_config(config_path.clone())).unwrap();
+        app.show_help = true;
+        let (tx, _rx) = mpsc::channel();
+
+        handle_key(KeyCode::Down, KeyModifiers::NONE, &mut app, &tx);
+        handle_key(KeyCode::Right, KeyModifiers::NONE, &mut app, &tx);
+
+        assert_eq!(app.selected_config_item(), ConfigEditorItem::DailyStart);
+        assert_eq!(
+            app.config.daily_start,
+            DailyStart {
+                hour: 4,
+                minute: 15
+            }
+        );
+
+        handle_key(KeyCode::Down, KeyModifiers::NONE, &mut app, &tx);
+        handle_key(KeyCode::Left, KeyModifiers::NONE, &mut app, &tx);
+
+        assert_eq!(app.selected_config_item(), ConfigEditorItem::RefreshSeconds);
+        assert_eq!(app.config.refresh_interval, Duration::from_secs(45));
+
+        let content = fs::read_to_string(config_path).unwrap();
+        assert!(content.contains(r#"daily_start = "04:15""#));
+        assert!(content.contains("refresh_seconds = 45"));
+    }
+
+    #[test]
+    fn config_selection_keeps_scroll_visible() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config_path = tempdir.path().join("config.toml");
+        let mut app = AppState::new(test_config(config_path)).unwrap();
+
+        for _ in 0..5 {
+            app.move_config_selection(1);
+        }
+
+        assert_eq!(app.selected_config_item(), ConfigEditorItem::ThemeScope);
+        assert_eq!(app.config_scroll, 2);
     }
 
     #[test]

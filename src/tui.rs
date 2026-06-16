@@ -783,6 +783,10 @@ fn config_value_width(item: ConfigEditorItem, app: &AppState) -> usize {
                 text_width(" [ ]  manual refresh only")
             }
         }
+        ConfigEditorItem::DailyStart => text_width(&format!(" {} ", app.config.daily_start)),
+        ConfigEditorItem::RefreshSeconds => {
+            text_width(&format!(" {}s ", app.config.refresh_interval.as_secs()))
+        }
         ConfigEditorItem::WeekStart => text_width(" monday  sunday "),
         ConfigEditorItem::ColorTheme => text_width(" aurora  ember  ocean  forest  graphite "),
         ConfigEditorItem::ThemeScope => text_width(" calendar  all "),
@@ -813,6 +817,14 @@ fn config_editor_line(
                 Style::default().fg(palette.muted),
             ));
         }
+        ConfigEditorItem::DailyStart => spans.push(config_value_span(
+            app.config.daily_start.to_string(),
+            palette,
+        )),
+        ConfigEditorItem::RefreshSeconds => spans.push(config_value_span(
+            format!("{}s", app.config.refresh_interval.as_secs()),
+            palette,
+        )),
         ConfigEditorItem::WeekStart => push_options(
             &mut spans,
             &[
@@ -843,6 +855,16 @@ fn config_editor_line(
     }
 
     Line::from(spans)
+}
+
+fn config_value_span(value: String, palette: Palette) -> Span<'static> {
+    Span::styled(
+        format!(" {value} "),
+        Style::default()
+            .fg(Color::Black)
+            .bg(palette.calendar_accent)
+            .add_modifier(Modifier::BOLD),
+    )
 }
 
 fn config_editor_label(
@@ -2392,10 +2414,11 @@ mod tests {
 
         assert!(output.contains("Help"));
         assert!(output.contains("Config"));
+        assert!(output.contains("daily_start"));
+        assert!(output.contains("refresh_seconds"));
         assert!(output.contains("week_start"));
-        assert!(output.contains("color_theme"));
-        assert!(output.contains("theme_scope"));
         assert!(output.contains("[x]"));
+        assert!(output.contains("1-4 / 6"));
         assert!(output.contains("Space / Enter"));
         assert!(output.contains("/tmp/expensive/config.toml"));
     }
@@ -2436,6 +2459,27 @@ mod tests {
         let output = render(&app, 120, 32);
         let starts = [
             config_value_start(&output, "auto_refresh", "[x]"),
+            config_value_start(&output, "daily_start", "04:00"),
+            config_value_start(&output, "refresh_seconds", "60s"),
+            config_value_start(&output, "week_start", "monday"),
+        ];
+
+        assert!(
+            starts.iter().all(|start| *start == starts[0]),
+            "config value starts were not aligned: {starts:?}"
+        );
+    }
+
+    #[test]
+    fn renders_scrolled_config_editor_values_aligned() {
+        let mut app = app_loading(Mode::Daily);
+        app.show_help = true;
+        app.config_selection = 5;
+        app.config_scroll = 2;
+
+        let output = render(&app, 120, 32);
+        let starts = [
+            config_value_start(&output, "refresh_seconds", "60s"),
             config_value_start(&output, "week_start", "monday"),
             config_value_start(&output, "color_theme", "aurora"),
             config_value_start(&output, "theme_scope", "calendar"),
@@ -2445,6 +2489,7 @@ mod tests {
             starts.iter().all(|start| *start == starts[0]),
             "config value starts were not aligned: {starts:?}"
         );
+        assert!(output.contains("3-6 / 6"));
     }
 
     fn render(app: &AppState, width: u16, height: u16) -> String {
