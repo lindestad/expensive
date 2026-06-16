@@ -52,6 +52,8 @@ pub enum ConfigEditorItem {
     ThemeScope,
 }
 
+pub const CONFIG_EDITOR_VISIBLE_ROWS: usize = 4;
+
 impl ConfigEditorItem {
     pub const ALL: [Self; 4] = [
         Self::AutoRefresh,
@@ -75,6 +77,7 @@ pub struct AppState {
     pub view: View,
     pub show_help: bool,
     pub config_selection: usize,
+    pub config_scroll: usize,
     pub config_notice: Option<ConfigNotice>,
     pub mode: Mode,
     pub stats: HashMap<Mode, UsageStats>,
@@ -106,6 +109,7 @@ impl AppState {
             view: View::Dashboard,
             show_help: false,
             config_selection: 0,
+            config_scroll: 0,
             config_notice: None,
             mode: Mode::Daily,
             stats: HashMap::new(),
@@ -377,6 +381,23 @@ impl AppState {
         let len = ConfigEditorItem::ALL.len() as i32;
         let idx = self.config_selection as i32;
         self.config_selection = (idx + steps).rem_euclid(len) as usize;
+        self.ensure_config_selection_visible();
+    }
+
+    fn ensure_config_selection_visible(&mut self) {
+        let max_scroll = ConfigEditorItem::ALL
+            .len()
+            .saturating_sub(CONFIG_EDITOR_VISIBLE_ROWS);
+        self.config_scroll = self.config_scroll.min(max_scroll);
+
+        if self.config_selection < self.config_scroll {
+            self.config_scroll = self.config_selection;
+        } else if self.config_selection >= self.config_scroll + CONFIG_EDITOR_VISIBLE_ROWS {
+            self.config_scroll = self
+                .config_selection
+                .saturating_add(1)
+                .saturating_sub(CONFIG_EDITOR_VISIBLE_ROWS);
+        }
     }
 
     fn edit_selected_config(&mut self, direction: i32, tx: &Sender<RefreshMessage>) -> Result<()> {
@@ -627,6 +648,11 @@ fn handle_key(
 
 fn handle_mouse(mouse: MouseEvent, area: Rect, app: &mut AppState, tx: &Sender<RefreshMessage>) {
     if app.show_help {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => app.move_config_selection(-1),
+            MouseEventKind::ScrollDown => app.move_config_selection(1),
+            _ => {}
+        }
         return;
     }
 
@@ -795,6 +821,43 @@ mod tests {
         assert!(fs::read_to_string(config_path)
             .unwrap()
             .contains("auto_refresh = false"));
+    }
+
+    #[test]
+    fn help_mouse_wheel_moves_config_selection() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config_path = tempdir.path().join("config.toml");
+        let mut app = AppState::new(test_config(config_path)).unwrap();
+        app.show_help = true;
+        let (tx, _rx) = mpsc::channel();
+
+        handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            },
+            Rect::new(0, 0, 120, 24),
+            &mut app,
+            &tx,
+        );
+
+        assert_eq!(app.selected_config_item(), ConfigEditorItem::WeekStart);
+
+        handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            },
+            Rect::new(0, 0, 120, 24),
+            &mut app,
+            &tx,
+        );
+
+        assert_eq!(app.selected_config_item(), ConfigEditorItem::AutoRefresh);
     }
 
     #[test]

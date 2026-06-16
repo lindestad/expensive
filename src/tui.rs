@@ -8,7 +8,7 @@ use ratatui::{
 };
 
 use crate::{
-    app::{AppState, ConfigEditorItem, View},
+    app::{AppState, ConfigEditorItem, View, CONFIG_EDITOR_VISIBLE_ROWS},
     config::{ColorTheme, ThemeScope},
     db::{ModelUsage, UsageStats, UsageTotals},
     format,
@@ -708,11 +708,40 @@ fn config_editor_lines(
     palette: Palette,
     available_width: usize,
 ) -> Vec<Line<'static>> {
-    let columns = config_columns(&ConfigEditorItem::ALL, app, available_width);
-    ConfigEditorItem::ALL
+    let items = ConfigEditorItem::ALL;
+    let visible_rows = CONFIG_EDITOR_VISIBLE_ROWS.min(items.len()).max(1);
+    let max_scroll = items.len().saturating_sub(visible_rows);
+    let scroll = app.config_scroll.min(max_scroll);
+    let visible_items = &items[scroll..items.len().min(scroll + visible_rows)];
+    let columns = config_columns(&items, app, available_width);
+    let mut lines = visible_items
         .iter()
         .map(|item| config_editor_line(*item, app, columns, palette))
-        .collect()
+        .collect::<Vec<_>>();
+
+    if items.len() > visible_rows {
+        lines.push(config_scroll_indicator(
+            scroll,
+            visible_items.len(),
+            items.len(),
+            palette,
+        ));
+    }
+
+    lines
+}
+
+fn config_scroll_indicator(
+    scroll: usize,
+    visible_count: usize,
+    total: usize,
+    palette: Palette,
+) -> Line<'static> {
+    Line::from(Span::styled(
+        format!("{}-{} / {}", scroll + 1, scroll + visible_count, total),
+        Style::default().fg(palette.muted),
+    ))
+    .alignment(Alignment::Center)
 }
 
 fn config_columns(
@@ -2465,6 +2494,7 @@ mod tests {
             view: View::Dashboard,
             show_help: false,
             config_selection: 0,
+            config_scroll: 0,
             config_notice: None,
             mode,
             stats: stats_by_mode,
@@ -2486,6 +2516,7 @@ mod tests {
             view: View::Dashboard,
             show_help: false,
             config_selection: 0,
+            config_scroll: 0,
             config_notice: None,
             mode,
             stats: HashMap::new(),
@@ -2507,6 +2538,7 @@ mod tests {
             view: View::CalendarOverview,
             show_help: false,
             config_selection: 0,
+            config_scroll: 0,
             config_notice: None,
             mode: Mode::Daily,
             stats: HashMap::new(),
