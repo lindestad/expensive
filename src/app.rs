@@ -969,6 +969,67 @@ mod tests {
     }
 
     #[test]
+    fn small_help_mouse_wheel_scrolls_before_config_selection() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config_path = tempdir.path().join("config.toml");
+        let mut app = AppState::new(test_config(config_path)).unwrap();
+        app.show_help = true;
+        let (tx, _rx) = mpsc::channel();
+        let area = Rect::new(0, 0, 80, 16);
+
+        handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+            &mut app,
+            &tx,
+        );
+
+        assert_eq!(app.help_scroll, 1);
+        assert_eq!(app.selected_config_item(), ConfigEditorItem::AutoRefresh);
+    }
+
+    #[test]
+    fn help_edit_keys_do_nothing_before_config_is_visible() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config_path = tempdir.path().join("config.toml");
+        let mut app = AppState::new(test_config(config_path.clone())).unwrap();
+        app.show_help = true;
+        let (tx, _rx) = mpsc::channel();
+        let area = Rect::new(0, 0, 80, 16);
+
+        handle_key(KeyCode::Char(' '), KeyModifiers::NONE, area, &mut app, &tx);
+        handle_key(KeyCode::Right, KeyModifiers::NONE, area, &mut app, &tx);
+
+        assert!(app.config.auto_refresh);
+        assert!(app.config_notice.is_none());
+        assert!(!config_path.exists());
+    }
+
+    #[test]
+    fn reopening_help_resets_scroll_and_config_selection() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config_path = tempdir.path().join("config.toml");
+        let mut app = AppState::new(test_config(config_path)).unwrap();
+        app.show_help = true;
+        app.help_scroll = 8;
+        app.config_selection = 4;
+        let (tx, _rx) = mpsc::channel();
+        let area = Rect::new(0, 0, 80, 16);
+
+        handle_key(KeyCode::Char('?'), KeyModifiers::NONE, area, &mut app, &tx);
+        handle_key(KeyCode::Char('?'), KeyModifiers::NONE, area, &mut app, &tx);
+
+        assert!(app.show_help);
+        assert_eq!(app.help_scroll, 0);
+        assert_eq!(app.selected_config_item(), ConfigEditorItem::AutoRefresh);
+    }
+
+    #[test]
     fn help_cycles_selected_option_and_saves_config() {
         let tempdir = tempfile::tempdir().unwrap();
         let config_path = tempdir.path().join("config.toml");
