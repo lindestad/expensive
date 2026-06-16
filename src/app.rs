@@ -54,8 +54,6 @@ pub enum ConfigEditorItem {
     ThemeScope,
 }
 
-pub const CONFIG_EDITOR_VISIBLE_ROWS: usize = 4;
-
 impl ConfigEditorItem {
     pub const ALL: [Self; 6] = [
         Self::AutoRefresh,
@@ -82,8 +80,8 @@ pub struct AppState {
     pub config: Config,
     pub view: View,
     pub show_help: bool,
+    pub help_scroll: usize,
     pub config_selection: usize,
-    pub config_scroll: usize,
     pub config_notice: Option<ConfigNotice>,
     pub mode: Mode,
     pub stats: HashMap<Mode, UsageStats>,
@@ -114,8 +112,8 @@ impl AppState {
             config,
             view: View::Dashboard,
             show_help: false,
+            help_scroll: 0,
             config_selection: 0,
-            config_scroll: 0,
             config_notice: None,
             mode: Mode::Daily,
             stats: HashMap::new(),
@@ -157,6 +155,14 @@ impl AppState {
 
     pub fn selected_config_item(&self) -> ConfigEditorItem {
         ConfigEditorItem::ALL[self.config_selection.min(ConfigEditorItem::ALL.len() - 1)]
+    }
+
+    fn toggle_help(&mut self) {
+        self.show_help = !self.show_help;
+        if self.show_help {
+            self.help_scroll = 0;
+            self.config_selection = 0;
+        }
     }
 
     fn switch_mode(&mut self, mode: Mode, tx: &Sender<RefreshMessage>) {
@@ -383,26 +389,56 @@ impl AppState {
         }
     }
 
-    fn move_config_selection(&mut self, steps: i32) {
-        let len = ConfigEditorItem::ALL.len() as i32;
-        let idx = self.config_selection as i32;
-        self.config_selection = (idx + steps).rem_euclid(len) as usize;
-        self.ensure_config_selection_visible();
+    fn move_help_selection(&mut self, steps: i32, layout: &tui::HelpLayoutState) {
+        for _ in 0..steps.unsigned_abs() {
+            if steps > 0 {
+                self.move_help_down(layout);
+            } else {
+                self.move_help_up(layout);
+            }
+        }
     }
 
-    fn ensure_config_selection_visible(&mut self) {
-        let max_scroll = ConfigEditorItem::ALL
-            .len()
-            .saturating_sub(CONFIG_EDITOR_VISIBLE_ROWS);
-        self.config_scroll = self.config_scroll.min(max_scroll);
+    fn move_help_down(&mut self, layout: &tui::HelpLayoutState) {
+        if self.help_config_visible(layout) {
+            if self.config_selection + 1 < ConfigEditorItem::ALL.len() {
+                self.config_selection += 1;
+                self.ensure_help_selection_visible(layout);
+            } else {
+                self.help_scroll = self.help_scroll.saturating_add(1).min(layout.max_scroll);
+            }
+        } else {
+            self.help_scroll = self.help_scroll.saturating_add(1).min(layout.max_scroll);
+        }
+    }
 
-        if self.config_selection < self.config_scroll {
-            self.config_scroll = self.config_selection;
-        } else if self.config_selection >= self.config_scroll + CONFIG_EDITOR_VISIBLE_ROWS {
-            self.config_scroll = self
-                .config_selection
+    fn move_help_up(&mut self, layout: &tui::HelpLayoutState) {
+        if self.help_config_visible(layout) && self.config_selection > 0 {
+            self.config_selection -= 1;
+            self.ensure_help_selection_visible(layout);
+        } else {
+            self.help_scroll = self.help_scroll.saturating_sub(1);
+        }
+    }
+
+    fn help_config_visible(&self, layout: &tui::HelpLayoutState) -> bool {
+        help_config_visible(self.help_scroll.min(layout.max_scroll), layout)
+    }
+
+    fn ensure_help_selection_visible(&mut self, layout: &tui::HelpLayoutState) {
+        let Some(&selected_row) = layout.config_item_starts.get(self.config_selection) else {
+            return;
+        };
+
+        let visible_start = self.help_scroll.min(layout.max_scroll);
+        let visible_end = visible_start.saturating_add(layout.visible_height);
+        if selected_row < visible_start {
+            self.help_scroll = selected_row.min(layout.max_scroll);
+        } else if selected_row >= visible_end {
+            self.help_scroll = selected_row
                 .saturating_add(1)
-                .saturating_sub(CONFIG_EDITOR_VISIBLE_ROWS);
+                .saturating_sub(layout.visible_height)
+                .min(layout.max_scroll);
         }
     }
 
@@ -540,7 +576,9 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Confi
         if event::poll(Duration::from_millis(200))? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    if handle_key(key.code, key.modifiers, &mut app, &tx) {
+                    let size = terminal.size()?;
+                    let area = Rect::new(0, 0, size.width, size.height);
+                    if handle_key(key.code, key.modifiers, area, &mut app, &tx) {
                         return Ok(());
                     }
                 }
@@ -558,36 +596,42 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Confi
 fn handle_key(
     code: KeyCode,
     modifiers: KeyModifiers,
+    area: Rect,
     app: &mut AppState,
     tx: &Sender<RefreshMessage>,
 ) -> bool {
     if code == KeyCode::Char('?') {
-        app.show_help = !app.show_help;
+        app.toggle_help();
         return false;
     }
 
     if app.show_help {
+        let help_layout = tui::help_layout_state(area, app);
         match code {
             KeyCode::Char('q') => return true,
             KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => return true,
             KeyCode::Up | KeyCode::Char('k') => {
-                app.move_config_selection(-1);
+                app.move_help_selection(-1, &help_layout);
                 return false;
             }
             KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
-                app.move_config_selection(1);
+                app.move_help_selection(1, &help_layout);
                 return false;
             }
             KeyCode::BackTab => {
-                app.move_config_selection(-1);
+                app.move_help_selection(-1, &help_layout);
                 return false;
             }
             KeyCode::Left | KeyCode::Char('h') => {
-                apply_config_action(app, tx, |app, tx| app.edit_selected_config(-1, tx));
+                if app.help_config_visible(&help_layout) {
+                    apply_config_action(app, tx, |app, tx| app.edit_selected_config(-1, tx));
+                }
                 return false;
             }
             KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter | KeyCode::Char(' ') => {
-                apply_config_action(app, tx, |app, tx| app.edit_selected_config(1, tx));
+                if app.help_config_visible(&help_layout) {
+                    apply_config_action(app, tx, |app, tx| app.edit_selected_config(1, tx));
+                }
                 return false;
             }
             KeyCode::Esc => {
@@ -677,9 +721,10 @@ fn handle_key(
 
 fn handle_mouse(mouse: MouseEvent, area: Rect, app: &mut AppState, tx: &Sender<RefreshMessage>) {
     if app.show_help {
+        let help_layout = tui::help_layout_state(area, app);
         match mouse.kind {
-            MouseEventKind::ScrollUp => app.move_config_selection(-1),
-            MouseEventKind::ScrollDown => app.move_config_selection(1),
+            MouseEventKind::ScrollUp => app.move_help_selection(-1, &help_layout),
+            MouseEventKind::ScrollDown => app.move_help_selection(1, &help_layout),
             _ => {}
         }
         return;
@@ -799,6 +844,13 @@ fn apply_config_action(
     }
 }
 
+fn help_config_visible(scroll: usize, layout: &tui::HelpLayoutState) -> bool {
+    layout.visible_height > 0
+        && layout.config_end > layout.config_start
+        && scroll.saturating_add(layout.visible_height) > layout.config_start
+        && scroll < layout.config_end
+}
+
 fn cycle_week_start(current: WeekStart, direction: i32) -> WeekStart {
     cycle_value(&[WeekStart::Monday, WeekStart::Sunday], current, direction)
 }
@@ -864,8 +916,9 @@ mod tests {
         let mut app = AppState::new(test_config(config_path.clone())).unwrap();
         app.show_help = true;
         let (tx, _rx) = mpsc::channel();
+        let area = Rect::new(0, 0, 120, 40);
 
-        let should_quit = handle_key(KeyCode::Char(' '), KeyModifiers::NONE, &mut app, &tx);
+        let should_quit = handle_key(KeyCode::Char(' '), KeyModifiers::NONE, area, &mut app, &tx);
 
         assert!(!should_quit);
         assert!(!app.config.auto_refresh);
@@ -922,11 +975,12 @@ mod tests {
         let mut app = AppState::new(test_config(config_path.clone())).unwrap();
         app.show_help = true;
         let (tx, _rx) = mpsc::channel();
+        let area = Rect::new(0, 0, 120, 40);
 
         for _ in 0..4 {
-            handle_key(KeyCode::Down, KeyModifiers::NONE, &mut app, &tx);
+            handle_key(KeyCode::Down, KeyModifiers::NONE, area, &mut app, &tx);
         }
-        handle_key(KeyCode::Right, KeyModifiers::NONE, &mut app, &tx);
+        handle_key(KeyCode::Right, KeyModifiers::NONE, area, &mut app, &tx);
 
         assert_eq!(app.selected_config_item(), ConfigEditorItem::ColorTheme);
         assert_eq!(app.config.color_theme, ColorTheme::Ember);
@@ -942,9 +996,10 @@ mod tests {
         let mut app = AppState::new(test_config(config_path.clone())).unwrap();
         app.show_help = true;
         let (tx, _rx) = mpsc::channel();
+        let area = Rect::new(0, 0, 120, 40);
 
-        handle_key(KeyCode::Down, KeyModifiers::NONE, &mut app, &tx);
-        handle_key(KeyCode::Right, KeyModifiers::NONE, &mut app, &tx);
+        handle_key(KeyCode::Down, KeyModifiers::NONE, area, &mut app, &tx);
+        handle_key(KeyCode::Right, KeyModifiers::NONE, area, &mut app, &tx);
 
         assert_eq!(app.selected_config_item(), ConfigEditorItem::DailyStart);
         assert_eq!(
@@ -955,8 +1010,8 @@ mod tests {
             }
         );
 
-        handle_key(KeyCode::Down, KeyModifiers::NONE, &mut app, &tx);
-        handle_key(KeyCode::Left, KeyModifiers::NONE, &mut app, &tx);
+        handle_key(KeyCode::Down, KeyModifiers::NONE, area, &mut app, &tx);
+        handle_key(KeyCode::Left, KeyModifiers::NONE, area, &mut app, &tx);
 
         assert_eq!(app.selected_config_item(), ConfigEditorItem::RefreshSeconds);
         assert_eq!(app.config.refresh_interval, Duration::from_secs(45));
@@ -967,17 +1022,32 @@ mod tests {
     }
 
     #[test]
-    fn config_selection_keeps_scroll_visible() {
+    fn small_help_scrolls_before_config_selection() {
         let tempdir = tempfile::tempdir().unwrap();
         let config_path = tempdir.path().join("config.toml");
         let mut app = AppState::new(test_config(config_path)).unwrap();
+        app.show_help = true;
+        let (tx, _rx) = mpsc::channel();
+        let area = Rect::new(0, 0, 80, 16);
 
-        for _ in 0..5 {
-            app.move_config_selection(1);
+        handle_key(KeyCode::Down, KeyModifiers::NONE, area, &mut app, &tx);
+
+        assert_eq!(app.help_scroll, 1);
+        assert_eq!(app.selected_config_item(), ConfigEditorItem::AutoRefresh);
+
+        loop {
+            let layout = tui::help_layout_state(area, &app);
+            if app.help_scroll.saturating_add(layout.visible_height) > layout.config_start {
+                break;
+            }
+            handle_key(KeyCode::Down, KeyModifiers::NONE, area, &mut app, &tx);
         }
 
-        assert_eq!(app.selected_config_item(), ConfigEditorItem::ThemeScope);
-        assert_eq!(app.config_scroll, 2);
+        assert_eq!(app.selected_config_item(), ConfigEditorItem::AutoRefresh);
+
+        handle_key(KeyCode::Down, KeyModifiers::NONE, area, &mut app, &tx);
+
+        assert_eq!(app.selected_config_item(), ConfigEditorItem::DailyStart);
     }
 
     #[test]
