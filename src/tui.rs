@@ -166,6 +166,12 @@ struct HelpColumns {
 }
 
 #[derive(Clone, Copy)]
+struct ConfigColumns {
+    label_width: usize,
+    left_pad: usize,
+}
+
+#[derive(Clone, Copy)]
 enum TabStyle {
     Normal,
     Dashboard,
@@ -333,12 +339,9 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &AppState, palette: Palette
         Line::from(""),
     ]);
     lines.extend(help_binding_lines(&config_bindings, help_columns, palette));
+    lines.extend([Line::from("")]);
+    lines.extend(config_editor_lines(app, palette, inner.width as usize));
     lines.extend([
-        Line::from(""),
-        config_editor_line(ConfigEditorItem::AutoRefresh, app, palette),
-        config_editor_line(ConfigEditorItem::WeekStart, app, palette),
-        config_editor_line(ConfigEditorItem::ColorTheme, app, palette),
-        config_editor_line(ConfigEditorItem::ThemeScope, app, palette),
         config_notice_line(app, palette),
         Line::from(""),
         config_line("file", config_path, palette),
@@ -700,18 +703,83 @@ fn centered_rect(area: Rect, max_width: u16, max_height: u16) -> Rect {
     )
 }
 
-fn config_editor_line(item: ConfigEditorItem, app: &AppState, palette: Palette) -> Line<'static> {
+fn config_editor_lines(
+    app: &AppState,
+    palette: Palette,
+    available_width: usize,
+) -> Vec<Line<'static>> {
+    let columns = config_columns(&ConfigEditorItem::ALL, app, available_width);
+    ConfigEditorItem::ALL
+        .iter()
+        .map(|item| config_editor_line(*item, app, columns, palette))
+        .collect()
+}
+
+fn config_columns(
+    items: &[ConfigEditorItem],
+    app: &AppState,
+    available_width: usize,
+) -> ConfigColumns {
+    const CONFIG_GAP: usize = 2;
+    const MARKER_WIDTH: usize = 2;
+
+    let label_width = items
+        .iter()
+        .map(|item| text_width(item.label()))
+        .max()
+        .unwrap_or(1);
+    let value_width = items
+        .iter()
+        .map(|item| config_value_width(*item, app))
+        .max()
+        .unwrap_or(1);
+    let table_width = MARKER_WIDTH
+        .saturating_add(label_width)
+        .saturating_add(CONFIG_GAP)
+        .saturating_add(value_width)
+        .min(available_width);
+
+    ConfigColumns {
+        label_width,
+        left_pad: available_width.saturating_sub(table_width) / 2,
+    }
+}
+
+fn config_value_width(item: ConfigEditorItem, app: &AppState) -> usize {
+    match item {
+        ConfigEditorItem::AutoRefresh => {
+            if app.config.auto_refresh {
+                text_width(" [x]  refreshes automatically")
+            } else {
+                text_width(" [ ]  manual refresh only")
+            }
+        }
+        ConfigEditorItem::WeekStart => text_width(" monday  sunday "),
+        ConfigEditorItem::ColorTheme => text_width(" aurora  ember  ocean  forest  graphite "),
+        ConfigEditorItem::ThemeScope => text_width(" calendar  all "),
+    }
+}
+
+fn config_editor_line(
+    item: ConfigEditorItem,
+    app: &AppState,
+    columns: ConfigColumns,
+    palette: Palette,
+) -> Line<'static> {
     let selected = app.selected_config_item() == item;
-    let mut spans = vec![config_editor_label(item.label(), selected, palette)];
+    let mut spans = vec![
+        Span::raw(" ".repeat(columns.left_pad)),
+        config_editor_label(item.label(), selected, columns.label_width, palette),
+    ];
 
     match item {
         ConfigEditorItem::AutoRefresh => {
             spans.push(checkbox_span(app.config.auto_refresh, palette));
             spans.push(Span::styled(
                 if app.config.auto_refresh {
-                    "  refreshes automatically"
+                    " refreshes automatically"
                 } else {
-                    "  manual refresh only"
+                    " manual refresh only"
                 },
                 Style::default().fg(palette.muted),
             ));
@@ -745,11 +813,15 @@ fn config_editor_line(item: ConfigEditorItem, app: &AppState, palette: Palette) 
         ),
     }
 
-    Line::from(spans).alignment(Alignment::Center)
+    Line::from(spans)
 }
 
-fn config_editor_label(label: &'static str, selected: bool, palette: Palette) -> Span<'static> {
-    const CONFIG_EDITOR_LABEL_WIDTH: usize = 18;
+fn config_editor_label(
+    label: &'static str,
+    selected: bool,
+    label_width: usize,
+    palette: Palette,
+) -> Span<'static> {
     let marker = if selected { ">" } else { " " };
     let style = if selected {
         Style::default()
@@ -759,14 +831,11 @@ fn config_editor_label(label: &'static str, selected: bool, palette: Palette) ->
         Style::default().fg(palette.muted)
     };
 
-    Span::styled(
-        format!("{marker} {label:>CONFIG_EDITOR_LABEL_WIDTH$}  "),
-        style,
-    )
+    Span::styled(format!("{marker} {label:>label_width$}  "), style)
 }
 
 fn checkbox_span(checked: bool, palette: Palette) -> Span<'static> {
-    let label = if checked { "[x]" } else { "[ ]" };
+    let label = if checked { " [x] " } else { " [ ] " };
     Span::styled(
         label,
         Style::default()
@@ -2330,6 +2399,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn aligns_config_editor_values_to_one_column() {
+        let mut app = app_loading(Mode::Daily);
+        app.show_help = true;
+
+        let output = render(&app, 120, 32);
+        let starts = [
+            config_value_start(&output, "auto_refresh", "[x]"),
+            config_value_start(&output, "week_start", "monday"),
+            config_value_start(&output, "color_theme", "aurora"),
+            config_value_start(&output, "theme_scope", "calendar"),
+        ];
+
+        assert!(
+            starts.iter().all(|start| *start == starts[0]),
+            "config value starts were not aligned: {starts:?}"
+        );
+    }
+
     fn render(app: &AppState, width: u16, height: u16) -> String {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -2356,6 +2444,16 @@ mod tests {
                     .map(|byte_idx| line[..byte_idx].chars().count())
             })
             .unwrap_or_else(|| panic!("missing help description {description:?}"))
+    }
+
+    fn config_value_start(output: &str, label: &str, value: &str) -> usize {
+        let line = output
+            .lines()
+            .find(|line| line.contains(label))
+            .unwrap_or_else(|| panic!("missing config label {label:?}"));
+        line.find(value)
+            .map(|byte_idx| line[..byte_idx].chars().count())
+            .unwrap_or_else(|| panic!("missing config value {value:?} for {label:?}"))
     }
 
     fn app_with_stats(mode: Mode, stats: UsageStats) -> AppState {
