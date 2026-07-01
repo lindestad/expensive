@@ -2,7 +2,8 @@
 
 A small terminal dashboard for OpenCode spend.
 
-<img width="1278" height="719" alt="image" src="https://github.com/user-attachments/assets/13e191cd-f0f6-46aa-bbe2-352f66b87d87" />
+<img width="1324" height="958" alt="image" src="https://github.com/user-attachments/assets/027ae18e-7e22-437b-a58c-5a4cc3acf60d" />
+
 
 
 `expensive` reads OpenCode's local SQLite database directly and turns the same
