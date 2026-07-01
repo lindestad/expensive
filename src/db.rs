@@ -54,6 +54,14 @@ pub struct UsageStats {
     pub end_millis: Option<i64>,
     pub totals: UsageTotals,
     pub models: Vec<ModelUsage>,
+    pub token_buckets: Vec<TokenBucket>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct TokenBucket {
+    pub start_millis: i64,
+    pub end_millis: i64,
+    pub tokens: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -87,6 +95,25 @@ fn load_usage_range(
     )
     .with_context(|| format!("opening {}", path.display()))?;
 
+    let (totals, models) = load_model_usage(&connection, start_millis, end_millis)?;
+    let token_buckets = load_token_buckets(&connection, mode, start_millis, end_millis)?;
+
+    Ok(UsageStats {
+        mode,
+        refreshed_at: Local::now(),
+        cutoff_millis: start_millis,
+        end_millis,
+        totals,
+        models,
+        token_buckets,
+    })
+}
+
+fn load_model_usage(
+    connection: &Connection,
+    start_millis: Option<i64>,
+    end_millis: Option<i64>,
+) -> Result<(UsageTotals, Vec<ModelUsage>)> {
     let mut statement = connection.prepare(
         r#"
         SELECT
@@ -138,14 +165,133 @@ fn load_usage_range(
         models.push(model);
     }
 
-    Ok(UsageStats {
-        mode,
-        refreshed_at: Local::now(),
-        cutoff_millis: start_millis,
-        end_millis,
-        totals,
-        models,
-    })
+    Ok((totals, models))
+}
+
+fn load_token_buckets(
+    connection: &Connection,
+    mode: Mode,
+    start_millis: Option<i64>,
+    end_millis: Option<i64>,
+) -> Result<Vec<TokenBucket>> {
+    let mut statement = connection.prepare(
+        r#"
+        SELECT
+            time_created,
+            COALESCE(json_extract(data, '$.tokens.input'), 0)
+                + COALESCE(json_extract(data, '$.tokens.output'), 0)
+                + COALESCE(json_extract(data, '$.tokens.cache.read'), 0)
+                + COALESCE(json_extract(data, '$.tokens.cache.write'), 0) AS tokens
+        FROM message
+        WHERE json_extract(data, '$.role') = 'assistant'
+            AND (?1 IS NULL OR time_created >= ?1)
+            AND (?2 IS NULL OR time_created < ?2)
+        ORDER BY time_created ASC
+        "#,
+    )?;
+
+    let rows = statement.query_map(params![start_millis, end_millis], |row| {
+        let time_created: i64 = row.get("time_created")?;
+        let tokens = read_u64(row, "tokens")?;
+        Ok((time_created, tokens))
+    })?;
+
+    let mut events = Vec::new();
+    for row in rows {
+        events.push(row?);
+    }
+
+    let Some((first_time, _)) = events.first().copied() else {
+        return Ok(Vec::new());
+    };
+    let last_time = events
+        .last()
+        .map(|(time_created, _)| *time_created)
+        .unwrap_or(first_time);
+    let range_start = start_millis.unwrap_or(first_time);
+    let span = token_bucket_span_millis(mode, range_start, last_time.max(range_start));
+    let range_end = token_bucket_range_end(mode, range_start, last_time, end_millis, span);
+    if span <= 0 || range_end <= range_start {
+        return Ok(Vec::new());
+    }
+
+    let bucket_count = ((range_end - range_start + span - 1) / span) as usize;
+    let mut buckets = (0..bucket_count)
+        .map(|idx| {
+            let start = range_start + idx as i64 * span;
+            TokenBucket {
+                start_millis: start,
+                end_millis: (start + span).min(range_end),
+                tokens: 0,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    for (time_created, tokens) in events {
+        if time_created < range_start || time_created >= range_end {
+            continue;
+        }
+        let idx = ((time_created - range_start) / span) as usize;
+        if let Some(bucket) = buckets.get_mut(idx) {
+            bucket.tokens = bucket.tokens.saturating_add(tokens);
+        }
+    }
+
+    Ok(buckets)
+}
+
+fn token_bucket_span_millis(mode: Mode, start_millis: i64, end_millis: i64) -> i64 {
+    const HOUR: i64 = 60 * 60 * 1000;
+    const DAY: i64 = 24 * HOUR;
+    const WEEK: i64 = 7 * DAY;
+
+    match mode {
+        Mode::Daily => HOUR,
+        Mode::Weekly | Mode::Monthly => DAY,
+        Mode::AllTime => {
+            let span = end_millis.saturating_sub(start_millis);
+            if span <= 60 * DAY {
+                DAY
+            } else if span <= 52 * WEEK {
+                WEEK
+            } else {
+                30 * DAY
+            }
+        }
+    }
+}
+
+fn token_bucket_range_end(
+    mode: Mode,
+    range_start: i64,
+    last_event_millis: i64,
+    end_millis: Option<i64>,
+    bucket_span_millis: i64,
+) -> i64 {
+    const HOUR: i64 = 60 * 60 * 1000;
+    const DAY: i64 = 24 * HOUR;
+
+    if let Some(end_millis) = end_millis {
+        return end_millis;
+    }
+
+    let nominal_end = match mode {
+        Mode::Daily => Some(range_start + DAY),
+        Mode::Weekly => Some(range_start + 7 * DAY),
+        Mode::Monthly => Some(range_start + 31 * DAY),
+        Mode::AllTime => None,
+    };
+    let buckets_to_last_event = last_event_millis
+        .saturating_sub(range_start)
+        .checked_div(bucket_span_millis)
+        .unwrap_or(0)
+        .saturating_add(1);
+    let last_bucket_end =
+        range_start.saturating_add(buckets_to_last_event.saturating_mul(bucket_span_millis));
+
+    nominal_end
+        .map(|end| end.max(last_bucket_end))
+        .unwrap_or(last_bucket_end)
 }
 
 pub fn load_period_costs(path: &Path, periods: &[PeriodKey]) -> Result<Vec<PeriodCost>> {
@@ -311,6 +457,8 @@ mod tests {
         assert_eq!(stats.models.len(), 2);
         assert_eq!(stats.models[0].display_name, "provider/gpt-test (high)");
         assert_eq!(stats.models[1].display_name, "provider/gpt-test");
+        assert_eq!(stats.token_buckets.len(), 1);
+        assert_eq!(stats.token_buckets[0].tokens, 110);
     }
 
     #[test]
@@ -344,6 +492,8 @@ mod tests {
         let stats = load_usage(file.path(), Mode::Daily, Some(1500)).unwrap();
         assert_eq!(stats.totals.messages, 1);
         assert_eq!(stats.totals.total_tokens(), 4);
+        assert_eq!(stats.token_buckets.len(), 24);
+        assert_eq!(stats.token_buckets[0].tokens, 4);
     }
 
     #[test]
@@ -363,6 +513,26 @@ mod tests {
         assert_eq!(stats.end_millis, Some(2000));
         assert_eq!(stats.totals.messages, 1);
         assert!((stats.totals.cost - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn buckets_daily_tokens_by_hour() {
+        const HOUR: i64 = 60 * 60 * 1000;
+        let file = NamedTempFile::new().unwrap();
+        let connection = Connection::open(file.path()).unwrap();
+        create_message_table(&connection);
+
+        insert_usage_message(&connection, "first", HOUR / 2, "m", 1.0);
+        insert_usage_message(&connection, "second", HOUR + HOUR / 2, "m", 1.0);
+        insert_usage_message(&connection, "outside", 3 * HOUR, "m", 1.0);
+        drop(connection);
+
+        let stats = load_usage_between(file.path(), Mode::Daily, 0, 3 * HOUR).unwrap();
+
+        assert_eq!(stats.token_buckets.len(), 3);
+        assert_eq!(stats.token_buckets[0].tokens, 4);
+        assert_eq!(stats.token_buckets[1].tokens, 4);
+        assert_eq!(stats.token_buckets[2].tokens, 0);
     }
 
     #[test]

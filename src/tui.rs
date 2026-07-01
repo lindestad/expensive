@@ -10,7 +10,7 @@ use ratatui::{
 use crate::{
     app::{AppState, ConfigEditorItem, View},
     config::{ColorTheme, ThemeScope},
-    db::{ModelUsage, UsageStats, UsageTotals},
+    db::{ModelUsage, TokenBucket, UsageStats, UsageTotals},
     format,
     time_window::{self, CalendarScale, Mode, PeriodKey, WeekStart},
 };
@@ -199,6 +199,21 @@ struct ConfigEditorLines {
     item_starts: Vec<usize>,
 }
 
+#[derive(Clone, Copy)]
+struct StatsLayout {
+    summary: Rect,
+    models: Rect,
+    divider: Option<Rect>,
+    graph: Option<Rect>,
+}
+
+#[derive(Clone, Copy)]
+struct GraphBucket {
+    start_idx: usize,
+    end_idx: usize,
+    tokens: u64,
+}
+
 #[derive(Clone)]
 struct ValueToken {
     text: String,
@@ -235,6 +250,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &AppState) {
                 .map(|stats| format!("{} by model", stats.mode.title()))
                 .unwrap_or_else(|| "Models".to_string()),
             app.dashboard_model_scroll,
+            app.dashboard_token_bucket,
             palette,
         ),
         View::CalendarOverview => draw_calendar_overview(frame, chunks[1], app, palette),
@@ -248,6 +264,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &AppState) {
                 detail_period_label(app.calendar.selected, app.config.week_start)
             ),
             app.history_model_scroll,
+            app.history_token_bucket,
             palette,
         ),
     }
@@ -291,11 +308,7 @@ pub fn calendar_period_at_position(
 }
 
 pub fn model_breakdown_area(area: Rect, app: &AppState) -> Option<Rect> {
-    if !matches!(app.view, View::Dashboard | View::CalendarDetail) {
-        return None;
-    }
-
-    Some(stats_view_areas(main_body_area(area)).1)
+    stats_for_view(app).map(|stats| stats_view_layout(main_body_area(area), Some(stats)).models)
 }
 
 pub fn model_breakdown_at_position(column: u16, row: u16, area: Rect, app: &AppState) -> bool {
@@ -306,6 +319,29 @@ pub fn model_breakdown_at_position(column: u16, row: u16, area: Rect, app: &AppS
 
 pub fn model_breakdown_max_scroll(area: Rect, row_count: usize) -> usize {
     row_count.saturating_sub(model_breakdown_visible_rows(area))
+}
+
+pub fn token_graph_area(area: Rect, app: &AppState) -> Option<Rect> {
+    stats_for_view(app).and_then(|stats| stats_view_layout(main_body_area(area), Some(stats)).graph)
+}
+
+pub fn token_bucket_at_position(
+    column: u16,
+    row: u16,
+    area: Rect,
+    app: &AppState,
+) -> Option<usize> {
+    let stats = stats_for_view(app)?;
+    let graph_area = token_graph_area(area, app)?;
+    token_bucket_index_at_position(column, row, graph_area, stats)
+}
+
+fn stats_for_view(app: &AppState) -> Option<&UsageStats> {
+    match app.view {
+        View::Dashboard => app.current_stats(),
+        View::CalendarDetail => app.selected_history_stats(),
+        View::CalendarOverview => None,
+    }
 }
 
 fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &AppState, palette: Palette) {
@@ -1236,28 +1272,90 @@ fn draw_stats_view(
     loading: bool,
     model_title: String,
     model_scroll: usize,
+    selected_token_bucket: Option<usize>,
     palette: Palette,
 ) {
-    let (summary_area, model_area) = stats_view_areas(area);
+    let layout = stats_view_layout(area, stats);
 
-    draw_summary(frame, summary_area, stats, loading, palette);
+    draw_summary(frame, layout.summary, stats, loading, palette);
     draw_models(
         frame,
-        model_area,
+        layout.models,
         stats,
         loading,
         &model_title,
         model_scroll,
         palette,
     );
+
+    if let (Some(stats), Some(divider), Some(graph)) = (stats, layout.divider, layout.graph) {
+        draw_model_graph_divider(frame, divider, palette);
+        draw_token_graph(frame, graph, stats, selected_token_bucket, palette);
+    }
 }
 
-fn stats_view_areas(area: Rect) -> (Rect, Rect) {
+fn stats_view_layout(area: Rect, stats: Option<&UsageStats>) -> StatsLayout {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(5), Constraint::Min(6)])
         .split(area);
-    (chunks[0], chunks[1])
+    let lower = chunks[1];
+    let mut layout = StatsLayout {
+        summary: chunks[0],
+        models: lower,
+        divider: None,
+        graph: None,
+    };
+
+    let Some(stats) = stats else {
+        return layout;
+    };
+    if stats.token_buckets.is_empty() || !can_show_token_graph(lower) {
+        return layout;
+    }
+
+    let model_height = model_graph_model_height(lower.height, stats.models.len());
+    let graph_height = lower
+        .height
+        .saturating_sub(model_height)
+        .saturating_sub(TOKEN_GRAPH_DIVIDER_HEIGHT);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(model_height),
+            Constraint::Length(TOKEN_GRAPH_DIVIDER_HEIGHT),
+            Constraint::Length(graph_height),
+        ])
+        .split(lower);
+    layout.models = chunks[0];
+    layout.divider = Some(chunks[1]);
+    layout.graph = Some(chunks[2]);
+    layout
+}
+
+const MODEL_TABLE_OVERHEAD: u16 = 3;
+const MIN_MODEL_ROWS_WITH_GRAPH: u16 = 6;
+const MIN_TOKEN_GRAPH_HEIGHT: u16 = 5;
+const TOKEN_GRAPH_DIVIDER_HEIGHT: u16 = 1;
+
+fn can_show_token_graph(lower_area: Rect) -> bool {
+    lower_area.height
+        >= MODEL_TABLE_OVERHEAD
+            .saturating_add(MIN_MODEL_ROWS_WITH_GRAPH)
+            .saturating_add(TOKEN_GRAPH_DIVIDER_HEIGHT)
+            .saturating_add(MIN_TOKEN_GRAPH_HEIGHT)
+}
+
+fn model_graph_model_height(lower_height: u16, model_count: usize) -> u16 {
+    let model_min = MODEL_TABLE_OVERHEAD.saturating_add(MIN_MODEL_ROWS_WITH_GRAPH);
+    let graph_min = MIN_TOKEN_GRAPH_HEIGHT;
+    let available = lower_height.saturating_sub(TOKEN_GRAPH_DIVIDER_HEIGHT);
+    let base = model_min.min(available.saturating_sub(graph_min));
+    let remaining = available.saturating_sub(base).saturating_sub(graph_min);
+    let full_model_height = MODEL_TABLE_OVERHEAD.saturating_add(model_count as u16);
+    let model_extra = remaining.min(full_model_height.saturating_sub(base));
+
+    base.saturating_add(model_extra)
 }
 
 fn draw_calendar_overview(frame: &mut Frame<'_>, area: Rect, app: &AppState, palette: Palette) {
@@ -1927,6 +2025,143 @@ fn draw_models(
     }
 }
 
+fn draw_model_graph_divider(frame: &mut Frame<'_>, area: Rect, palette: Palette) {
+    frame.render_widget(
+        Paragraph::new("─".repeat(area.width as usize)).style(Style::default().fg(palette.border)),
+        area,
+    );
+}
+
+fn draw_token_graph(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    stats: &UsageStats,
+    selected_bucket: Option<usize>,
+    palette: Palette,
+) {
+    let inner = token_graph_inner_area(area);
+    let groups = token_bucket_groups(&stats.token_buckets, inner.width as usize);
+    let max_tokens = groups.iter().map(|bucket| bucket.tokens).max().unwrap_or(0);
+    let graph_height = inner.height as usize;
+    let selected_bucket = selected_bucket.filter(|idx| *idx < stats.token_buckets.len());
+
+    let lines = (0..graph_height)
+        .map(|row| {
+            let level = graph_height.saturating_sub(row);
+            let spans = groups
+                .iter()
+                .map(|bucket| {
+                    let filled_height = if max_tokens == 0 || bucket.tokens == 0 {
+                        0
+                    } else {
+                        ((bucket.tokens as f64 / max_tokens as f64) * graph_height as f64).ceil()
+                            as usize
+                    };
+                    let selected = selected_bucket
+                        .map(|idx| idx >= bucket.start_idx && idx < bucket.end_idx)
+                        .unwrap_or(false);
+                    let color = if selected {
+                        palette.calendar_accent
+                    } else if bucket.tokens == 0 {
+                        palette.muted
+                    } else {
+                        palette.tokens
+                    };
+                    let mut style = Style::default().fg(color);
+                    if selected {
+                        style = style.add_modifier(Modifier::BOLD);
+                    }
+                    Span::styled(if filled_height >= level { "█" } else { " " }, style)
+                })
+                .collect::<Vec<_>>();
+            Line::from(spans)
+        })
+        .collect::<Vec<_>>();
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(token_graph_title(stats, selected_bucket))
+        .title_style(Style::default().fg(palette.title))
+        .border_style(Style::default().fg(palette.border));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn token_graph_title(stats: &UsageStats, selected_bucket: Option<usize>) -> String {
+    if let Some(bucket) = selected_bucket.and_then(|idx| stats.token_buckets.get(idx)) {
+        return format!(
+            " Token usage over time | {} {} ",
+            token_bucket_label(bucket, stats.mode),
+            format::tokens(bucket.tokens)
+        );
+    }
+
+    " Token usage over time ".to_string()
+}
+
+fn token_bucket_label(bucket: &TokenBucket, mode: Mode) -> String {
+    let Some(start) = local_date(bucket.start_millis) else {
+        return "bucket".to_string();
+    };
+
+    match mode {
+        Mode::Daily => start.format("%H:%M").to_string(),
+        Mode::Weekly | Mode::Monthly => start.format("%b %d").to_string(),
+        Mode::AllTime => {
+            let span = bucket.end_millis.saturating_sub(bucket.start_millis);
+            if span <= 7 * 24 * 60 * 60 * 1000 {
+                start.format("%b %d").to_string()
+            } else {
+                start.format("%b %Y").to_string()
+            }
+        }
+    }
+}
+
+fn token_bucket_index_at_position(
+    column: u16,
+    row: u16,
+    area: Rect,
+    stats: &UsageStats,
+) -> Option<usize> {
+    let inner = token_graph_inner_area(area);
+    if !rect_contains(inner, column, row) {
+        return None;
+    }
+
+    let groups = token_bucket_groups(&stats.token_buckets, inner.width as usize);
+    let column_idx = column.checked_sub(inner.x)? as usize;
+    groups.get(column_idx).map(|bucket| bucket.start_idx)
+}
+
+fn token_graph_inner_area(area: Rect) -> Rect {
+    area.inner(Margin {
+        horizontal: 1,
+        vertical: 1,
+    })
+}
+
+fn token_bucket_groups(buckets: &[TokenBucket], max_width: usize) -> Vec<GraphBucket> {
+    let group_count = buckets.len().min(max_width);
+    if group_count == 0 {
+        return Vec::new();
+    }
+
+    (0..group_count)
+        .map(|idx| {
+            let start_idx = idx * buckets.len() / group_count;
+            let end_idx = ((idx + 1) * buckets.len() / group_count).max(start_idx + 1);
+            let tokens = buckets[start_idx..end_idx]
+                .iter()
+                .fold(0_u64, |total, bucket| total.saturating_add(bucket.tokens));
+            GraphBucket {
+                start_idx,
+                end_idx,
+                tokens,
+            }
+        })
+        .collect()
+}
+
 fn draw_wide_models(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -2508,6 +2743,32 @@ mod tests {
     }
 
     #[test]
+    fn hides_token_graph_when_model_pane_is_cramped() {
+        let stats = many_model_stats(Mode::Daily, 8);
+        let app = app_with_stats(Mode::Daily, stats);
+
+        let output = render(&app, 100, 23);
+
+        assert!(!output.contains("Token usage over time"));
+    }
+
+    #[test]
+    fn renders_token_graph_when_space_allows() {
+        let stats = many_model_stats(Mode::Daily, 8);
+        let mut app = app_with_stats(Mode::Daily, stats);
+        app.dashboard_token_bucket = Some(2);
+
+        let output = render(&app, 100, 24);
+        let selected_label = local_date(token_buckets(3)[2].start_millis)
+            .unwrap()
+            .format("%H:%M")
+            .to_string();
+
+        assert!(output.contains("Token usage over time"));
+        assert!(output.contains(&format!("{selected_label} 30")));
+    }
+
+    #[test]
     fn renders_loading_state_when_current_mode_is_refreshing() {
         let app = app_loading(Mode::Weekly);
 
@@ -2829,6 +3090,9 @@ mod tests {
             help_scroll: 0,
             dashboard_model_scroll: 0,
             history_model_scroll: 0,
+            dashboard_token_bucket: None,
+            history_token_bucket: None,
+            token_graph_dragging: false,
             config_selection: 0,
             config_notice: None,
             mode,
@@ -2853,6 +3117,9 @@ mod tests {
             help_scroll: 0,
             dashboard_model_scroll: 0,
             history_model_scroll: 0,
+            dashboard_token_bucket: None,
+            history_token_bucket: None,
+            token_graph_dragging: false,
             config_selection: 0,
             config_notice: None,
             mode,
@@ -2877,6 +3144,9 @@ mod tests {
             help_scroll: 0,
             dashboard_model_scroll: 0,
             history_model_scroll: 0,
+            dashboard_token_bucket: None,
+            history_token_bucket: None,
+            token_graph_dragging: false,
             config_selection: 0,
             config_notice: None,
             mode: Mode::Daily,
@@ -2981,6 +3251,7 @@ mod tests {
                 cache_write: 44,
             },
             models: vec![high, default],
+            token_buckets: token_buckets(4),
         }
     }
 
@@ -3017,7 +3288,19 @@ mod tests {
             end_millis: None,
             totals,
             models,
+            token_buckets: token_buckets(count),
         }
+    }
+
+    fn token_buckets(count: usize) -> Vec<TokenBucket> {
+        const HOUR: i64 = 60 * 60 * 1000;
+        (0..count)
+            .map(|idx| TokenBucket {
+                start_millis: idx as i64 * HOUR,
+                end_millis: (idx as i64 + 1) * HOUR,
+                tokens: (idx as u64 + 1) * 10,
+            })
+            .collect()
     }
 
     fn local_millis(year: i32, month: u32, day: u32, hour: u32, minute: u32, second: u32) -> i64 {

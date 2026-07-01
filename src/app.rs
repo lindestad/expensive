@@ -83,6 +83,9 @@ pub struct AppState {
     pub help_scroll: usize,
     pub dashboard_model_scroll: usize,
     pub history_model_scroll: usize,
+    pub dashboard_token_bucket: Option<usize>,
+    pub history_token_bucket: Option<usize>,
+    pub token_graph_dragging: bool,
     pub config_selection: usize,
     pub config_notice: Option<ConfigNotice>,
     pub mode: Mode,
@@ -117,6 +120,9 @@ impl AppState {
             help_scroll: 0,
             dashboard_model_scroll: 0,
             history_model_scroll: 0,
+            dashboard_token_bucket: None,
+            history_token_bucket: None,
+            token_graph_dragging: false,
             config_selection: 0,
             config_notice: None,
             mode: Mode::Daily,
@@ -173,6 +179,7 @@ impl AppState {
         self.view = View::Dashboard;
         if self.mode != mode {
             self.dashboard_model_scroll = 0;
+            self.dashboard_token_bucket = None;
         }
         self.mode = mode;
         if !self.stats.contains_key(&mode) {
@@ -215,6 +222,7 @@ impl AppState {
     fn open_calendar_detail(&mut self, tx: &Sender<RefreshMessage>) {
         self.view = View::CalendarDetail;
         self.history_model_scroll = 0;
+        self.history_token_bucket = None;
         self.error = None;
         if !self.history_stats.contains_key(&self.calendar.selected) {
             self.trigger_history_refresh(tx);
@@ -235,6 +243,7 @@ impl AppState {
             self.config.week_start,
         )?;
         self.history_model_scroll = 0;
+        self.history_token_bucket = None;
         self.sync_visible_periods()?;
         match self.view {
             View::Dashboard => {}
@@ -250,6 +259,7 @@ impl AppState {
     fn move_calendar_selection(&mut self, steps: i32, tx: &Sender<RefreshMessage>) -> Result<()> {
         self.calendar.selected = time_window::shift_period(self.calendar.selected, steps)?;
         self.history_model_scroll = 0;
+        self.history_token_bucket = None;
         self.sync_visible_periods()?;
         self.ensure_calendar_costs(tx);
         if self.view == View::CalendarDetail {
@@ -266,6 +276,7 @@ impl AppState {
         self.calendar.scale = period.scale;
         self.calendar.selected = period;
         self.history_model_scroll = 0;
+        self.history_token_bucket = None;
         self.sync_visible_periods()?;
         self.ensure_calendar_costs(tx);
         Ok(())
@@ -444,6 +455,14 @@ impl AppState {
         }
     }
 
+    fn select_token_bucket(&mut self, bucket_idx: usize) {
+        match self.view {
+            View::Dashboard => self.dashboard_token_bucket = Some(bucket_idx),
+            View::CalendarDetail => self.history_token_bucket = Some(bucket_idx),
+            View::CalendarOverview => {}
+        }
+    }
+
     fn move_help_down(&mut self, layout: &tui::HelpLayoutState) {
         if self.help_config_visible(layout) {
             if self.config_selection + 1 < ConfigEditorItem::ALL.len() {
@@ -544,6 +563,7 @@ impl AppState {
             self.config.week_start,
         )?;
         self.history_model_scroll = 0;
+        self.history_token_bucket = None;
         self.sync_visible_periods()?;
         match self.view {
             View::Dashboard => {}
@@ -777,6 +797,32 @@ fn handle_mouse(mouse: MouseEvent, area: Rect, app: &mut AppState, tx: &Sender<R
     }
 
     match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            app.token_graph_dragging = false;
+            if let Some(bucket_idx) =
+                tui::token_bucket_at_position(mouse.column, mouse.row, area, app)
+            {
+                app.select_token_bucket(bucket_idx);
+                app.token_graph_dragging = true;
+                return;
+            }
+        }
+        MouseEventKind::Drag(MouseButton::Left) if app.token_graph_dragging => {
+            if let Some(bucket_idx) =
+                tui::token_bucket_at_position(mouse.column, mouse.row, area, app)
+            {
+                app.select_token_bucket(bucket_idx);
+            }
+            return;
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            app.token_graph_dragging = false;
+            return;
+        }
+        _ => {}
+    }
+
+    match mouse.kind {
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
             if tui::model_breakdown_at_position(mouse.column, mouse.row, area, app) =>
         {
@@ -967,7 +1013,7 @@ mod tests {
 
     use crate::{
         config::Scope,
-        db::{ModelUsage, UsageTotals},
+        db::{ModelUsage, TokenBucket, UsageTotals},
         time_window::{DailyStart, WeekStart},
     };
 
@@ -1282,6 +1328,61 @@ mod tests {
         assert_eq!(app.history_model_scroll, 1);
     }
 
+    #[test]
+    fn token_graph_click_and_drag_selects_dashboard_bucket() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config_path = tempdir.path().join("config.toml");
+        let mut app = AppState::new(test_config(config_path)).unwrap();
+        app.stats
+            .insert(Mode::Daily, many_model_stats(Mode::Daily, 8));
+        let (tx, _rx) = mpsc::channel();
+        let area = Rect::new(0, 0, 100, 32);
+        let graph_area = tui::token_graph_area(area, &app).unwrap();
+
+        handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: graph_area.x + 2,
+                row: graph_area.y + 2,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+            &mut app,
+            &tx,
+        );
+
+        assert_eq!(app.dashboard_token_bucket, Some(1));
+        assert!(app.token_graph_dragging);
+
+        handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: graph_area.x + 4,
+                row: graph_area.y + 2,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+            &mut app,
+            &tx,
+        );
+
+        assert_eq!(app.dashboard_token_bucket, Some(3));
+
+        handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: graph_area.x + 4,
+                row: graph_area.y + 2,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+            &mut app,
+            &tx,
+        );
+
+        assert!(!app.token_graph_dragging);
+    }
+
     fn test_config(config_path: PathBuf) -> Config {
         Config {
             db_path: PathBuf::from("/tmp/opencode.db"),
@@ -1329,6 +1430,18 @@ mod tests {
             end_millis: None,
             totals,
             models,
+            token_buckets: token_buckets(count),
         }
+    }
+
+    fn token_buckets(count: usize) -> Vec<TokenBucket> {
+        const HOUR: i64 = 60 * 60 * 1000;
+        (0..count)
+            .map(|idx| TokenBucket {
+                start_millis: idx as i64 * HOUR,
+                end_millis: (idx as i64 + 1) * HOUR,
+                tokens: (idx as u64 + 1) * 10,
+            })
+            .collect()
     }
 }
