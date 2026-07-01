@@ -10,10 +10,14 @@ use ratatui::{
 use crate::{
     app::{AppState, ConfigEditorItem, View},
     config::{ColorTheme, ThemeScope},
-    db::{ModelUsage, TokenBucket, UsageStats, UsageTotals},
+    db::{ModelUsage, UsageStats, UsageTotals},
     format,
     time_window::{self, CalendarScale, Mode, PeriodKey, WeekStart},
 };
+
+mod token_graph;
+
+use token_graph::{draw_token_graph, token_bucket_index_at_position};
 
 #[derive(Clone, Copy)]
 struct Palette {
@@ -206,13 +210,12 @@ struct StatsLayout {
     graph: Option<Rect>,
 }
 
-#[derive(Clone, Copy)]
-struct GraphBucket {
-    start_idx: usize,
-    end_idx: usize,
-    start_millis: i64,
-    end_millis: i64,
-    tokens: u64,
+struct StatsViewState<'a> {
+    stats: Option<&'a UsageStats>,
+    loading: bool,
+    model_title: String,
+    model_scroll: usize,
+    selected_token_bucket: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -245,27 +248,32 @@ pub fn draw(frame: &mut Frame<'_>, app: &AppState) {
         View::Dashboard => draw_stats_view(
             frame,
             chunks[1],
-            app.current_stats(),
-            app.is_current_loading(),
-            app.current_stats()
-                .map(|stats| format!("{} by model", stats.mode.title()))
-                .unwrap_or_else(|| "Models".to_string()),
-            app.dashboard_model_scroll,
-            app.dashboard_token_bucket,
+            StatsViewState {
+                stats: app.current_stats(),
+                loading: app.is_current_loading(),
+                model_title: app
+                    .current_stats()
+                    .map(|stats| format!("{} by model", stats.mode.title()))
+                    .unwrap_or_else(|| "Models".to_string()),
+                model_scroll: app.dashboard_model_scroll,
+                selected_token_bucket: app.dashboard_token_bucket,
+            },
             palette,
         ),
         View::CalendarOverview => draw_calendar_overview(frame, chunks[1], app, palette),
         View::CalendarDetail => draw_stats_view(
             frame,
             chunks[1],
-            app.selected_history_stats(),
-            app.is_selected_history_loading(),
-            format!(
-                "{} by model",
-                detail_period_label(app.calendar.selected, app.config.week_start)
-            ),
-            app.history_model_scroll,
-            app.history_token_bucket,
+            StatsViewState {
+                stats: app.selected_history_stats(),
+                loading: app.is_selected_history_loading(),
+                model_title: format!(
+                    "{} by model",
+                    detail_period_label(app.calendar.selected, app.config.week_start)
+                ),
+                model_scroll: app.history_model_scroll,
+                selected_token_bucket: app.history_token_bucket,
+            },
             palette,
         ),
     }
@@ -1266,31 +1274,22 @@ fn tab_span(label: &str, tab_style: TabStyle, palette: Palette) -> Span<'static>
     Span::styled(format!(" {label} "), style)
 }
 
-fn draw_stats_view(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    stats: Option<&UsageStats>,
-    loading: bool,
-    model_title: String,
-    model_scroll: usize,
-    selected_token_bucket: Option<usize>,
-    palette: Palette,
-) {
-    let layout = stats_view_layout(area, stats);
+fn draw_stats_view(frame: &mut Frame<'_>, area: Rect, view: StatsViewState<'_>, palette: Palette) {
+    let layout = stats_view_layout(area, view.stats);
 
-    draw_summary(frame, layout.summary, stats, loading, palette);
+    draw_summary(frame, layout.summary, view.stats, view.loading, palette);
     draw_models(
         frame,
         layout.models,
-        stats,
-        loading,
-        &model_title,
-        model_scroll,
+        view.stats,
+        view.loading,
+        &view.model_title,
+        view.model_scroll,
         palette,
     );
 
-    if let (Some(stats), Some(graph)) = (stats, layout.graph) {
-        draw_token_graph(frame, graph, stats, selected_token_bucket, palette);
+    if let (Some(stats), Some(graph)) = (view.stats, layout.graph) {
+        draw_token_graph(frame, graph, stats, view.selected_token_bucket, palette);
     }
 }
 
@@ -2017,269 +2016,6 @@ fn draw_models(
     }
 }
 
-fn draw_token_graph(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    stats: &UsageStats,
-    selected_bucket: Option<usize>,
-    palette: Palette,
-) {
-    let inner = token_graph_inner_area(area);
-    let (visible_start, visible_end) = visible_token_bucket_range(&stats.token_buckets);
-    let groups = token_bucket_groups(
-        &stats.token_buckets[visible_start..visible_end],
-        inner.width as usize,
-        visible_start,
-    );
-    let max_tokens = groups.iter().map(|bucket| bucket.tokens).max().unwrap_or(0);
-    let axis_height = usize::from(inner.height > 1);
-    let graph_height = (inner.height as usize).saturating_sub(axis_height).max(1);
-    let selected_bucket = selected_bucket.filter(|idx| *idx < stats.token_buckets.len());
-
-    let mut lines = (0..graph_height)
-        .map(|row| {
-            let level = graph_height.saturating_sub(row);
-            let spans = groups
-                .iter()
-                .map(|bucket| {
-                    let filled_height = if max_tokens == 0 || bucket.tokens == 0 {
-                        0
-                    } else {
-                        ((bucket.tokens as f64 / max_tokens as f64) * graph_height as f64).ceil()
-                            as usize
-                    };
-                    let selected = selected_bucket
-                        .map(|idx| idx >= bucket.start_idx && idx < bucket.end_idx)
-                        .unwrap_or(false);
-                    let color = if selected {
-                        palette.calendar_accent
-                    } else if bucket.tokens == 0 {
-                        palette.muted
-                    } else {
-                        palette.tokens
-                    };
-                    let mut style = Style::default().fg(color);
-                    if selected {
-                        style = style.add_modifier(Modifier::BOLD);
-                    }
-                    Span::styled(if filled_height >= level { "█" } else { " " }, style)
-                })
-                .collect::<Vec<_>>();
-            Line::from(spans)
-        })
-        .collect::<Vec<_>>();
-    if axis_height > 0 {
-        lines.push(token_graph_axis_line(
-            &groups,
-            inner.width as usize,
-            stats.mode,
-            palette,
-        ));
-    }
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(token_graph_title(stats, selected_bucket))
-        .title_style(Style::default().fg(palette.title))
-        .border_style(Style::default().fg(palette.border));
-    frame.render_widget(Paragraph::new(lines).block(block), area);
-}
-
-fn token_graph_title(stats: &UsageStats, selected_bucket: Option<usize>) -> String {
-    if let Some(bucket) = selected_bucket.and_then(|idx| stats.token_buckets.get(idx)) {
-        return format!(
-            " Token usage over time | {} {} ",
-            token_bucket_range_label(bucket, stats.mode),
-            format::tokens(bucket.tokens)
-        );
-    }
-
-    " Token usage over time ".to_string()
-}
-
-fn token_graph_axis_line(
-    groups: &[GraphBucket],
-    width: usize,
-    mode: Mode,
-    palette: Palette,
-) -> Line<'static> {
-    if groups.is_empty() || width == 0 {
-        return Line::from("");
-    }
-
-    let mut cells = vec![' '; width];
-    let tick_count = if width >= 36 { 4 } else { 3 }.min(groups.len());
-    for tick_idx in 0..tick_count {
-        let group_idx = if tick_count == 1 {
-            0
-        } else {
-            tick_idx * (groups.len() - 1) / (tick_count - 1)
-        };
-        let label = token_axis_label(&groups[group_idx], mode);
-        place_axis_label(&mut cells, group_idx, &label);
-    }
-
-    Line::from(Span::styled(
-        cells.into_iter().collect::<String>(),
-        Style::default().fg(palette.muted),
-    ))
-}
-
-fn place_axis_label(cells: &mut [char], center: usize, label: &str) {
-    if cells.is_empty() || label.is_empty() {
-        return;
-    }
-
-    let label_width = label.chars().count();
-    if label_width > cells.len() {
-        return;
-    }
-
-    let start = center
-        .saturating_sub(label_width / 2)
-        .min(cells.len().saturating_sub(label_width));
-    if cells[start..start + label_width]
-        .iter()
-        .any(|value| *value != ' ')
-    {
-        return;
-    }
-
-    for (idx, ch) in label.chars().enumerate() {
-        cells[start + idx] = ch;
-    }
-}
-
-fn token_axis_label(bucket: &GraphBucket, mode: Mode) -> String {
-    let Some(start) = local_date(bucket.start_millis) else {
-        return String::new();
-    };
-
-    match mode {
-        Mode::Daily => start.format("%H").to_string(),
-        Mode::Weekly | Mode::Monthly => start.format("%b %d").to_string(),
-        Mode::AllTime => {
-            let span = bucket.end_millis.saturating_sub(bucket.start_millis);
-            if span <= 7 * 24 * 60 * 60 * 1000 {
-                start.format("%b %d").to_string()
-            } else {
-                start.format("%b").to_string()
-            }
-        }
-    }
-}
-
-fn token_bucket_range_label(bucket: &TokenBucket, mode: Mode) -> String {
-    let Some(start) = local_date(bucket.start_millis) else {
-        return "bucket".to_string();
-    };
-    let end = local_date(bucket.end_millis);
-
-    match mode {
-        Mode::Daily => end
-            .map(|end| format!("{}-{}", start.format("%H:%M"), end.format("%H:%M")))
-            .unwrap_or_else(|| start.format("%H:%M").to_string()),
-        Mode::Weekly | Mode::Monthly => start.format("%b %d").to_string(),
-        Mode::AllTime => {
-            let span = bucket.end_millis.saturating_sub(bucket.start_millis);
-            if span <= 7 * 24 * 60 * 60 * 1000 {
-                start.format("%b %d").to_string()
-            } else {
-                start.format("%b %Y").to_string()
-            }
-        }
-    }
-}
-
-fn token_bucket_index_at_position(
-    column: u16,
-    row: u16,
-    area: Rect,
-    stats: &UsageStats,
-) -> Option<usize> {
-    if !rect_contains(area, column, row) {
-        return None;
-    }
-
-    let inner = token_graph_inner_area(area);
-    if inner.width == 0 || inner.height == 0 {
-        return None;
-    }
-
-    let (visible_start, visible_end) = visible_token_bucket_range(&stats.token_buckets);
-    let groups = token_bucket_groups(
-        &stats.token_buckets[visible_start..visible_end],
-        inner.width as usize,
-        visible_start,
-    );
-    if groups.is_empty() {
-        return None;
-    }
-    let max_column_idx = groups.len().saturating_sub(1);
-    let column_idx = if column < inner.x {
-        0
-    } else if column >= inner.x.saturating_add(groups.len() as u16) {
-        max_column_idx
-    } else {
-        (column.checked_sub(inner.x)? as usize).min(max_column_idx)
-    };
-    groups.get(column_idx).map(|bucket| bucket.start_idx)
-}
-
-fn token_graph_inner_area(area: Rect) -> Rect {
-    area.inner(Margin {
-        horizontal: 1,
-        vertical: 1,
-    })
-}
-
-fn visible_token_bucket_range(buckets: &[TokenBucket]) -> (usize, usize) {
-    if buckets.is_empty() {
-        return (0, 0);
-    }
-
-    let Some(first_used) = buckets.iter().position(|bucket| bucket.tokens > 0) else {
-        return (0, buckets.len());
-    };
-    let last_used = buckets
-        .iter()
-        .rposition(|bucket| bucket.tokens > 0)
-        .unwrap_or(first_used);
-
-    (
-        first_used.saturating_sub(1),
-        last_used.saturating_add(2).min(buckets.len()),
-    )
-}
-
-fn token_bucket_groups(
-    buckets: &[TokenBucket],
-    max_width: usize,
-    start_offset: usize,
-) -> Vec<GraphBucket> {
-    let group_count = buckets.len().min(max_width);
-    if group_count == 0 {
-        return Vec::new();
-    }
-
-    (0..group_count)
-        .map(|idx| {
-            let start_idx = idx * buckets.len() / group_count;
-            let end_idx = ((idx + 1) * buckets.len() / group_count).max(start_idx + 1);
-            let tokens = buckets[start_idx..end_idx]
-                .iter()
-                .fold(0_u64, |total, bucket| total.saturating_add(bucket.tokens));
-            GraphBucket {
-                start_idx: start_offset + start_idx,
-                end_idx: start_offset + end_idx,
-                start_millis: buckets[start_idx].start_millis,
-                end_millis: buckets[end_idx - 1].end_millis,
-                tokens,
-            }
-        })
-        .collect()
-}
-
 fn draw_wide_models(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -2667,6 +2403,7 @@ mod tests {
     use crate::{
         app::CalendarState,
         config::{ColorTheme, Config, Scope, ThemeScope},
+        db::TokenBucket,
         time_window::{self, DailyStart, WeekStart},
     };
 
@@ -2877,10 +2614,34 @@ mod tests {
         app.dashboard_token_bucket = Some(2);
 
         let output = render(&app, 100, 24);
-        let selected_label = token_bucket_range_label(&token_buckets(3)[2], Mode::Daily);
+        let selected_label =
+            token_graph::token_bucket_range_label(&token_buckets(3)[2], Mode::Daily);
 
         assert!(output.contains("Token usage over time"));
         assert!(output.contains(&format!("{selected_label} 30")));
+    }
+
+    #[test]
+    fn token_graph_spans_available_width_with_few_buckets() {
+        let stats = many_model_stats(Mode::Daily, 3);
+        let app = app_with_stats(Mode::Daily, stats);
+        let terminal_area = Rect::new(0, 0, 100, 24);
+        let graph_area = token_graph_area(terminal_area, &app).unwrap();
+
+        let output = render(&app, terminal_area.width, terminal_area.height);
+        let inner_right = graph_area.x + graph_area.width - 2;
+        let graph_body_top = graph_area.y + 1;
+        let graph_body_bottom = graph_area.y + graph_area.height - 1;
+        let has_right_edge_bar = output.lines().enumerate().any(|(y, line)| {
+            y >= graph_body_top as usize
+                && y < graph_body_bottom as usize
+                && char_at(line, inner_right as usize) == Some('█')
+        });
+
+        assert!(
+            has_right_edge_bar,
+            "expected token graph bars to reach the right edge:\n{output}"
+        );
     }
 
     #[test]
@@ -2895,7 +2656,7 @@ mod tests {
             test_token_bucket(6, 0),
         ];
 
-        assert_eq!(visible_token_bucket_range(&buckets), (1, 6));
+        assert_eq!(token_graph::visible_token_bucket_range(&buckets), (1, 6));
     }
 
     #[test]
@@ -3197,6 +2958,10 @@ mod tests {
                     .map(|byte_idx| line[..byte_idx].chars().count())
             })
             .unwrap_or_else(|| panic!("missing text {text:?}"))
+    }
+
+    fn char_at(line: &str, column: usize) -> Option<char> {
+        line.chars().nth(column)
     }
 
     fn config_value_start(output: &str, label: &str, value: &str) -> usize {

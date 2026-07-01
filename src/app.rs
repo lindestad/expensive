@@ -1335,16 +1335,19 @@ mod tests {
         let tempdir = tempfile::tempdir().unwrap();
         let config_path = tempdir.path().join("config.toml");
         let mut app = AppState::new(test_config(config_path)).unwrap();
+        let bucket_count = 8;
         app.stats
-            .insert(Mode::Daily, many_model_stats(Mode::Daily, 8));
+            .insert(Mode::Daily, many_model_stats(Mode::Daily, bucket_count));
         let (tx, _rx) = mpsc::channel();
         let area = Rect::new(0, 0, 100, 32);
         let graph_area = tui::token_graph_area(area, &app).unwrap();
+        let inner_width = graph_area.width.saturating_sub(2) as usize;
+        let bucket_one_column = graph_area.x + 1 + inner_width.div_ceil(bucket_count) as u16;
 
         handle_mouse(
             MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
-                column: graph_area.x + 2,
+                column: bucket_one_column,
                 row: graph_area.y + 2,
                 modifiers: KeyModifiers::NONE,
             },
