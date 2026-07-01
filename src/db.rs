@@ -174,40 +174,10 @@ fn load_token_buckets(
     start_millis: Option<i64>,
     end_millis: Option<i64>,
 ) -> Result<Vec<TokenBucket>> {
-    let mut statement = connection.prepare(
-        r#"
-        SELECT
-            time_created,
-            COALESCE(json_extract(data, '$.tokens.input'), 0)
-                + COALESCE(json_extract(data, '$.tokens.output'), 0)
-                + COALESCE(json_extract(data, '$.tokens.cache.read'), 0)
-                + COALESCE(json_extract(data, '$.tokens.cache.write'), 0) AS tokens
-        FROM message
-        WHERE json_extract(data, '$.role') = 'assistant'
-            AND (?1 IS NULL OR time_created >= ?1)
-            AND (?2 IS NULL OR time_created < ?2)
-        ORDER BY time_created ASC
-        "#,
-    )?;
-
-    let rows = statement.query_map(params![start_millis, end_millis], |row| {
-        let time_created: i64 = row.get("time_created")?;
-        let tokens = read_u64(row, "tokens")?;
-        Ok((time_created, tokens))
-    })?;
-
-    let mut events = Vec::new();
-    for row in rows {
-        events.push(row?);
-    }
-
-    let Some((first_time, _)) = events.first().copied() else {
+    let Some((first_time, last_time)) = usage_time_bounds(connection, start_millis, end_millis)?
+    else {
         return Ok(Vec::new());
     };
-    let last_time = events
-        .last()
-        .map(|(time_created, _)| *time_created)
-        .unwrap_or(first_time);
     let range_start = start_millis.unwrap_or(first_time);
     let span = token_bucket_span_millis(mode, range_start, last_time.max(range_start));
     let range_end = token_bucket_range_end(mode, range_start, last_time, end_millis, span);
@@ -227,17 +197,73 @@ fn load_token_buckets(
         })
         .collect::<Vec<_>>();
 
-    for (time_created, tokens) in events {
-        if time_created < range_start || time_created >= range_end {
+    let mut statement = connection.prepare(
+        r#"
+        SELECT
+            (time_created - ?3) / ?4 AS bucket_idx,
+            COALESCE(SUM(
+                COALESCE(json_extract(data, '$.tokens.input'), 0)
+                + COALESCE(json_extract(data, '$.tokens.output'), 0)
+                + COALESCE(json_extract(data, '$.tokens.cache.read'), 0)
+                + COALESCE(json_extract(data, '$.tokens.cache.write'), 0)
+            ), 0) AS tokens
+        FROM message
+        WHERE json_extract(data, '$.role') = 'assistant'
+            AND (?1 IS NULL OR time_created >= ?1)
+            AND (?2 IS NULL OR time_created < ?2)
+            AND time_created >= ?3
+            AND time_created < ?5
+        GROUP BY bucket_idx
+        ORDER BY bucket_idx ASC
+        "#,
+    )?;
+
+    let rows = statement.query_map(
+        params![start_millis, end_millis, range_start, span, range_end],
+        |row| {
+            let bucket_idx: i64 = row.get("bucket_idx")?;
+            let tokens = read_u64(row, "tokens")?;
+            Ok((bucket_idx, tokens))
+        },
+    )?;
+
+    for row in rows {
+        let (bucket_idx, tokens) = row?;
+        if bucket_idx < 0 {
             continue;
         }
-        let idx = ((time_created - range_start) / span) as usize;
-        if let Some(bucket) = buckets.get_mut(idx) {
-            bucket.tokens = bucket.tokens.saturating_add(tokens);
+        if let Some(bucket) = buckets.get_mut(bucket_idx as usize) {
+            bucket.tokens = tokens;
         }
     }
 
     Ok(buckets)
+}
+
+fn usage_time_bounds(
+    connection: &Connection,
+    start_millis: Option<i64>,
+    end_millis: Option<i64>,
+) -> Result<Option<(i64, i64)>> {
+    let mut statement = connection.prepare(
+        r#"
+        SELECT
+            MIN(time_created) AS first_time,
+            MAX(time_created) AS last_time
+        FROM message
+        WHERE json_extract(data, '$.role') = 'assistant'
+            AND (?1 IS NULL OR time_created >= ?1)
+            AND (?2 IS NULL OR time_created < ?2)
+        "#,
+    )?;
+
+    let bounds = statement.query_row(params![start_millis, end_millis], |row| {
+        let first_time: Option<i64> = row.get("first_time")?;
+        let last_time: Option<i64> = row.get("last_time")?;
+        Ok(first_time.zip(last_time))
+    })?;
+
+    Ok(bounds)
 }
 
 fn token_bucket_span_millis(mode: Mode, start_millis: i64, end_millis: i64) -> i64 {
