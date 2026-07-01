@@ -272,7 +272,7 @@ fn token_bucket_span_millis(mode: Mode, start_millis: i64, end_millis: i64) -> i
     const WEEK: i64 = 7 * DAY;
 
     match mode {
-        Mode::Daily => HOUR,
+        Mode::Daily => 2 * HOUR,
         Mode::Weekly | Mode::Monthly => DAY,
         Mode::AllTime => {
             let span = end_millis.saturating_sub(start_millis);
@@ -518,7 +518,7 @@ mod tests {
         let stats = load_usage(file.path(), Mode::Daily, Some(1500)).unwrap();
         assert_eq!(stats.totals.messages, 1);
         assert_eq!(stats.totals.total_tokens(), 4);
-        assert_eq!(stats.token_buckets.len(), 24);
+        assert_eq!(stats.token_buckets.len(), 12);
         assert_eq!(stats.token_buckets[0].tokens, 4);
     }
 
@@ -542,7 +542,7 @@ mod tests {
     }
 
     #[test]
-    fn buckets_daily_tokens_by_hour() {
+    fn buckets_daily_tokens_by_two_hour_window() {
         const HOUR: i64 = 60 * 60 * 1000;
         let file = NamedTempFile::new().unwrap();
         let connection = Connection::open(file.path()).unwrap();
@@ -550,15 +550,14 @@ mod tests {
 
         insert_usage_message(&connection, "first", HOUR / 2, "m", 1.0);
         insert_usage_message(&connection, "second", HOUR + HOUR / 2, "m", 1.0);
-        insert_usage_message(&connection, "outside", 3 * HOUR, "m", 1.0);
+        insert_usage_message(&connection, "outside", 4 * HOUR, "m", 1.0);
         drop(connection);
 
-        let stats = load_usage_between(file.path(), Mode::Daily, 0, 3 * HOUR).unwrap();
+        let stats = load_usage_between(file.path(), Mode::Daily, 0, 4 * HOUR).unwrap();
 
-        assert_eq!(stats.token_buckets.len(), 3);
-        assert_eq!(stats.token_buckets[0].tokens, 4);
-        assert_eq!(stats.token_buckets[1].tokens, 4);
-        assert_eq!(stats.token_buckets[2].tokens, 0);
+        assert_eq!(stats.token_buckets.len(), 2);
+        assert_eq!(stats.token_buckets[0].tokens, 8);
+        assert_eq!(stats.token_buckets[1].tokens, 0);
     }
 
     #[test]

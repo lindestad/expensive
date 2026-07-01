@@ -210,6 +210,8 @@ struct StatsLayout {
 struct GraphBucket {
     start_idx: usize,
     end_idx: usize,
+    start_millis: i64,
+    end_millis: i64,
     tokens: u64,
 }
 
@@ -2023,12 +2025,18 @@ fn draw_token_graph(
     palette: Palette,
 ) {
     let inner = token_graph_inner_area(area);
-    let groups = token_bucket_groups(&stats.token_buckets, inner.width as usize);
+    let (visible_start, visible_end) = visible_token_bucket_range(&stats.token_buckets);
+    let groups = token_bucket_groups(
+        &stats.token_buckets[visible_start..visible_end],
+        inner.width as usize,
+        visible_start,
+    );
     let max_tokens = groups.iter().map(|bucket| bucket.tokens).max().unwrap_or(0);
-    let graph_height = inner.height as usize;
+    let axis_height = usize::from(inner.height > 1);
+    let graph_height = (inner.height as usize).saturating_sub(axis_height).max(1);
     let selected_bucket = selected_bucket.filter(|idx| *idx < stats.token_buckets.len());
 
-    let lines = (0..graph_height)
+    let mut lines = (0..graph_height)
         .map(|row| {
             let level = graph_height.saturating_sub(row);
             let spans = groups
@@ -2060,6 +2068,14 @@ fn draw_token_graph(
             Line::from(spans)
         })
         .collect::<Vec<_>>();
+    if axis_height > 0 {
+        lines.push(token_graph_axis_line(
+            &groups,
+            inner.width as usize,
+            stats.mode,
+            palette,
+        ));
+    }
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -2073,7 +2089,7 @@ fn token_graph_title(stats: &UsageStats, selected_bucket: Option<usize>) -> Stri
     if let Some(bucket) = selected_bucket.and_then(|idx| stats.token_buckets.get(idx)) {
         return format!(
             " Token usage over time | {} {} ",
-            token_bucket_label(bucket, stats.mode),
+            token_bucket_range_label(bucket, stats.mode),
             format::tokens(bucket.tokens)
         );
     }
@@ -2081,13 +2097,88 @@ fn token_graph_title(stats: &UsageStats, selected_bucket: Option<usize>) -> Stri
     " Token usage over time ".to_string()
 }
 
-fn token_bucket_label(bucket: &TokenBucket, mode: Mode) -> String {
+fn token_graph_axis_line(
+    groups: &[GraphBucket],
+    width: usize,
+    mode: Mode,
+    palette: Palette,
+) -> Line<'static> {
+    if groups.is_empty() || width == 0 {
+        return Line::from("");
+    }
+
+    let mut cells = vec![' '; width];
+    let tick_count = if width >= 36 { 4 } else { 3 }.min(groups.len());
+    for tick_idx in 0..tick_count {
+        let group_idx = if tick_count == 1 {
+            0
+        } else {
+            tick_idx * (groups.len() - 1) / (tick_count - 1)
+        };
+        let label = token_axis_label(&groups[group_idx], mode);
+        place_axis_label(&mut cells, group_idx, &label);
+    }
+
+    Line::from(Span::styled(
+        cells.into_iter().collect::<String>(),
+        Style::default().fg(palette.muted),
+    ))
+}
+
+fn place_axis_label(cells: &mut [char], center: usize, label: &str) {
+    if cells.is_empty() || label.is_empty() {
+        return;
+    }
+
+    let label_width = label.chars().count();
+    if label_width > cells.len() {
+        return;
+    }
+
+    let start = center
+        .saturating_sub(label_width / 2)
+        .min(cells.len().saturating_sub(label_width));
+    if cells[start..start + label_width]
+        .iter()
+        .any(|value| *value != ' ')
+    {
+        return;
+    }
+
+    for (idx, ch) in label.chars().enumerate() {
+        cells[start + idx] = ch;
+    }
+}
+
+fn token_axis_label(bucket: &GraphBucket, mode: Mode) -> String {
     let Some(start) = local_date(bucket.start_millis) else {
-        return "bucket".to_string();
+        return String::new();
     };
 
     match mode {
-        Mode::Daily => start.format("%H:%M").to_string(),
+        Mode::Daily => start.format("%H").to_string(),
+        Mode::Weekly | Mode::Monthly => start.format("%b %d").to_string(),
+        Mode::AllTime => {
+            let span = bucket.end_millis.saturating_sub(bucket.start_millis);
+            if span <= 7 * 24 * 60 * 60 * 1000 {
+                start.format("%b %d").to_string()
+            } else {
+                start.format("%b").to_string()
+            }
+        }
+    }
+}
+
+fn token_bucket_range_label(bucket: &TokenBucket, mode: Mode) -> String {
+    let Some(start) = local_date(bucket.start_millis) else {
+        return "bucket".to_string();
+    };
+    let end = local_date(bucket.end_millis);
+
+    match mode {
+        Mode::Daily => end
+            .map(|end| format!("{}-{}", start.format("%H:%M"), end.format("%H:%M")))
+            .unwrap_or_else(|| start.format("%H:%M").to_string()),
         Mode::Weekly | Mode::Monthly => start.format("%b %d").to_string(),
         Mode::AllTime => {
             let span = bucket.end_millis.saturating_sub(bucket.start_millis);
@@ -2115,7 +2206,12 @@ fn token_bucket_index_at_position(
         return None;
     }
 
-    let groups = token_bucket_groups(&stats.token_buckets, inner.width as usize);
+    let (visible_start, visible_end) = visible_token_bucket_range(&stats.token_buckets);
+    let groups = token_bucket_groups(
+        &stats.token_buckets[visible_start..visible_end],
+        inner.width as usize,
+        visible_start,
+    );
     if groups.is_empty() {
         return None;
     }
@@ -2137,7 +2233,30 @@ fn token_graph_inner_area(area: Rect) -> Rect {
     })
 }
 
-fn token_bucket_groups(buckets: &[TokenBucket], max_width: usize) -> Vec<GraphBucket> {
+fn visible_token_bucket_range(buckets: &[TokenBucket]) -> (usize, usize) {
+    if buckets.is_empty() {
+        return (0, 0);
+    }
+
+    let Some(first_used) = buckets.iter().position(|bucket| bucket.tokens > 0) else {
+        return (0, buckets.len());
+    };
+    let last_used = buckets
+        .iter()
+        .rposition(|bucket| bucket.tokens > 0)
+        .unwrap_or(first_used);
+
+    (
+        first_used.saturating_sub(1),
+        last_used.saturating_add(2).min(buckets.len()),
+    )
+}
+
+fn token_bucket_groups(
+    buckets: &[TokenBucket],
+    max_width: usize,
+    start_offset: usize,
+) -> Vec<GraphBucket> {
     let group_count = buckets.len().min(max_width);
     if group_count == 0 {
         return Vec::new();
@@ -2151,8 +2270,10 @@ fn token_bucket_groups(buckets: &[TokenBucket], max_width: usize) -> Vec<GraphBu
                 .iter()
                 .fold(0_u64, |total, bucket| total.saturating_add(bucket.tokens));
             GraphBucket {
-                start_idx,
-                end_idx,
+                start_idx: start_offset + start_idx,
+                end_idx: start_offset + end_idx,
+                start_millis: buckets[start_idx].start_millis,
+                end_millis: buckets[end_idx - 1].end_millis,
                 tokens,
             }
         })
@@ -2756,13 +2877,25 @@ mod tests {
         app.dashboard_token_bucket = Some(2);
 
         let output = render(&app, 100, 24);
-        let selected_label = local_date(token_buckets(3)[2].start_millis)
-            .unwrap()
-            .format("%H:%M")
-            .to_string();
+        let selected_label = token_bucket_range_label(&token_buckets(3)[2], Mode::Daily);
 
         assert!(output.contains("Token usage over time"));
         assert!(output.contains(&format!("{selected_label} 30")));
+    }
+
+    #[test]
+    fn trims_empty_token_graph_edges() {
+        let buckets = vec![
+            test_token_bucket(0, 0),
+            test_token_bucket(1, 0),
+            test_token_bucket(2, 10),
+            test_token_bucket(3, 0),
+            test_token_bucket(4, 20),
+            test_token_bucket(5, 0),
+            test_token_bucket(6, 0),
+        ];
+
+        assert_eq!(visible_token_bucket_range(&buckets), (1, 6));
     }
 
     #[test]
@@ -3290,14 +3423,18 @@ mod tests {
     }
 
     fn token_buckets(count: usize) -> Vec<TokenBucket> {
-        const HOUR: i64 = 60 * 60 * 1000;
         (0..count)
-            .map(|idx| TokenBucket {
-                start_millis: idx as i64 * HOUR,
-                end_millis: (idx as i64 + 1) * HOUR,
-                tokens: (idx as u64 + 1) * 10,
-            })
+            .map(|idx| test_token_bucket(idx, (idx as u64 + 1) * 10))
             .collect()
+    }
+
+    fn test_token_bucket(idx: usize, tokens: u64) -> TokenBucket {
+        const HOUR: i64 = 60 * 60 * 1000;
+        TokenBucket {
+            start_millis: idx as i64 * 2 * HOUR,
+            end_millis: (idx as i64 + 1) * 2 * HOUR,
+            tokens,
+        }
     }
 
     fn local_millis(year: i32, month: u32, day: u32, hour: u32, minute: u32, second: u32) -> i64 {
