@@ -3,7 +3,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table},
+    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState},
     Frame,
 };
 
@@ -234,6 +234,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &AppState) {
             app.current_stats()
                 .map(|stats| format!("{} by model", stats.mode.title()))
                 .unwrap_or_else(|| "Models".to_string()),
+            app.dashboard_model_scroll,
             palette,
         ),
         View::CalendarOverview => draw_calendar_overview(frame, chunks[1], app, palette),
@@ -246,6 +247,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &AppState) {
                 "{} by model",
                 detail_period_label(app.calendar.selected, app.config.week_start)
             ),
+            app.history_model_scroll,
             palette,
         ),
     }
@@ -286,6 +288,24 @@ pub fn calendar_period_at_position(
         CalendarScale::Week => period_grid_at_position(column, row, inner, app, 4),
         CalendarScale::Month => period_grid_at_position(column, row, inner, app, 3),
     }
+}
+
+pub fn model_breakdown_area(area: Rect, app: &AppState) -> Option<Rect> {
+    if !matches!(app.view, View::Dashboard | View::CalendarDetail) {
+        return None;
+    }
+
+    Some(stats_view_areas(main_body_area(area)).1)
+}
+
+pub fn model_breakdown_at_position(column: u16, row: u16, area: Rect, app: &AppState) -> bool {
+    model_breakdown_area(area, app)
+        .map(|area| rect_contains(area, column, row))
+        .unwrap_or(false)
+}
+
+pub fn model_breakdown_max_scroll(area: Rect, row_count: usize) -> usize {
+    row_count.saturating_sub(model_breakdown_visible_rows(area))
 }
 
 fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &AppState, palette: Palette) {
@@ -1215,15 +1235,29 @@ fn draw_stats_view(
     stats: Option<&UsageStats>,
     loading: bool,
     model_title: String,
+    model_scroll: usize,
     palette: Palette,
 ) {
+    let (summary_area, model_area) = stats_view_areas(area);
+
+    draw_summary(frame, summary_area, stats, loading, palette);
+    draw_models(
+        frame,
+        model_area,
+        stats,
+        loading,
+        &model_title,
+        model_scroll,
+        palette,
+    );
+}
+
+fn stats_view_areas(area: Rect) -> (Rect, Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(5), Constraint::Min(6)])
         .split(area);
-
-    draw_summary(frame, chunks[0], stats, loading, palette);
-    draw_models(frame, chunks[1], stats, loading, &model_title, palette);
+    (chunks[0], chunks[1])
 }
 
 fn draw_calendar_overview(frame: &mut Frame<'_>, area: Rect, app: &AppState, palette: Palette) {
@@ -1859,6 +1893,7 @@ fn draw_models(
     stats: Option<&UsageStats>,
     loading: bool,
     title: &str,
+    scroll: usize,
     palette: Palette,
 ) {
     let Some(stats) = stats else {
@@ -1886,9 +1921,9 @@ fn draw_models(
     };
 
     if area.width >= 112 {
-        draw_wide_models(frame, area, stats, title, palette);
+        draw_wide_models(frame, area, stats, title, scroll, palette);
     } else {
-        draw_compact_models(frame, area, stats, title, palette);
+        draw_compact_models(frame, area, stats, title, scroll, palette);
     }
 }
 
@@ -1897,6 +1932,7 @@ fn draw_wide_models(
     area: Rect,
     stats: &UsageStats,
     title: &str,
+    scroll: usize,
     palette: Palette,
 ) {
     let max_cost = stats.models.first().map(model_cost).unwrap_or(0.0);
@@ -1946,7 +1982,9 @@ fn draw_wide_models(
     )
     .column_spacing(1);
 
-    frame.render_widget(table, area);
+    let mut state = TableState::new()
+        .with_offset(scroll.min(model_breakdown_max_scroll(area, stats.models.len())));
+    frame.render_stateful_widget(table, area, &mut state);
 }
 
 fn draw_compact_models(
@@ -1954,6 +1992,7 @@ fn draw_compact_models(
     area: Rect,
     stats: &UsageStats,
     title: &str,
+    scroll: usize,
     palette: Palette,
 ) {
     let max_cost = stats.models.first().map(model_cost).unwrap_or(0.0);
@@ -1995,7 +2034,13 @@ fn draw_compact_models(
     )
     .column_spacing(1);
 
-    frame.render_widget(table, area);
+    let mut state = TableState::new()
+        .with_offset(scroll.min(model_breakdown_max_scroll(area, stats.models.len())));
+    frame.render_stateful_widget(table, area, &mut state);
+}
+
+fn model_breakdown_visible_rows(area: Rect) -> usize {
+    area.height.saturating_sub(3) as usize
 }
 
 fn wide_row(
@@ -2451,6 +2496,18 @@ mod tests {
     }
 
     #[test]
+    fn renders_scrolled_dashboard_model_breakdown() {
+        let stats = many_model_stats(Mode::AllTime, 8);
+        let mut app = app_with_stats(Mode::AllTime, stats);
+        app.dashboard_model_scroll = 3;
+
+        let output = render(&app, 100, 16);
+
+        assert!(output.contains("provider/model-3"));
+        assert!(!output.contains("provider/model-0"));
+    }
+
+    #[test]
     fn renders_loading_state_when_current_mode_is_refreshing() {
         let app = app_loading(Mode::Weekly);
 
@@ -2552,6 +2609,27 @@ mod tests {
         assert!(output.contains("Jun 15 by model"));
         assert!(output.contains("$3.75"));
         assert!(output.contains("Jun 15 04:00 - Jun 16 04:00"));
+    }
+
+    #[test]
+    fn renders_scrolled_calendar_detail_model_breakdown() {
+        let selected = time_window::current_period(
+            CalendarScale::Day,
+            Local.with_ymd_and_hms(2026, 6, 15, 10, 0, 0).unwrap(),
+            DailyStart::default(),
+            WeekStart::default(),
+        )
+        .unwrap();
+        let stats = many_model_stats(Mode::Daily, 8);
+        let mut app = app_with_calendar(selected);
+        app.view = View::CalendarDetail;
+        app.history_model_scroll = 3;
+        app.history_stats.insert(selected, stats);
+
+        let output = render(&app, 100, 16);
+
+        assert!(output.contains("provider/model-3"));
+        assert!(!output.contains("provider/model-0"));
     }
 
     #[test]
@@ -2749,6 +2827,8 @@ mod tests {
             view: View::Dashboard,
             show_help: false,
             help_scroll: 0,
+            dashboard_model_scroll: 0,
+            history_model_scroll: 0,
             config_selection: 0,
             config_notice: None,
             mode,
@@ -2771,6 +2851,8 @@ mod tests {
             view: View::Dashboard,
             show_help: false,
             help_scroll: 0,
+            dashboard_model_scroll: 0,
+            history_model_scroll: 0,
             config_selection: 0,
             config_notice: None,
             mode,
@@ -2793,6 +2875,8 @@ mod tests {
             view: View::CalendarOverview,
             show_help: false,
             help_scroll: 0,
+            dashboard_model_scroll: 0,
+            history_model_scroll: 0,
             config_selection: 0,
             config_notice: None,
             mode: Mode::Daily,
@@ -2897,6 +2981,42 @@ mod tests {
                 cache_write: 44,
             },
             models: vec![high, default],
+        }
+    }
+
+    fn many_model_stats(mode: Mode, count: usize) -> UsageStats {
+        let models = (0..count)
+            .map(|idx| ModelUsage {
+                provider: "provider".to_string(),
+                model_id: format!("model-{idx}"),
+                variant: "default".to_string(),
+                display_name: format!("provider/model-{idx}"),
+                totals: UsageTotals {
+                    messages: 1,
+                    cost: (count - idx) as f64,
+                    input: 10,
+                    output: 20,
+                    cache_read: 30,
+                    cache_write: 40,
+                },
+            })
+            .collect::<Vec<_>>();
+        let totals = UsageTotals {
+            messages: count as u64,
+            cost: models.iter().map(|model| model.totals.cost).sum(),
+            input: models.iter().map(|model| model.totals.input).sum(),
+            output: models.iter().map(|model| model.totals.output).sum(),
+            cache_read: models.iter().map(|model| model.totals.cache_read).sum(),
+            cache_write: models.iter().map(|model| model.totals.cache_write).sum(),
+        };
+
+        UsageStats {
+            mode,
+            refreshed_at: Local.with_ymd_and_hms(2026, 6, 15, 10, 0, 0).unwrap(),
+            cutoff_millis: None,
+            end_millis: None,
+            totals,
+            models,
         }
     }
 

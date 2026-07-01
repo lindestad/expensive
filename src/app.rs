@@ -81,6 +81,8 @@ pub struct AppState {
     pub view: View,
     pub show_help: bool,
     pub help_scroll: usize,
+    pub dashboard_model_scroll: usize,
+    pub history_model_scroll: usize,
     pub config_selection: usize,
     pub config_notice: Option<ConfigNotice>,
     pub mode: Mode,
@@ -113,6 +115,8 @@ impl AppState {
             view: View::Dashboard,
             show_help: false,
             help_scroll: 0,
+            dashboard_model_scroll: 0,
+            history_model_scroll: 0,
             config_selection: 0,
             config_notice: None,
             mode: Mode::Daily,
@@ -167,6 +171,9 @@ impl AppState {
 
     fn switch_mode(&mut self, mode: Mode, tx: &Sender<RefreshMessage>) {
         self.view = View::Dashboard;
+        if self.mode != mode {
+            self.dashboard_model_scroll = 0;
+        }
         self.mode = mode;
         if !self.stats.contains_key(&mode) {
             self.trigger_dashboard_refresh(tx);
@@ -207,6 +214,7 @@ impl AppState {
 
     fn open_calendar_detail(&mut self, tx: &Sender<RefreshMessage>) {
         self.view = View::CalendarDetail;
+        self.history_model_scroll = 0;
         self.error = None;
         if !self.history_stats.contains_key(&self.calendar.selected) {
             self.trigger_history_refresh(tx);
@@ -226,6 +234,7 @@ impl AppState {
             self.config.daily_start,
             self.config.week_start,
         )?;
+        self.history_model_scroll = 0;
         self.sync_visible_periods()?;
         match self.view {
             View::Dashboard => {}
@@ -240,6 +249,7 @@ impl AppState {
 
     fn move_calendar_selection(&mut self, steps: i32, tx: &Sender<RefreshMessage>) -> Result<()> {
         self.calendar.selected = time_window::shift_period(self.calendar.selected, steps)?;
+        self.history_model_scroll = 0;
         self.sync_visible_periods()?;
         self.ensure_calendar_costs(tx);
         if self.view == View::CalendarDetail {
@@ -255,6 +265,7 @@ impl AppState {
     ) -> Result<()> {
         self.calendar.scale = period.scale;
         self.calendar.selected = period;
+        self.history_model_scroll = 0;
         self.sync_visible_periods()?;
         self.ensure_calendar_costs(tx);
         Ok(())
@@ -399,6 +410,40 @@ impl AppState {
         }
     }
 
+    fn move_model_breakdown_scroll(&mut self, steps: i32, area: Rect) {
+        let max_scroll = match self.view {
+            View::Dashboard => self
+                .current_stats()
+                .map(|stats| tui::model_breakdown_max_scroll(area, stats.models.len())),
+            View::CalendarDetail => self
+                .selected_history_stats()
+                .map(|stats| tui::model_breakdown_max_scroll(area, stats.models.len())),
+            View::CalendarOverview => None,
+        }
+        .unwrap_or(0);
+        let amount = steps.unsigned_abs() as usize;
+
+        match self.view {
+            View::Dashboard => {
+                let current = self.dashboard_model_scroll.min(max_scroll);
+                self.dashboard_model_scroll = if steps > 0 {
+                    current.saturating_add(amount).min(max_scroll)
+                } else {
+                    current.saturating_sub(amount)
+                };
+            }
+            View::CalendarDetail => {
+                let current = self.history_model_scroll.min(max_scroll);
+                self.history_model_scroll = if steps > 0 {
+                    current.saturating_add(amount).min(max_scroll)
+                } else {
+                    current.saturating_sub(amount)
+                };
+            }
+            View::CalendarOverview => {}
+        }
+    }
+
     fn move_help_down(&mut self, layout: &tui::HelpLayoutState) {
         if self.help_config_visible(layout) {
             if self.config_selection + 1 < ConfigEditorItem::ALL.len() {
@@ -498,6 +543,7 @@ impl AppState {
             self.config.daily_start,
             self.config.week_start,
         )?;
+        self.history_model_scroll = 0;
         self.sync_visible_periods()?;
         match self.view {
             View::Dashboard => {}
@@ -730,6 +776,23 @@ fn handle_mouse(mouse: MouseEvent, area: Rect, app: &mut AppState, tx: &Sender<R
         return;
     }
 
+    match mouse.kind {
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            if tui::model_breakdown_at_position(mouse.column, mouse.row, area, app) =>
+        {
+            if let Some(model_area) = tui::model_breakdown_area(area, app) {
+                let steps = if matches!(mouse.kind, MouseEventKind::ScrollDown) {
+                    1
+                } else {
+                    -1
+                };
+                app.move_model_breakdown_scroll(steps, model_area);
+            }
+            return;
+        }
+        _ => {}
+    }
+
     if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
         return;
     }
@@ -904,6 +967,7 @@ mod tests {
 
     use crate::{
         config::Scope,
+        db::{ModelUsage, UsageTotals},
         time_window::{DailyStart, WeekStart},
     };
 
@@ -1150,6 +1214,74 @@ mod tests {
         assert_eq!(app.calendar.selected, selected);
     }
 
+    #[test]
+    fn model_breakdown_mouse_wheel_scrolls_dashboard_pane() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config_path = tempdir.path().join("config.toml");
+        let mut app = AppState::new(test_config(config_path)).unwrap();
+        app.stats
+            .insert(Mode::Daily, many_model_stats(Mode::Daily, 12));
+        let (tx, _rx) = mpsc::channel();
+        let area = Rect::new(0, 0, 100, 16);
+        let model_area = tui::model_breakdown_area(area, &app).unwrap();
+
+        handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: model_area.x + 1,
+                row: model_area.y + 1,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+            &mut app,
+            &tx,
+        );
+
+        assert_eq!(app.dashboard_model_scroll, 1);
+
+        handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: model_area.x + 1,
+                row: model_area.y + 1,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+            &mut app,
+            &tx,
+        );
+
+        assert_eq!(app.dashboard_model_scroll, 0);
+    }
+
+    #[test]
+    fn model_breakdown_mouse_wheel_scrolls_history_pane_separately() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config_path = tempdir.path().join("config.toml");
+        let mut app = AppState::new(test_config(config_path)).unwrap();
+        app.view = View::CalendarDetail;
+        app.history_stats
+            .insert(app.calendar.selected, many_model_stats(Mode::Daily, 12));
+        let (tx, _rx) = mpsc::channel();
+        let area = Rect::new(0, 0, 100, 16);
+        let model_area = tui::model_breakdown_area(area, &app).unwrap();
+
+        handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: model_area.x + 1,
+                row: model_area.y + 1,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+            &mut app,
+            &tx,
+        );
+
+        assert_eq!(app.dashboard_model_scroll, 0);
+        assert_eq!(app.history_model_scroll, 1);
+    }
+
     fn test_config(config_path: PathBuf) -> Config {
         Config {
             db_path: PathBuf::from("/tmp/opencode.db"),
@@ -1161,6 +1293,42 @@ mod tests {
             scope: Scope::All,
             color_theme: ColorTheme::Aurora,
             theme_scope: ThemeScope::Calendar,
+        }
+    }
+
+    fn many_model_stats(mode: Mode, count: usize) -> UsageStats {
+        let models = (0..count)
+            .map(|idx| ModelUsage {
+                provider: "provider".to_string(),
+                model_id: format!("model-{idx}"),
+                variant: "default".to_string(),
+                display_name: format!("provider/model-{idx}"),
+                totals: UsageTotals {
+                    messages: 1,
+                    cost: (count - idx) as f64,
+                    input: 10,
+                    output: 20,
+                    cache_read: 30,
+                    cache_write: 40,
+                },
+            })
+            .collect::<Vec<_>>();
+        let totals = UsageTotals {
+            messages: count as u64,
+            cost: models.iter().map(|model| model.totals.cost).sum(),
+            input: models.iter().map(|model| model.totals.input).sum(),
+            output: models.iter().map(|model| model.totals.output).sum(),
+            cache_read: models.iter().map(|model| model.totals.cache_read).sum(),
+            cache_write: models.iter().map(|model| model.totals.cache_write).sum(),
+        };
+
+        UsageStats {
+            mode,
+            refreshed_at: Local.with_ymd_and_hms(2026, 6, 15, 10, 0, 0).unwrap(),
+            cutoff_millis: None,
+            end_millis: None,
+            totals,
+            models,
         }
     }
 }
