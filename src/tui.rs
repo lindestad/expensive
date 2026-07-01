@@ -17,7 +17,7 @@ use crate::{
 
 mod token_graph;
 
-use token_graph::{draw_token_graph, token_bucket_index_at_position};
+use token_graph::{draw_token_graph, draw_token_graph_loading, token_bucket_index_at_position};
 
 #[derive(Clone, Copy)]
 struct Palette {
@@ -213,6 +213,7 @@ struct StatsLayout {
 struct StatsViewState<'a> {
     stats: Option<&'a UsageStats>,
     loading: bool,
+    graph_loading: bool,
     model_title: String,
     model_scroll: usize,
     selected_token_bucket: Option<usize>,
@@ -251,6 +252,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &AppState) {
             StatsViewState {
                 stats: app.current_stats(),
                 loading: app.is_current_loading(),
+                graph_loading: app.is_current_graph_loading(),
                 model_title: app
                     .current_stats()
                     .map(|stats| format!("{} by model", stats.mode.title()))
@@ -267,6 +269,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &AppState) {
             StatsViewState {
                 stats: app.selected_history_stats(),
                 loading: app.is_selected_history_loading(),
+                graph_loading: app.is_selected_history_graph_loading(),
                 model_title: format!(
                     "{} by model",
                     detail_period_label(app.calendar.selected, app.config.week_start)
@@ -317,7 +320,14 @@ pub fn calendar_period_at_position(
 }
 
 pub fn model_breakdown_area(area: Rect, app: &AppState) -> Option<Rect> {
-    stats_for_view(app).map(|stats| stats_view_layout(main_body_area(area), Some(stats)).models)
+    stats_for_view(app).map(|stats| {
+        stats_view_layout(
+            main_body_area(area),
+            Some(stats),
+            graph_available_for_view(app),
+        )
+        .models
+    })
 }
 
 pub fn model_breakdown_at_position(column: u16, row: u16, area: Rect, app: &AppState) -> bool {
@@ -331,7 +341,23 @@ pub fn model_breakdown_max_scroll(area: Rect, row_count: usize) -> usize {
 }
 
 pub fn token_graph_area(area: Rect, app: &AppState) -> Option<Rect> {
-    stats_for_view(app).and_then(|stats| stats_view_layout(main_body_area(area), Some(stats)).graph)
+    stats_for_view(app).and_then(|stats| {
+        stats_view_layout(
+            main_body_area(area),
+            Some(stats),
+            graph_available_for_view(app),
+        )
+        .graph
+    })
+}
+
+pub fn token_graph_capacity_area(area: Rect, app: &AppState) -> Option<Rect> {
+    stats_for_view(app).and_then(|stats| {
+        if stats.totals.messages == 0 {
+            return None;
+        }
+        stats_view_layout(main_body_area(area), Some(stats), true).graph
+    })
 }
 
 pub fn token_bucket_at_position(
@@ -351,6 +377,17 @@ fn stats_for_view(app: &AppState) -> Option<&UsageStats> {
         View::CalendarDetail => app.selected_history_stats(),
         View::CalendarOverview => None,
     }
+}
+
+fn graph_available_for_view(app: &AppState) -> bool {
+    stats_for_view(app)
+        .map(|stats| !stats.token_buckets.is_empty())
+        .unwrap_or(false)
+        || match app.view {
+            View::Dashboard => app.is_current_graph_loading(),
+            View::CalendarDetail => app.is_selected_history_graph_loading(),
+            View::CalendarOverview => false,
+        }
 }
 
 fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &AppState, palette: Palette) {
@@ -1275,7 +1312,12 @@ fn tab_span(label: &str, tab_style: TabStyle, palette: Palette) -> Span<'static>
 }
 
 fn draw_stats_view(frame: &mut Frame<'_>, area: Rect, view: StatsViewState<'_>, palette: Palette) {
-    let layout = stats_view_layout(area, view.stats);
+    let graph_available = view
+        .stats
+        .map(|stats| !stats.token_buckets.is_empty())
+        .unwrap_or(false)
+        || view.graph_loading;
+    let layout = stats_view_layout(area, view.stats, graph_available);
 
     draw_summary(frame, layout.summary, view.stats, view.loading, palette);
     draw_models(
@@ -1289,11 +1331,15 @@ fn draw_stats_view(frame: &mut Frame<'_>, area: Rect, view: StatsViewState<'_>, 
     );
 
     if let (Some(stats), Some(graph)) = (view.stats, layout.graph) {
-        draw_token_graph(frame, graph, stats, view.selected_token_bucket, palette);
+        if stats.token_buckets.is_empty() {
+            draw_token_graph_loading(frame, graph, palette);
+        } else {
+            draw_token_graph(frame, graph, stats, view.selected_token_bucket, palette);
+        }
     }
 }
 
-fn stats_view_layout(area: Rect, stats: Option<&UsageStats>) -> StatsLayout {
+fn stats_view_layout(area: Rect, stats: Option<&UsageStats>, graph_available: bool) -> StatsLayout {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(5), Constraint::Min(6)])
@@ -1308,7 +1354,7 @@ fn stats_view_layout(area: Rect, stats: Option<&UsageStats>) -> StatsLayout {
     let Some(stats) = stats else {
         return layout;
     };
-    if stats.token_buckets.is_empty() || !can_show_token_graph(lower) {
+    if !graph_available || !can_show_token_graph(lower) {
         return layout;
     }
 
@@ -2622,6 +2668,20 @@ mod tests {
     }
 
     #[test]
+    fn renders_token_graph_loading_with_summary_data() {
+        let mut stats = many_model_stats(Mode::Daily, 8);
+        stats.token_buckets.clear();
+        let mut app = app_with_stats(Mode::Daily, stats);
+        app.graph_loading.insert(Mode::Daily);
+
+        let output = render(&app, 100, 24);
+
+        assert!(output.contains("Daily by model"));
+        assert!(output.contains("Token usage over time"));
+        assert!(output.contains("Loading token graph"));
+    }
+
+    #[test]
     fn token_graph_spans_available_width_with_few_buckets() {
         let stats = many_model_stats(Mode::Daily, 3);
         let app = app_with_stats(Mode::Daily, stats);
@@ -3014,11 +3074,14 @@ mod tests {
             mode,
             stats: stats_by_mode,
             loading: HashSet::new(),
+            graph_loading: HashSet::new(),
+            dashboard_prefetch_attempted: HashSet::new(),
             calendar: test_calendar(),
             calendar_costs: HashMap::new(),
             calendar_loading: false,
             history_stats: HashMap::new(),
             history_loading: HashSet::new(),
+            history_graph_loading: HashSet::new(),
             error: None,
             last_refresh_started: None,
             next_refresh_due: Instant::now() + Duration::from_secs(60),
@@ -3041,11 +3104,14 @@ mod tests {
             mode,
             stats: HashMap::new(),
             loading: HashSet::from([mode]),
+            graph_loading: HashSet::new(),
+            dashboard_prefetch_attempted: HashSet::new(),
             calendar: test_calendar(),
             calendar_costs: HashMap::new(),
             calendar_loading: false,
             history_stats: HashMap::new(),
             history_loading: HashSet::new(),
+            history_graph_loading: HashSet::new(),
             error: None,
             last_refresh_started: None,
             next_refresh_due: Instant::now() + Duration::from_secs(60),
@@ -3068,6 +3134,8 @@ mod tests {
             mode: Mode::Daily,
             stats: HashMap::new(),
             loading: HashSet::new(),
+            graph_loading: HashSet::new(),
+            dashboard_prefetch_attempted: HashSet::new(),
             calendar: CalendarState {
                 scale: selected.scale,
                 selected,
@@ -3082,6 +3150,7 @@ mod tests {
             calendar_loading: false,
             history_stats: HashMap::new(),
             history_loading: HashSet::new(),
+            history_graph_loading: HashSet::new(),
             error: None,
             last_refresh_started: None,
             next_refresh_due: Instant::now() + Duration::from_secs(60),

@@ -104,6 +104,19 @@ pub(super) fn draw_token_graph(
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+pub(super) fn draw_token_graph_loading(frame: &mut Frame<'_>, area: Rect, palette: Palette) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Token usage over time ")
+        .title_style(Style::default().fg(palette.title))
+        .border_style(Style::default().fg(palette.border));
+    let paragraph = Paragraph::new("Loading token graph...")
+        .block(block)
+        .style(Style::default().fg(palette.tokens));
+
+    frame.render_widget(paragraph, area);
+}
+
 fn token_graph_title(stats: &UsageStats, selected_bucket: Option<usize>) -> String {
     if let Some(bucket) = selected_bucket.and_then(|idx| stats.token_buckets.get(idx)) {
         return format!(

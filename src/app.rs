@@ -91,11 +91,14 @@ pub struct AppState {
     pub mode: Mode,
     pub stats: HashMap<Mode, UsageStats>,
     pub loading: HashSet<Mode>,
+    pub graph_loading: HashSet<Mode>,
+    pub dashboard_prefetch_attempted: HashSet<Mode>,
     pub calendar: CalendarState,
     pub calendar_costs: HashMap<PeriodKey, f64>,
     pub calendar_loading: bool,
     pub history_stats: HashMap<PeriodKey, UsageStats>,
     pub history_loading: HashSet<PeriodKey>,
+    pub history_graph_loading: HashSet<PeriodKey>,
     pub error: Option<String>,
     pub last_refresh_started: Option<DateTime<Local>>,
     pub next_refresh_due: Instant,
@@ -128,6 +131,8 @@ impl AppState {
             mode: Mode::Daily,
             stats: HashMap::new(),
             loading: HashSet::new(),
+            graph_loading: HashSet::new(),
+            dashboard_prefetch_attempted: HashSet::new(),
             calendar: CalendarState {
                 scale: CalendarScale::Day,
                 selected,
@@ -137,6 +142,7 @@ impl AppState {
             calendar_loading: false,
             history_stats: HashMap::new(),
             history_loading: HashSet::new(),
+            history_graph_loading: HashSet::new(),
             error: None,
             last_refresh_started: None,
             next_refresh_due,
@@ -151,12 +157,20 @@ impl AppState {
         self.loading.contains(&self.mode)
     }
 
+    pub fn is_current_graph_loading(&self) -> bool {
+        self.graph_loading.contains(&self.mode)
+    }
+
     pub fn selected_history_stats(&self) -> Option<&UsageStats> {
         self.history_stats.get(&self.calendar.selected)
     }
 
     pub fn is_selected_history_loading(&self) -> bool {
         self.history_loading.contains(&self.calendar.selected)
+    }
+
+    pub fn is_selected_history_graph_loading(&self) -> bool {
+        self.history_graph_loading.contains(&self.calendar.selected)
     }
 
     pub fn calendar_cost(&self, period: PeriodKey) -> Option<f64> {
@@ -196,20 +210,59 @@ impl AppState {
     }
 
     fn trigger_dashboard_refresh(&mut self, tx: &Sender<RefreshMessage>) {
-        if self.loading.contains(&self.mode) {
+        self.trigger_dashboard_refresh_for_mode(self.mode, tx, true);
+    }
+
+    fn trigger_dashboard_refresh_for_mode(
+        &mut self,
+        mode: Mode,
+        tx: &Sender<RefreshMessage>,
+        foreground: bool,
+    ) {
+        if self.loading.contains(&mode) {
             return;
         }
 
-        let mode = self.mode;
         self.loading.insert(mode);
-        self.last_refresh_started = Some(Local::now());
-        self.error = None;
+        if foreground {
+            self.dashboard_prefetch_attempted.clear();
+            self.last_refresh_started = Some(Local::now());
+            self.error = None;
+        }
 
         let tx = tx.clone();
         let config = self.config.clone();
         thread::spawn(move || {
-            let result = refresh_dashboard(config, mode).map_err(|error| format!("{error:#}"));
+            let result =
+                refresh_dashboard_summary(config, mode).map_err(|error| format!("{error:#}"));
             let _ = tx.send(RefreshMessage::Dashboard { mode, result });
+        });
+    }
+
+    fn trigger_dashboard_graph_refresh(&mut self, mode: Mode, tx: &Sender<RefreshMessage>) {
+        if self.graph_loading.contains(&mode) {
+            return;
+        }
+        let Some(stats) = self.stats.get(&mode) else {
+            return;
+        };
+        if stats.totals.messages == 0 || !stats.token_buckets.is_empty() {
+            return;
+        }
+
+        let cutoff_millis = stats.cutoff_millis;
+        self.graph_loading.insert(mode);
+
+        let tx = tx.clone();
+        let config = self.config.clone();
+        thread::spawn(move || {
+            let result = db::load_usage_token_buckets(&config.db_path, mode, cutoff_millis)
+                .map_err(|error| format!("{error:#}"));
+            let _ = tx.send(RefreshMessage::DashboardGraph {
+                mode,
+                cutoff_millis,
+                result,
+            });
         });
     }
 
@@ -334,7 +387,7 @@ impl AppState {
         let tx = tx.clone();
         let config = self.config.clone();
         thread::spawn(move || {
-            let result = db::load_usage_between(
+            let result = db::load_usage_summary_between(
                 &config.db_path,
                 period.mode(),
                 period.start_millis,
@@ -342,6 +395,33 @@ impl AppState {
             )
             .map_err(|error| format!("{error:#}"));
             let _ = tx.send(RefreshMessage::History { period, result });
+        });
+    }
+
+    fn trigger_history_graph_refresh(&mut self, period: PeriodKey, tx: &Sender<RefreshMessage>) {
+        if self.history_graph_loading.contains(&period) {
+            return;
+        }
+        let Some(stats) = self.history_stats.get(&period) else {
+            return;
+        };
+        if stats.totals.messages == 0 || !stats.token_buckets.is_empty() {
+            return;
+        }
+
+        self.history_graph_loading.insert(period);
+
+        let tx = tx.clone();
+        let config = self.config.clone();
+        thread::spawn(move || {
+            let result = db::load_usage_token_buckets_between(
+                &config.db_path,
+                period.mode(),
+                period.start_millis,
+                period.end_millis,
+            )
+            .map_err(|error| format!("{error:#}"));
+            let _ = tx.send(RefreshMessage::HistoryGraph { period, result });
         });
     }
 
@@ -354,6 +434,40 @@ impl AppState {
         match result {
             Ok(stats) => {
                 self.stats.insert(mode, stats);
+                if self.view == View::Dashboard && mode == self.mode {
+                    self.dashboard_token_bucket = None;
+                    self.error = None;
+                }
+            }
+            Err(error) => {
+                if self.view == View::Dashboard && mode == self.mode {
+                    self.error = Some(error);
+                }
+            }
+        }
+    }
+
+    fn apply_dashboard_graph_refresh(
+        &mut self,
+        mode: Mode,
+        cutoff_millis: Option<i64>,
+        result: std::result::Result<Vec<db::TokenBucket>, String>,
+    ) {
+        self.graph_loading.remove(&mode);
+        match result {
+            Ok(token_buckets) => {
+                if let Some(stats) = self.stats.get_mut(&mode) {
+                    if stats.cutoff_millis == cutoff_millis {
+                        stats.token_buckets = token_buckets;
+                        if self
+                            .dashboard_token_bucket
+                            .map(|idx| idx >= stats.token_buckets.len())
+                            .unwrap_or(false)
+                        {
+                            self.dashboard_token_bucket = None;
+                        }
+                    }
+                }
                 if self.view == View::Dashboard && mode == self.mode {
                     self.error = None;
                 }
@@ -400,6 +514,7 @@ impl AppState {
             Ok(stats) => {
                 self.history_stats.insert(period, stats);
                 if self.view == View::CalendarDetail && period == self.calendar.selected {
+                    self.history_token_bucket = None;
                     self.error = None;
                 }
             }
@@ -407,6 +522,72 @@ impl AppState {
                 if self.view == View::CalendarDetail && period == self.calendar.selected {
                     self.error = Some(error);
                 }
+            }
+        }
+    }
+
+    fn apply_history_graph_refresh(
+        &mut self,
+        period: PeriodKey,
+        result: std::result::Result<Vec<db::TokenBucket>, String>,
+    ) {
+        self.history_graph_loading.remove(&period);
+        match result {
+            Ok(token_buckets) => {
+                if let Some(stats) = self.history_stats.get_mut(&period) {
+                    stats.token_buckets = token_buckets;
+                    if self
+                        .history_token_bucket
+                        .map(|idx| idx >= stats.token_buckets.len())
+                        .unwrap_or(false)
+                    {
+                        self.history_token_bucket = None;
+                    }
+                }
+                if self.view == View::CalendarDetail && period == self.calendar.selected {
+                    self.error = None;
+                }
+            }
+            Err(error) => {
+                if self.view == View::CalendarDetail && period == self.calendar.selected {
+                    self.error = Some(error);
+                }
+            }
+        }
+    }
+
+    fn ensure_visible_graph(&mut self, area: Rect, tx: &Sender<RefreshMessage>) {
+        if tui::token_graph_capacity_area(area, self).is_none() {
+            return;
+        }
+
+        match self.view {
+            View::Dashboard => self.trigger_dashboard_graph_refresh(self.mode, tx),
+            View::CalendarDetail => self.trigger_history_graph_refresh(self.calendar.selected, tx),
+            View::CalendarOverview => {}
+        }
+    }
+
+    fn prefetch_dashboard_summaries(&mut self, tx: &Sender<RefreshMessage>) {
+        if self.view != View::Dashboard
+            || !self.stats.contains_key(&self.mode)
+            || !self.loading.is_empty()
+            || !self.graph_loading.is_empty()
+            || self.calendar_loading
+            || !self.history_loading.is_empty()
+            || !self.history_graph_loading.is_empty()
+        {
+            return;
+        }
+
+        for mode in Mode::ALL {
+            if mode != self.mode
+                && !self.stats.contains_key(&mode)
+                && !self.dashboard_prefetch_attempted.contains(&mode)
+            {
+                self.dashboard_prefetch_attempted.insert(mode);
+                self.trigger_dashboard_refresh_for_mode(mode, tx, false);
+                break;
             }
         }
     }
@@ -599,12 +780,21 @@ enum RefreshMessage {
         mode: Mode,
         result: std::result::Result<UsageStats, String>,
     },
+    DashboardGraph {
+        mode: Mode,
+        cutoff_millis: Option<i64>,
+        result: std::result::Result<Vec<db::TokenBucket>, String>,
+    },
     Calendar {
         result: std::result::Result<Vec<db::PeriodCost>, String>,
     },
     History {
         period: PeriodKey,
         result: std::result::Result<UsageStats, String>,
+    },
+    HistoryGraph {
+        period: PeriodKey,
+        result: std::result::Result<Vec<db::TokenBucket>, String>,
     },
 }
 
@@ -636,6 +826,10 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Confi
     loop {
         drain_refreshes(&rx, &mut app, &tx);
         maybe_auto_refresh(&mut app, &tx);
+        let size = terminal.size()?;
+        let area = Rect::new(0, 0, size.width, size.height);
+        app.ensure_visible_graph(area, &tx);
+        app.prefetch_dashboard_summaries(&tx);
 
         terminal.draw(|frame| tui::draw(frame, &app))?;
 
@@ -885,8 +1079,16 @@ fn drain_refreshes(rx: &Receiver<RefreshMessage>, app: &mut AppState, tx: &Sende
     while let Ok(message) = rx.try_recv() {
         match message {
             RefreshMessage::Dashboard { mode, result } => app.apply_dashboard_refresh(mode, result),
+            RefreshMessage::DashboardGraph {
+                mode,
+                cutoff_millis,
+                result,
+            } => app.apply_dashboard_graph_refresh(mode, cutoff_millis, result),
             RefreshMessage::Calendar { result } => app.apply_calendar_refresh(result, tx),
             RefreshMessage::History { period, result } => app.apply_history_refresh(period, result),
+            RefreshMessage::HistoryGraph { period, result } => {
+                app.apply_history_graph_refresh(period, result)
+            }
         }
     }
 }
@@ -900,10 +1102,10 @@ fn maybe_auto_refresh(app: &mut AppState, tx: &Sender<RefreshMessage>) {
     app.next_refresh_due = Instant::now() + app.config.refresh_interval;
 }
 
-fn refresh_dashboard(config: Config, mode: Mode) -> Result<UsageStats> {
+fn refresh_dashboard_summary(config: Config, mode: Mode) -> Result<UsageStats> {
     let cutoff_millis =
         time_window::cutoff_millis(mode, Local::now(), config.daily_start, config.week_start)?;
-    db::load_usage(&config.db_path, mode, cutoff_millis)
+    db::load_usage_summary(&config.db_path, mode, cutoff_millis)
 }
 
 fn overview_steps(scale: CalendarScale, code: KeyCode) -> Option<i32> {

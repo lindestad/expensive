@@ -71,7 +71,15 @@ pub struct PeriodCost {
 }
 
 pub fn load_usage(path: &Path, mode: Mode, cutoff_millis: Option<i64>) -> Result<UsageStats> {
-    load_usage_range(path, mode, cutoff_millis, None)
+    load_usage_range(path, mode, cutoff_millis, None, true)
+}
+
+pub fn load_usage_summary(
+    path: &Path,
+    mode: Mode,
+    cutoff_millis: Option<i64>,
+) -> Result<UsageStats> {
+    load_usage_range(path, mode, cutoff_millis, None, false)
 }
 
 pub fn load_usage_between(
@@ -80,7 +88,33 @@ pub fn load_usage_between(
     start_millis: i64,
     end_millis: i64,
 ) -> Result<UsageStats> {
-    load_usage_range(path, mode, Some(start_millis), Some(end_millis))
+    load_usage_range(path, mode, Some(start_millis), Some(end_millis), true)
+}
+
+pub fn load_usage_summary_between(
+    path: &Path,
+    mode: Mode,
+    start_millis: i64,
+    end_millis: i64,
+) -> Result<UsageStats> {
+    load_usage_range(path, mode, Some(start_millis), Some(end_millis), false)
+}
+
+pub fn load_usage_token_buckets(
+    path: &Path,
+    mode: Mode,
+    cutoff_millis: Option<i64>,
+) -> Result<Vec<TokenBucket>> {
+    load_token_buckets_range(path, mode, cutoff_millis, None)
+}
+
+pub fn load_usage_token_buckets_between(
+    path: &Path,
+    mode: Mode,
+    start_millis: i64,
+    end_millis: i64,
+) -> Result<Vec<TokenBucket>> {
+    load_token_buckets_range(path, mode, Some(start_millis), Some(end_millis))
 }
 
 fn load_usage_range(
@@ -88,6 +122,7 @@ fn load_usage_range(
     mode: Mode,
     start_millis: Option<i64>,
     end_millis: Option<i64>,
+    include_token_buckets: bool,
 ) -> Result<UsageStats> {
     let connection = Connection::open_with_flags(
         path,
@@ -96,7 +131,11 @@ fn load_usage_range(
     .with_context(|| format!("opening {}", path.display()))?;
 
     let (totals, models) = load_model_usage(&connection, start_millis, end_millis)?;
-    let token_buckets = load_token_buckets(&connection, mode, start_millis, end_millis)?;
+    let token_buckets = if include_token_buckets && totals.messages > 0 {
+        load_token_buckets(&connection, mode, start_millis, end_millis)?
+    } else {
+        Vec::new()
+    };
 
     Ok(UsageStats {
         mode,
@@ -107,6 +146,21 @@ fn load_usage_range(
         models,
         token_buckets,
     })
+}
+
+fn load_token_buckets_range(
+    path: &Path,
+    mode: Mode,
+    start_millis: Option<i64>,
+    end_millis: Option<i64>,
+) -> Result<Vec<TokenBucket>> {
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("opening {}", path.display()))?;
+
+    load_token_buckets(&connection, mode, start_millis, end_millis)
 }
 
 fn load_model_usage(
@@ -174,11 +228,11 @@ fn load_token_buckets(
     start_millis: Option<i64>,
     end_millis: Option<i64>,
 ) -> Result<Vec<TokenBucket>> {
-    let Some((first_time, last_time)) = usage_time_bounds(connection, start_millis, end_millis)?
+    let Some((range_start, last_time)) =
+        token_bucket_time_range(connection, mode, start_millis, end_millis)?
     else {
         return Ok(Vec::new());
     };
-    let range_start = start_millis.unwrap_or(first_time);
     let span = token_bucket_span_millis(mode, range_start, last_time.max(range_start));
     let range_end = token_bucket_range_end(mode, range_start, last_time, end_millis, span);
     if span <= 0 || range_end <= range_start {
@@ -238,6 +292,21 @@ fn load_token_buckets(
     }
 
     Ok(buckets)
+}
+
+fn token_bucket_time_range(
+    connection: &Connection,
+    mode: Mode,
+    start_millis: Option<i64>,
+    end_millis: Option<i64>,
+) -> Result<Option<(i64, i64)>> {
+    if matches!(mode, Mode::Daily | Mode::Weekly | Mode::Monthly) {
+        if let Some(start_millis) = start_millis {
+            return Ok(Some((start_millis, end_millis.unwrap_or(start_millis))));
+        }
+    }
+
+    usage_time_bounds(connection, start_millis, end_millis)
 }
 
 fn usage_time_bounds(
@@ -539,6 +608,25 @@ mod tests {
         assert_eq!(stats.end_millis, Some(2000));
         assert_eq!(stats.totals.messages, 1);
         assert!((stats.totals.cost - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn summary_load_skips_token_buckets() {
+        let file = NamedTempFile::new().unwrap();
+        let connection = Connection::open(file.path()).unwrap();
+        create_message_table(&connection);
+
+        insert_usage_message(&connection, "inside", 1500, "m", 2.0);
+        drop(connection);
+
+        let stats = load_usage_summary_between(file.path(), Mode::Daily, 1000, 2000).unwrap();
+        let token_buckets =
+            load_usage_token_buckets_between(file.path(), Mode::Daily, 1000, 2000).unwrap();
+
+        assert_eq!(stats.totals.messages, 1);
+        assert!(stats.token_buckets.is_empty());
+        assert_eq!(token_buckets.len(), 1);
+        assert_eq!(token_buckets[0].tokens, 4);
     }
 
     #[test]
