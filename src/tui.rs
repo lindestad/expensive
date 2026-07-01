@@ -203,7 +203,6 @@ struct ConfigEditorLines {
 struct StatsLayout {
     summary: Rect,
     models: Rect,
-    divider: Option<Rect>,
     graph: Option<Rect>,
 }
 
@@ -1288,8 +1287,7 @@ fn draw_stats_view(
         palette,
     );
 
-    if let (Some(stats), Some(divider), Some(graph)) = (stats, layout.divider, layout.graph) {
-        draw_model_graph_divider(frame, divider, palette);
+    if let (Some(stats), Some(graph)) = (stats, layout.graph) {
         draw_token_graph(frame, graph, stats, selected_token_bucket, palette);
     }
 }
@@ -1303,7 +1301,6 @@ fn stats_view_layout(area: Rect, stats: Option<&UsageStats>) -> StatsLayout {
     let mut layout = StatsLayout {
         summary: chunks[0],
         models: lower,
-        divider: None,
         graph: None,
     };
 
@@ -1315,41 +1312,34 @@ fn stats_view_layout(area: Rect, stats: Option<&UsageStats>) -> StatsLayout {
     }
 
     let model_height = model_graph_model_height(lower.height, stats.models.len());
-    let graph_height = lower
-        .height
-        .saturating_sub(model_height)
-        .saturating_sub(TOKEN_GRAPH_DIVIDER_HEIGHT);
+    let graph_height = lower.height.saturating_sub(model_height);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(model_height),
-            Constraint::Length(TOKEN_GRAPH_DIVIDER_HEIGHT),
             Constraint::Length(graph_height),
         ])
         .split(lower);
     layout.models = chunks[0];
-    layout.divider = Some(chunks[1]);
-    layout.graph = Some(chunks[2]);
+    layout.graph = Some(chunks[1]);
     layout
 }
 
 const MODEL_TABLE_OVERHEAD: u16 = 3;
 const MIN_MODEL_ROWS_WITH_GRAPH: u16 = 6;
 const MIN_TOKEN_GRAPH_HEIGHT: u16 = 5;
-const TOKEN_GRAPH_DIVIDER_HEIGHT: u16 = 1;
 
 fn can_show_token_graph(lower_area: Rect) -> bool {
     lower_area.height
         >= MODEL_TABLE_OVERHEAD
             .saturating_add(MIN_MODEL_ROWS_WITH_GRAPH)
-            .saturating_add(TOKEN_GRAPH_DIVIDER_HEIGHT)
             .saturating_add(MIN_TOKEN_GRAPH_HEIGHT)
 }
 
 fn model_graph_model_height(lower_height: u16, model_count: usize) -> u16 {
     let model_min = MODEL_TABLE_OVERHEAD.saturating_add(MIN_MODEL_ROWS_WITH_GRAPH);
     let graph_min = MIN_TOKEN_GRAPH_HEIGHT;
-    let available = lower_height.saturating_sub(TOKEN_GRAPH_DIVIDER_HEIGHT);
+    let available = lower_height;
     let base = model_min.min(available.saturating_sub(graph_min));
     let remaining = available.saturating_sub(base).saturating_sub(graph_min);
     let full_model_height = MODEL_TABLE_OVERHEAD.saturating_add(model_count as u16);
@@ -2025,13 +2015,6 @@ fn draw_models(
     }
 }
 
-fn draw_model_graph_divider(frame: &mut Frame<'_>, area: Rect, palette: Palette) {
-    frame.render_widget(
-        Paragraph::new("─".repeat(area.width as usize)).style(Style::default().fg(palette.border)),
-        area,
-    );
-}
-
 fn draw_token_graph(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -2123,13 +2106,27 @@ fn token_bucket_index_at_position(
     area: Rect,
     stats: &UsageStats,
 ) -> Option<usize> {
+    if !rect_contains(area, column, row) {
+        return None;
+    }
+
     let inner = token_graph_inner_area(area);
-    if !rect_contains(inner, column, row) {
+    if inner.width == 0 || inner.height == 0 {
         return None;
     }
 
     let groups = token_bucket_groups(&stats.token_buckets, inner.width as usize);
-    let column_idx = column.checked_sub(inner.x)? as usize;
+    if groups.is_empty() {
+        return None;
+    }
+    let max_column_idx = groups.len().saturating_sub(1);
+    let column_idx = if column < inner.x {
+        0
+    } else if column >= inner.x.saturating_add(groups.len() as u16) {
+        max_column_idx
+    } else {
+        (column.checked_sub(inner.x)? as usize).min(max_column_idx)
+    };
     groups.get(column_idx).map(|bucket| bucket.start_idx)
 }
 
@@ -2747,7 +2744,7 @@ mod tests {
         let stats = many_model_stats(Mode::Daily, 8);
         let app = app_with_stats(Mode::Daily, stats);
 
-        let output = render(&app, 100, 23);
+        let output = render(&app, 100, 22);
 
         assert!(!output.contains("Token usage over time"));
     }

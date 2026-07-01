@@ -807,7 +807,9 @@ fn handle_mouse(mouse: MouseEvent, area: Rect, app: &mut AppState, tx: &Sender<R
                 return;
             }
         }
-        MouseEventKind::Drag(MouseButton::Left) if app.token_graph_dragging => {
+        MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Moved
+            if app.token_graph_dragging =>
+        {
             if let Some(bucket_idx) =
                 tui::token_bucket_at_position(mouse.column, mouse.row, area, app)
             {
@@ -1356,8 +1358,8 @@ mod tests {
 
         handle_mouse(
             MouseEvent {
-                kind: MouseEventKind::Drag(MouseButton::Left),
-                column: graph_area.x + 4,
+                kind: MouseEventKind::Moved,
+                column: graph_area.x + graph_area.width - 1,
                 row: graph_area.y + 2,
                 modifiers: KeyModifiers::NONE,
             },
@@ -1366,12 +1368,12 @@ mod tests {
             &tx,
         );
 
-        assert_eq!(app.dashboard_token_bucket, Some(3));
+        assert_eq!(app.dashboard_token_bucket, Some(7));
 
         handle_mouse(
             MouseEvent {
                 kind: MouseEventKind::Up(MouseButton::Left),
-                column: graph_area.x + 4,
+                column: graph_area.x + graph_area.width - 1,
                 row: graph_area.y + 2,
                 modifiers: KeyModifiers::NONE,
             },
