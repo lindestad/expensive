@@ -2645,7 +2645,7 @@ mod tests {
     }
 
     #[test]
-    fn trims_empty_token_graph_edges() {
+    fn trims_empty_all_time_token_graph_edges() {
         let buckets = vec![
             test_token_bucket(0, 0),
             test_token_bucket(1, 0),
@@ -2656,7 +2656,28 @@ mod tests {
             test_token_bucket(6, 0),
         ];
 
-        assert_eq!(token_graph::visible_token_bucket_range(&buckets), (1, 6));
+        assert_eq!(
+            token_graph::visible_token_bucket_range(Mode::AllTime, &buckets),
+            (1, 6)
+        );
+    }
+
+    #[test]
+    fn preserves_fixed_window_token_graph_edges() {
+        let buckets = vec![
+            test_token_bucket(0, 0),
+            test_token_bucket(1, 0),
+            test_token_bucket(2, 10),
+            test_token_bucket(3, 0),
+        ];
+
+        for mode in [Mode::Daily, Mode::Weekly, Mode::Monthly] {
+            assert_eq!(
+                token_graph::visible_token_bucket_range(mode, &buckets),
+                (0, buckets.len()),
+                "{mode:?} should preserve its full graph window"
+            );
+        }
     }
 
     #[test]

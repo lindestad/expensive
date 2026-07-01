@@ -37,7 +37,7 @@ pub(super) fn draw_token_graph(
     palette: Palette,
 ) {
     let inner = token_graph_inner_area(area);
-    let (visible_start, visible_end) = visible_token_bucket_range(&stats.token_buckets);
+    let (visible_start, visible_end) = visible_token_bucket_range(stats.mode, &stats.token_buckets);
     let columns = token_graph_columns(
         &stats.token_buckets[visible_start..visible_end],
         inner.width as usize,
@@ -220,7 +220,7 @@ pub(super) fn token_bucket_index_at_position(
         return None;
     }
 
-    let (visible_start, visible_end) = visible_token_bucket_range(&stats.token_buckets);
+    let (visible_start, visible_end) = visible_token_bucket_range(stats.mode, &stats.token_buckets);
     let columns = token_graph_columns(
         &stats.token_buckets[visible_start..visible_end],
         inner.width as usize,
@@ -250,9 +250,13 @@ fn token_graph_inner_area(area: Rect) -> Rect {
     })
 }
 
-pub(super) fn visible_token_bucket_range(buckets: &[TokenBucket]) -> (usize, usize) {
+pub(super) fn visible_token_bucket_range(mode: Mode, buckets: &[TokenBucket]) -> (usize, usize) {
     if buckets.is_empty() {
         return (0, 0);
+    }
+
+    if matches!(mode, Mode::Daily | Mode::Weekly | Mode::Monthly) {
+        return (0, buckets.len());
     }
 
     let Some(first_used) = buckets.iter().position(|bucket| bucket.tokens > 0) else {
