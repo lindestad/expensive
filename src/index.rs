@@ -304,6 +304,95 @@ impl UsageIndex {
         })
     }
 
+    /// Applies an append/update scan without forgetting unchanged events from
+    /// the same artifact. Deletions are explicit stable event keys discovered
+    /// by the source adapter (for example, a changed row that is no longer an
+    /// assistant response).
+    pub fn apply_artifact_changes(
+        &mut self,
+        source_id: i64,
+        artifact: &ArtifactRecord,
+        upserts: &[UsageEvent],
+        removals: &[Vec<u8>],
+    ) -> Result<IndexChange> {
+        let transaction = self.connection.transaction()?;
+        let artifact_id = upsert_artifact(&transaction, source_id, artifact)?;
+        let old_bounds = removed_event_bounds(&transaction, artifact_id, removals)?;
+
+        for event_key in removals {
+            transaction.execute(
+                "DELETE FROM artifact_events
+                 WHERE artifact_id = ?1
+                   AND event_id IN (
+                       SELECT id FROM usage_events
+                       WHERE source_id = ?2 AND event_key = ?3
+                   )",
+                params![artifact_id, source_id, event_key],
+            )?;
+        }
+        let mut upsert_changed = false;
+        for event in upserts {
+            validate_event(event)?;
+            upsert_changed |= !event_is_unchanged(&transaction, source_id, event)?;
+            let event_id = upsert_event(&transaction, source_id, event)?;
+            transaction.execute(
+                "INSERT OR IGNORE INTO artifact_events (artifact_id, event_id)
+                 VALUES (?1, ?2)",
+                params![artifact_id, event_id],
+            )?;
+        }
+        let removed_events = transaction.execute(
+            "DELETE FROM usage_events
+             WHERE source_id = ?1
+               AND NOT EXISTS (
+                   SELECT 1 FROM artifact_events
+                   WHERE artifact_events.event_id = usage_events.id
+               )",
+            [source_id],
+        )?;
+        transaction.execute(
+            "UPDATE sources
+             SET last_sync_ms = ?2, last_error = NULL
+             WHERE id = ?1",
+            params![source_id, artifact.scanned_at_ms],
+        )?;
+
+        let changed = upsert_changed || removed_events > 0;
+        if changed {
+            transaction.execute(
+                "UPDATE index_state SET generation = generation + 1 WHERE id = 1",
+                [],
+            )?;
+        }
+        let generation = transaction.query_row(
+            "SELECT generation FROM index_state WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        transaction.commit()?;
+
+        let (start_ms, end_ms) = if changed {
+            merge_bounds(old_bounds, event_bounds(upserts))
+        } else {
+            (None, None)
+        };
+        Ok(IndexChange {
+            generation,
+            source_id,
+            start_ms,
+            end_ms,
+            event_count: upserts.len(),
+        })
+    }
+
+    pub fn mark_source_error(&self, source_id: i64, message: &str) -> Result<()> {
+        self.connection.execute(
+            "UPDATE sources SET last_error = ?2 WHERE id = ?1",
+            params![source_id, message],
+        )?;
+        Ok(())
+    }
+
     pub fn diagnostics(&self) -> Result<IndexDiagnostics> {
         Ok(IndexDiagnostics {
             path: self.path.clone(),
@@ -558,6 +647,55 @@ fn upsert_event(transaction: &Transaction<'_>, source_id: i64, event: &UsageEven
         .context("upserting usage event")
 }
 
+fn event_is_unchanged(
+    transaction: &Transaction<'_>,
+    source_id: i64,
+    event: &UsageEvent,
+) -> Result<bool> {
+    transaction
+        .query_row(
+            "SELECT EXISTS (
+                SELECT 1 FROM usage_events
+                WHERE source_id = ?1
+                  AND event_key = ?2
+                  AND occurred_at_ms = ?3
+                  AND project_id IS ?4
+                  AND provider = ?5
+                  AND model = ?6
+                  AND variant = ?7
+                  AND messages = ?8
+                  AND input_tokens = ?9
+                  AND output_tokens = ?10
+                  AND cache_read_tokens = ?11
+                  AND cache_write_tokens = ?12
+                  AND reasoning_tokens = ?13
+                  AND total_tokens = ?14
+                  AND cost_microusd IS ?15
+                  AND cost_kind = ?16
+             )",
+            params![
+                source_id,
+                event.event_key,
+                event.occurred_at_ms,
+                event.project_id,
+                event.provider,
+                event.model,
+                event.variant,
+                event.messages,
+                event.input_tokens,
+                event.output_tokens,
+                event.cache_read_tokens,
+                event.cache_write_tokens,
+                event.reasoning_tokens,
+                event.total_tokens,
+                event.cost_microusd,
+                event.cost_kind.key(),
+            ],
+            |row| row.get(0),
+        )
+        .context("comparing indexed usage event")
+}
+
 fn validate_event(event: &UsageEvent) -> Result<()> {
     if event.event_key.is_empty() {
         return Err(anyhow!("usage event key must not be empty"));
@@ -596,6 +734,34 @@ fn artifact_event_bounds(
             },
         )
         .context("reading previous artifact event range")
+}
+
+fn removed_event_bounds(
+    transaction: &Transaction<'_>,
+    artifact_id: i64,
+    event_keys: &[Vec<u8>],
+) -> Result<Option<(i64, i64)>> {
+    let mut bounds: Option<(i64, i64)> = None;
+    for event_key in event_keys {
+        let event_time = transaction
+            .query_row(
+                "SELECT usage_events.occurred_at_ms
+                 FROM usage_events
+                 JOIN artifact_events ON artifact_events.event_id = usage_events.id
+                 WHERE artifact_events.artifact_id = ?1
+                   AND usage_events.event_key = ?2",
+                params![artifact_id, event_key],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        if let Some(event_time) = event_time {
+            bounds = Some(match bounds {
+                Some((start, end)) => (start.min(event_time), end.max(event_time)),
+                None => (event_time, event_time),
+            });
+        }
+    }
+    Ok(bounds)
 }
 
 fn event_bounds(events: &[UsageEvent]) -> Option<(i64, i64)> {

@@ -27,6 +27,8 @@ pub mod db;
 pub mod format;
 pub mod index;
 pub mod report;
+#[doc(hidden)]
+pub mod sources;
 pub mod time_window;
 #[doc(hidden)]
 pub mod tui;

@@ -919,7 +919,7 @@ pub fn diagnose(path: &Path) -> Result<DatabaseDiagnostics> {
     })
 }
 
-fn open_database(path: &Path) -> Result<Connection> {
+pub(crate) fn open_database(path: &Path) -> Result<Connection> {
     let connection = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -975,7 +975,7 @@ fn usage_schema_errors(
     errors
 }
 
-fn table_columns(connection: &Connection, table: &str) -> Result<HashSet<String>> {
+pub(crate) fn table_columns(connection: &Connection, table: &str) -> Result<HashSet<String>> {
     let mut statement = connection.prepare("SELECT name FROM pragma_table_info(?1)")?;
     let rows = statement.query_map([table], |row| row.get::<_, String>(0))?;
     rows.collect::<rusqlite::Result<HashSet<_>>>()
