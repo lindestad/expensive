@@ -1889,6 +1889,7 @@ fn draw_summary(
     loading: bool,
     palette: Palette,
 ) {
+    let loading = loading && stats.is_none();
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -2753,6 +2754,20 @@ mod tests {
     }
 
     #[test]
+    fn keeps_metric_labels_stable_while_loaded_data_refreshes() {
+        let stats = many_model_stats(Mode::Weekly, 4);
+        let mut app = app_with_stats(Mode::Weekly, stats);
+        app.loading.insert(Mode::Weekly);
+
+        let output = render(&app, 100, 24);
+
+        assert!(!output.contains("refreshing"));
+        assert!(output.contains("all categories"));
+        assert!(output.contains("input / output"));
+        assert!(output.contains("read / write"));
+    }
+
+    #[test]
     fn renders_error_footer() {
         let mut app = app_loading(Mode::Monthly);
         app.loading.clear();
@@ -3075,6 +3090,7 @@ mod tests {
             stats: stats_by_mode,
             loading: HashSet::new(),
             graph_loading: HashSet::new(),
+            graph_refresh_pending: HashSet::new(),
             dashboard_prefetch_attempted: HashSet::new(),
             calendar: test_calendar(),
             calendar_costs: HashMap::new(),
@@ -3082,6 +3098,7 @@ mod tests {
             history_stats: HashMap::new(),
             history_loading: HashSet::new(),
             history_graph_loading: HashSet::new(),
+            history_graph_refresh_pending: HashSet::new(),
             error: None,
             last_refresh_started: None,
             next_refresh_due: Instant::now() + Duration::from_secs(60),
@@ -3105,6 +3122,7 @@ mod tests {
             stats: HashMap::new(),
             loading: HashSet::from([mode]),
             graph_loading: HashSet::new(),
+            graph_refresh_pending: HashSet::new(),
             dashboard_prefetch_attempted: HashSet::new(),
             calendar: test_calendar(),
             calendar_costs: HashMap::new(),
@@ -3112,6 +3130,7 @@ mod tests {
             history_stats: HashMap::new(),
             history_loading: HashSet::new(),
             history_graph_loading: HashSet::new(),
+            history_graph_refresh_pending: HashSet::new(),
             error: None,
             last_refresh_started: None,
             next_refresh_due: Instant::now() + Duration::from_secs(60),
@@ -3135,6 +3154,7 @@ mod tests {
             stats: HashMap::new(),
             loading: HashSet::new(),
             graph_loading: HashSet::new(),
+            graph_refresh_pending: HashSet::new(),
             dashboard_prefetch_attempted: HashSet::new(),
             calendar: CalendarState {
                 scale: selected.scale,
@@ -3151,6 +3171,7 @@ mod tests {
             history_stats: HashMap::new(),
             history_loading: HashSet::new(),
             history_graph_loading: HashSet::new(),
+            history_graph_refresh_pending: HashSet::new(),
             error: None,
             last_refresh_started: None,
             next_refresh_due: Instant::now() + Duration::from_secs(60),

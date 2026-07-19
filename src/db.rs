@@ -57,7 +57,7 @@ pub struct UsageStats {
     pub token_buckets: Vec<TokenBucket>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TokenBucket {
     pub start_millis: i64,
     pub end_millis: i64,

@@ -92,6 +92,7 @@ pub struct AppState {
     pub stats: HashMap<Mode, UsageStats>,
     pub loading: HashSet<Mode>,
     pub graph_loading: HashSet<Mode>,
+    pub graph_refresh_pending: HashSet<Mode>,
     pub dashboard_prefetch_attempted: HashSet<Mode>,
     pub calendar: CalendarState,
     pub calendar_costs: HashMap<PeriodKey, f64>,
@@ -99,6 +100,7 @@ pub struct AppState {
     pub history_stats: HashMap<PeriodKey, UsageStats>,
     pub history_loading: HashSet<PeriodKey>,
     pub history_graph_loading: HashSet<PeriodKey>,
+    pub history_graph_refresh_pending: HashSet<PeriodKey>,
     pub error: Option<String>,
     pub last_refresh_started: Option<DateTime<Local>>,
     pub next_refresh_due: Instant,
@@ -132,6 +134,7 @@ impl AppState {
             stats: HashMap::new(),
             loading: HashSet::new(),
             graph_loading: HashSet::new(),
+            graph_refresh_pending: HashSet::new(),
             dashboard_prefetch_attempted: HashSet::new(),
             calendar: CalendarState {
                 scale: CalendarScale::Day,
@@ -143,6 +146,7 @@ impl AppState {
             history_stats: HashMap::new(),
             history_loading: HashSet::new(),
             history_graph_loading: HashSet::new(),
+            history_graph_refresh_pending: HashSet::new(),
             error: None,
             last_refresh_started: None,
             next_refresh_due,
@@ -240,17 +244,19 @@ impl AppState {
     }
 
     fn trigger_dashboard_graph_refresh(&mut self, mode: Mode, tx: &Sender<RefreshMessage>) {
-        if self.graph_loading.contains(&mode) {
+        if self.graph_loading.contains(&mode) || !self.graph_refresh_pending.contains(&mode) {
             return;
         }
         let Some(stats) = self.stats.get(&mode) else {
             return;
         };
-        if stats.totals.messages == 0 || !stats.token_buckets.is_empty() {
+        if stats.totals.messages == 0 {
+            self.graph_refresh_pending.remove(&mode);
             return;
         }
 
         let cutoff_millis = stats.cutoff_millis;
+        let refreshed_at = stats.refreshed_at;
         self.graph_loading.insert(mode);
 
         let tx = tx.clone();
@@ -261,6 +267,7 @@ impl AppState {
             let _ = tx.send(RefreshMessage::DashboardGraph {
                 mode,
                 cutoff_millis,
+                refreshed_at,
                 result,
             });
         });
@@ -399,16 +406,20 @@ impl AppState {
     }
 
     fn trigger_history_graph_refresh(&mut self, period: PeriodKey, tx: &Sender<RefreshMessage>) {
-        if self.history_graph_loading.contains(&period) {
+        if self.history_graph_loading.contains(&period)
+            || !self.history_graph_refresh_pending.contains(&period)
+        {
             return;
         }
         let Some(stats) = self.history_stats.get(&period) else {
             return;
         };
-        if stats.totals.messages == 0 || !stats.token_buckets.is_empty() {
+        if stats.totals.messages == 0 {
+            self.history_graph_refresh_pending.remove(&period);
             return;
         }
 
+        let refreshed_at = stats.refreshed_at;
         self.history_graph_loading.insert(period);
 
         let tx = tx.clone();
@@ -421,7 +432,11 @@ impl AppState {
                 period.end_millis,
             )
             .map_err(|error| format!("{error:#}"));
-            let _ = tx.send(RefreshMessage::HistoryGraph { period, result });
+            let _ = tx.send(RefreshMessage::HistoryGraph {
+                period,
+                refreshed_at,
+                result,
+            });
         });
     }
 
@@ -432,10 +447,26 @@ impl AppState {
     ) {
         self.loading.remove(&mode);
         match result {
-            Ok(stats) => {
+            Ok(mut stats) => {
+                let mut retained_graph = false;
+                if let Some(previous) = self.stats.get(&mode).filter(|previous| {
+                    previous.cutoff_millis == stats.cutoff_millis
+                        && previous.end_millis == stats.end_millis
+                        && stats.totals.messages > 0
+                }) {
+                    stats.token_buckets.clone_from(&previous.token_buckets);
+                    retained_graph = !stats.token_buckets.is_empty();
+                }
+                if stats.totals.messages > 0 {
+                    self.graph_refresh_pending.insert(mode);
+                } else {
+                    self.graph_refresh_pending.remove(&mode);
+                }
                 self.stats.insert(mode, stats);
                 if self.view == View::Dashboard && mode == self.mode {
-                    self.dashboard_token_bucket = None;
+                    if !retained_graph {
+                        self.dashboard_token_bucket = None;
+                    }
                     self.error = None;
                 }
             }
@@ -451,13 +482,32 @@ impl AppState {
         &mut self,
         mode: Mode,
         cutoff_millis: Option<i64>,
+        refreshed_at: DateTime<Local>,
         result: std::result::Result<Vec<db::TokenBucket>, String>,
-    ) {
+    ) -> bool {
+        let placeholder_was_visible = self.view == View::Dashboard
+            && mode == self.mode
+            && self
+                .stats
+                .get(&mode)
+                .map(|stats| stats.token_buckets.is_empty())
+                .unwrap_or(false);
         self.graph_loading.remove(&mode);
+        let is_current_request = self
+            .stats
+            .get(&mode)
+            .map(|stats| stats.cutoff_millis == cutoff_millis && stats.refreshed_at == refreshed_at)
+            .unwrap_or(false);
+        if !is_current_request {
+            return false;
+        }
+        self.graph_refresh_pending.remove(&mode);
         match result {
             Ok(token_buckets) => {
+                let mut graph_changed = false;
                 if let Some(stats) = self.stats.get_mut(&mode) {
-                    if stats.cutoff_millis == cutoff_millis {
+                    if stats.token_buckets != token_buckets {
+                        graph_changed = true;
                         stats.token_buckets = token_buckets;
                         if self
                             .dashboard_token_bucket
@@ -468,13 +518,21 @@ impl AppState {
                         }
                     }
                 }
+                let mut error_changed = false;
                 if self.view == View::Dashboard && mode == self.mode {
+                    error_changed = self.error.is_some();
                     self.error = None;
                 }
+                (self.view == View::Dashboard && mode == self.mode)
+                    && (placeholder_was_visible || graph_changed || error_changed)
             }
             Err(error) => {
                 if self.view == View::Dashboard && mode == self.mode {
+                    let changed = self.error.as_deref() != Some(error.as_str());
                     self.error = Some(error);
+                    changed
+                } else {
+                    false
                 }
             }
         }
@@ -511,10 +569,26 @@ impl AppState {
     ) {
         self.history_loading.remove(&period);
         match result {
-            Ok(stats) => {
+            Ok(mut stats) => {
+                let mut retained_graph = false;
+                if let Some(previous) = self.history_stats.get(&period).filter(|previous| {
+                    previous.cutoff_millis == stats.cutoff_millis
+                        && previous.end_millis == stats.end_millis
+                        && stats.totals.messages > 0
+                }) {
+                    stats.token_buckets.clone_from(&previous.token_buckets);
+                    retained_graph = !stats.token_buckets.is_empty();
+                }
+                if stats.totals.messages > 0 {
+                    self.history_graph_refresh_pending.insert(period);
+                } else {
+                    self.history_graph_refresh_pending.remove(&period);
+                }
                 self.history_stats.insert(period, stats);
                 if self.view == View::CalendarDetail && period == self.calendar.selected {
-                    self.history_token_bucket = None;
+                    if !retained_graph {
+                        self.history_token_bucket = None;
+                    }
                     self.error = None;
                 }
             }
@@ -529,42 +603,90 @@ impl AppState {
     fn apply_history_graph_refresh(
         &mut self,
         period: PeriodKey,
+        refreshed_at: DateTime<Local>,
         result: std::result::Result<Vec<db::TokenBucket>, String>,
-    ) {
+    ) -> bool {
+        let placeholder_was_visible = self.view == View::CalendarDetail
+            && period == self.calendar.selected
+            && self
+                .history_stats
+                .get(&period)
+                .map(|stats| stats.token_buckets.is_empty())
+                .unwrap_or(false);
         self.history_graph_loading.remove(&period);
+        let is_current_request = self
+            .history_stats
+            .get(&period)
+            .map(|stats| stats.refreshed_at == refreshed_at)
+            .unwrap_or(false);
+        if !is_current_request {
+            return false;
+        }
+        self.history_graph_refresh_pending.remove(&period);
         match result {
             Ok(token_buckets) => {
+                let mut graph_changed = false;
                 if let Some(stats) = self.history_stats.get_mut(&period) {
-                    stats.token_buckets = token_buckets;
-                    if self
-                        .history_token_bucket
-                        .map(|idx| idx >= stats.token_buckets.len())
-                        .unwrap_or(false)
-                    {
-                        self.history_token_bucket = None;
+                    if stats.token_buckets != token_buckets {
+                        graph_changed = true;
+                        stats.token_buckets = token_buckets;
+                        if self
+                            .history_token_bucket
+                            .map(|idx| idx >= stats.token_buckets.len())
+                            .unwrap_or(false)
+                        {
+                            self.history_token_bucket = None;
+                        }
                     }
                 }
+                let mut error_changed = false;
                 if self.view == View::CalendarDetail && period == self.calendar.selected {
+                    error_changed = self.error.is_some();
                     self.error = None;
                 }
+                (self.view == View::CalendarDetail && period == self.calendar.selected)
+                    && (placeholder_was_visible || graph_changed || error_changed)
             }
             Err(error) => {
                 if self.view == View::CalendarDetail && period == self.calendar.selected {
+                    let changed = self.error.as_deref() != Some(error.as_str());
                     self.error = Some(error);
+                    changed
+                } else {
+                    false
                 }
             }
         }
     }
 
-    fn ensure_visible_graph(&mut self, area: Rect, tx: &Sender<RefreshMessage>) {
+    fn ensure_visible_graph(&mut self, area: Rect, tx: &Sender<RefreshMessage>) -> bool {
         if tui::token_graph_capacity_area(area, self).is_none() {
-            return;
+            return false;
         }
 
         match self.view {
-            View::Dashboard => self.trigger_dashboard_graph_refresh(self.mode, tx),
-            View::CalendarDetail => self.trigger_history_graph_refresh(self.calendar.selected, tx),
-            View::CalendarOverview => {}
+            View::Dashboard => {
+                let was_loading = self.graph_loading.contains(&self.mode);
+                self.trigger_dashboard_graph_refresh(self.mode, tx);
+                !was_loading
+                    && self.graph_loading.contains(&self.mode)
+                    && self
+                        .current_stats()
+                        .map(|stats| stats.token_buckets.is_empty())
+                        .unwrap_or(false)
+            }
+            View::CalendarDetail => {
+                let period = self.calendar.selected;
+                let was_loading = self.history_graph_loading.contains(&period);
+                self.trigger_history_graph_refresh(period, tx);
+                !was_loading
+                    && self.history_graph_loading.contains(&period)
+                    && self
+                        .selected_history_stats()
+                        .map(|stats| stats.token_buckets.is_empty())
+                        .unwrap_or(false)
+            }
+            View::CalendarOverview => false,
         }
     }
 
@@ -783,6 +905,7 @@ enum RefreshMessage {
     DashboardGraph {
         mode: Mode,
         cutoff_millis: Option<i64>,
+        refreshed_at: DateTime<Local>,
         result: std::result::Result<Vec<db::TokenBucket>, String>,
     },
     Calendar {
@@ -794,6 +917,7 @@ enum RefreshMessage {
     },
     HistoryGraph {
         period: PeriodKey,
+        refreshed_at: DateTime<Local>,
         result: std::result::Result<Vec<db::TokenBucket>, String>,
     },
 }
@@ -822,16 +946,26 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Confi
     let (tx, rx) = mpsc::channel();
     let mut app = AppState::new(config)?;
     app.trigger_dashboard_refresh(&tx);
+    let mut needs_draw = true;
+    let mut last_size = None;
 
     loop {
-        drain_refreshes(&rx, &mut app, &tx);
-        maybe_auto_refresh(&mut app, &tx);
+        needs_draw |= drain_refreshes(&rx, &mut app, &tx);
+        needs_draw |= maybe_auto_refresh(&mut app, &tx);
         let size = terminal.size()?;
+        let current_size = (size.width, size.height);
+        if last_size != Some(current_size) {
+            last_size = Some(current_size);
+            needs_draw = true;
+        }
         let area = Rect::new(0, 0, size.width, size.height);
-        app.ensure_visible_graph(area, &tx);
+        needs_draw |= app.ensure_visible_graph(area, &tx);
         app.prefetch_dashboard_summaries(&tx);
 
-        terminal.draw(|frame| tui::draw(frame, &app))?;
+        if needs_draw {
+            terminal.draw(|frame| tui::draw(frame, &app))?;
+            needs_draw = false;
+        }
 
         if event::poll(Duration::from_millis(200))? {
             match event::read()? {
@@ -841,12 +975,14 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Confi
                     if handle_key(key.code, key.modifiers, area, &mut app, &tx) {
                         return Ok(());
                     }
+                    needs_draw = true;
                 }
                 Event::Mouse(mouse) => {
                     let size = terminal.size()?;
                     let area = Rect::new(0, 0, size.width, size.height);
-                    handle_mouse(mouse, area, &mut app, &tx);
+                    needs_draw |= handle_mouse(mouse, area, &mut app, &tx);
                 }
+                Event::Resize(_, _) => needs_draw = true,
                 _ => {}
             }
         }
@@ -979,26 +1115,38 @@ fn handle_key(
     }
 }
 
-fn handle_mouse(mouse: MouseEvent, area: Rect, app: &mut AppState, tx: &Sender<RefreshMessage>) {
+fn handle_mouse(
+    mouse: MouseEvent,
+    area: Rect,
+    app: &mut AppState,
+    tx: &Sender<RefreshMessage>,
+) -> bool {
     if app.show_help {
         let help_layout = tui::help_layout_state(area, app);
-        match mouse.kind {
-            MouseEventKind::ScrollUp => app.move_help_selection(-1, &help_layout),
-            MouseEventKind::ScrollDown => app.move_help_selection(1, &help_layout),
-            _ => {}
-        }
-        return;
+        return match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                app.move_help_selection(-1, &help_layout);
+                true
+            }
+            MouseEventKind::ScrollDown => {
+                app.move_help_selection(1, &help_layout);
+                true
+            }
+            _ => false,
+        };
     }
 
+    let mut changed = false;
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
+            changed = app.token_graph_dragging;
             app.token_graph_dragging = false;
             if let Some(bucket_idx) =
                 tui::token_bucket_at_position(mouse.column, mouse.row, area, app)
             {
                 app.select_token_bucket(bucket_idx);
                 app.token_graph_dragging = true;
-                return;
+                return true;
             }
         }
         MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Moved
@@ -1007,13 +1155,20 @@ fn handle_mouse(mouse: MouseEvent, area: Rect, app: &mut AppState, tx: &Sender<R
             if let Some(bucket_idx) =
                 tui::token_bucket_at_position(mouse.column, mouse.row, area, app)
             {
+                let previous = match app.view {
+                    View::Dashboard => app.dashboard_token_bucket,
+                    View::CalendarDetail => app.history_token_bucket,
+                    View::CalendarOverview => None,
+                };
                 app.select_token_bucket(bucket_idx);
+                return previous != Some(bucket_idx);
             }
-            return;
+            return false;
         }
         MouseEventKind::Up(MouseButton::Left) => {
+            let changed = app.token_graph_dragging;
             app.token_graph_dragging = false;
-            return;
+            return changed;
         }
         _ => {}
     }
@@ -1023,20 +1178,22 @@ fn handle_mouse(mouse: MouseEvent, area: Rect, app: &mut AppState, tx: &Sender<R
             if tui::model_breakdown_at_position(mouse.column, mouse.row, area, app) =>
         {
             if let Some(model_area) = tui::model_breakdown_area(area, app) {
+                let previous = (app.dashboard_model_scroll, app.history_model_scroll);
                 let steps = if matches!(mouse.kind, MouseEventKind::ScrollDown) {
                     1
                 } else {
                     -1
                 };
                 app.move_model_breakdown_scroll(steps, model_area);
+                return previous != (app.dashboard_model_scroll, app.history_model_scroll);
             }
-            return;
+            return false;
         }
         _ => {}
     }
 
     if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-        return;
+        return changed;
     }
 
     if let Some(target) = tui::tab_at_position(mouse.column, mouse.row, area) {
@@ -1063,7 +1220,7 @@ fn handle_mouse(mouse: MouseEvent, area: Rect, app: &mut AppState, tx: &Sender<R
                 }
             }
         }
-        return;
+        return true;
     }
 
     if let Some(period) = tui::calendar_period_at_position(mouse.column, mouse.row, area, app) {
@@ -1072,34 +1229,61 @@ fn handle_mouse(mouse: MouseEvent, area: Rect, app: &mut AppState, tx: &Sender<R
             app.open_calendar_detail(tx);
             Ok(())
         });
+        return true;
     }
+
+    changed
 }
 
-fn drain_refreshes(rx: &Receiver<RefreshMessage>, app: &mut AppState, tx: &Sender<RefreshMessage>) {
+fn drain_refreshes(
+    rx: &Receiver<RefreshMessage>,
+    app: &mut AppState,
+    tx: &Sender<RefreshMessage>,
+) -> bool {
+    let mut needs_draw = false;
     while let Ok(message) = rx.try_recv() {
         match message {
-            RefreshMessage::Dashboard { mode, result } => app.apply_dashboard_refresh(mode, result),
+            RefreshMessage::Dashboard { mode, result } => {
+                app.apply_dashboard_refresh(mode, result);
+                needs_draw = true;
+            }
             RefreshMessage::DashboardGraph {
                 mode,
                 cutoff_millis,
+                refreshed_at,
                 result,
-            } => app.apply_dashboard_graph_refresh(mode, cutoff_millis, result),
-            RefreshMessage::Calendar { result } => app.apply_calendar_refresh(result, tx),
-            RefreshMessage::History { period, result } => app.apply_history_refresh(period, result),
-            RefreshMessage::HistoryGraph { period, result } => {
-                app.apply_history_graph_refresh(period, result)
+            } => {
+                needs_draw |=
+                    app.apply_dashboard_graph_refresh(mode, cutoff_millis, refreshed_at, result);
+            }
+            RefreshMessage::Calendar { result } => {
+                app.apply_calendar_refresh(result, tx);
+                needs_draw = true;
+            }
+            RefreshMessage::History { period, result } => {
+                app.apply_history_refresh(period, result);
+                needs_draw = true;
+            }
+            RefreshMessage::HistoryGraph {
+                period,
+                refreshed_at,
+                result,
+            } => {
+                needs_draw |= app.apply_history_graph_refresh(period, refreshed_at, result);
             }
         }
     }
+    needs_draw
 }
 
-fn maybe_auto_refresh(app: &mut AppState, tx: &Sender<RefreshMessage>) {
+fn maybe_auto_refresh(app: &mut AppState, tx: &Sender<RefreshMessage>) -> bool {
     if !app.config.auto_refresh || Instant::now() < app.next_refresh_due {
-        return;
+        return false;
     }
 
     app.trigger_current_refresh(tx);
     app.next_refresh_due = Instant::now() + app.config.refresh_interval;
+    true
 }
 
 fn refresh_dashboard_summary(config: Config, mode: Mode) -> Result<UsageStats> {
@@ -1280,6 +1464,27 @@ mod tests {
         );
 
         assert_eq!(app.selected_config_item(), ConfigEditorItem::AutoRefresh);
+    }
+
+    #[test]
+    fn idle_mouse_movement_does_not_request_a_redraw() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut app = AppState::new(test_config(tempdir.path().join("config.toml"))).unwrap();
+        let (tx, _rx) = mpsc::channel();
+
+        let changed = handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: 10,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            },
+            Rect::new(0, 0, 120, 24),
+            &mut app,
+            &tx,
+        );
+
+        assert!(!changed);
     }
 
     #[test]
@@ -1588,6 +1793,125 @@ mod tests {
         );
 
         assert!(!app.token_graph_dragging);
+    }
+
+    #[test]
+    fn initial_dashboard_summary_defers_graph_loading() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut app = AppState::new(test_config(tempdir.path().join("config.toml"))).unwrap();
+        let mut summary = many_model_stats(Mode::Daily, 4);
+        summary.token_buckets.clear();
+
+        app.apply_dashboard_refresh(Mode::Daily, Ok(summary));
+
+        assert!(app.current_stats().unwrap().token_buckets.is_empty());
+        assert!(app.graph_refresh_pending.contains(&Mode::Daily));
+    }
+
+    #[test]
+    fn dashboard_refresh_retains_graph_until_replacement_arrives() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut app = AppState::new(test_config(tempdir.path().join("config.toml"))).unwrap();
+        let previous = many_model_stats(Mode::Daily, 4);
+        let previous_buckets = previous.token_buckets.clone();
+        let previous_refreshed_at = previous.refreshed_at;
+        app.stats.insert(Mode::Daily, previous);
+        app.dashboard_token_bucket = Some(2);
+
+        let mut summary = many_model_stats(Mode::Daily, 4);
+        summary.refreshed_at = previous_refreshed_at + chrono::Duration::minutes(1);
+        summary.token_buckets.clear();
+        app.apply_dashboard_refresh(Mode::Daily, Ok(summary));
+
+        assert_eq!(app.current_stats().unwrap().token_buckets, previous_buckets);
+        assert_eq!(app.dashboard_token_bucket, Some(2));
+        assert!(app.graph_refresh_pending.contains(&Mode::Daily));
+    }
+
+    #[test]
+    fn stale_dashboard_graph_result_does_not_replace_retained_graph() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut app = AppState::new(test_config(tempdir.path().join("config.toml"))).unwrap();
+        let previous = many_model_stats(Mode::Daily, 4);
+        let previous_buckets = previous.token_buckets.clone();
+        let previous_refreshed_at = previous.refreshed_at;
+        app.stats.insert(Mode::Daily, previous);
+
+        let mut summary = many_model_stats(Mode::Daily, 4);
+        summary.refreshed_at = previous_refreshed_at + chrono::Duration::minutes(1);
+        summary.token_buckets.clear();
+        app.apply_dashboard_refresh(Mode::Daily, Ok(summary));
+        app.graph_loading.insert(Mode::Daily);
+
+        let replacement = vec![TokenBucket {
+            start_millis: 0,
+            end_millis: 1,
+            tokens: 999,
+        }];
+        let changed = app.apply_dashboard_graph_refresh(
+            Mode::Daily,
+            None,
+            previous_refreshed_at,
+            Ok(replacement),
+        );
+
+        assert!(!changed);
+        assert_eq!(app.current_stats().unwrap().token_buckets, previous_buckets);
+        assert!(app.graph_refresh_pending.contains(&Mode::Daily));
+    }
+
+    #[test]
+    fn unchanged_dashboard_graph_does_not_request_a_redraw() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut app = AppState::new(test_config(tempdir.path().join("config.toml"))).unwrap();
+        let stats = many_model_stats(Mode::Daily, 4);
+        let cutoff_millis = stats.cutoff_millis;
+        let refreshed_at = stats.refreshed_at;
+        let buckets = stats.token_buckets.clone();
+        app.stats.insert(Mode::Daily, stats);
+        app.graph_loading.insert(Mode::Daily);
+        app.graph_refresh_pending.insert(Mode::Daily);
+
+        let changed = app.apply_dashboard_graph_refresh(
+            Mode::Daily,
+            cutoff_millis,
+            refreshed_at,
+            Ok(buckets),
+        );
+
+        assert!(!changed);
+        assert!(!app.graph_refresh_pending.contains(&Mode::Daily));
+    }
+
+    #[test]
+    fn history_refresh_retains_graph_until_replacement_arrives() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut app = AppState::new(test_config(tempdir.path().join("config.toml"))).unwrap();
+        let period = app.calendar.selected;
+        let previous = many_model_stats(period.mode(), 4);
+        let previous_buckets = previous.token_buckets.clone();
+        let previous_refreshed_at = previous.refreshed_at;
+        app.view = View::CalendarDetail;
+        app.history_stats.insert(period, previous);
+        app.history_token_bucket = Some(2);
+
+        let mut summary = many_model_stats(period.mode(), 4);
+        summary.refreshed_at = previous_refreshed_at + chrono::Duration::minutes(1);
+        summary.cutoff_millis = Some(period.start_millis);
+        summary.end_millis = Some(period.end_millis);
+        if let Some(previous) = app.history_stats.get_mut(&period) {
+            previous.cutoff_millis = Some(period.start_millis);
+            previous.end_millis = Some(period.end_millis);
+        }
+        summary.token_buckets.clear();
+        app.apply_history_refresh(period, Ok(summary));
+
+        assert_eq!(
+            app.selected_history_stats().unwrap().token_buckets,
+            previous_buckets
+        );
+        assert_eq!(app.history_token_bucket, Some(2));
+        assert!(app.history_graph_refresh_pending.contains(&period));
     }
 
     fn test_config(config_path: PathBuf) -> Config {
