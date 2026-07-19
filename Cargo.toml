@@ -1,16 +1,16 @@
 [package]
 name = "expensive"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.88"
 resolver = "3"
 license = "MIT"
-description = "Terminal dashboard for OpenCode token usage and spend"
+description = "Terminal dashboard for AI coding harness token usage and spend"
 repository = "https://github.com/lindestad/expensive"
 homepage = "https://github.com/lindestad/expensive"
 documentation = "https://docs.rs/expensive"
 readme = "README.md"
-keywords = ["opencode", "tui", "tokens", "ratatui"]
+keywords = ["opencode", "codex", "pi", "tui", "tokens"]
 categories = ["command-line-utilities"]
 
 [dependencies]

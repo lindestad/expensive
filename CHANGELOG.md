@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.0
+
+- add a source-neutral local SQLite index that stores accounting facts and content-free scan checkpoints instead of copied session histories
+- import OpenCode, Codex, and Pi usage with safe incremental scans, rewrite reconciliation, and clone/fork deduplication
+- query cached usage immediately while refreshing sources in the background; add `R` for a full rescan and handle day rollover independently
+- distinguish known spend from unpriced messages when sources such as Codex provide tokens without dollar cost
+- expand `doctor` with index and source diagnostics and update JSON reports to schema version 2
+- update dependencies within the Rust 1.88 compatibility boundary, including bundled SQLite 3.51.3
+
 ## 0.4.0
 
 - add all-project, current-directory, and persisted project scopes with a TUI picker
