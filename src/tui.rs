@@ -12,6 +12,7 @@ use crate::{
     config::{ColorTheme, ThemeScope},
     db::{ModelUsage, UsageStats, UsageTotals},
     format,
+    sources::SyncMode,
     time_window::{self, CalendarScale, Mode, PeriodKey, WeekStart},
 };
 
@@ -736,7 +737,7 @@ fn help_inner_area(area: Rect) -> Rect {
     })
 }
 
-fn control_help_bindings() -> [HelpBinding; 9] {
+fn control_help_bindings() -> [HelpBinding; 10] {
     [
         HelpBinding {
             key: "Tab / Shift+Tab",
@@ -760,7 +761,11 @@ fn control_help_bindings() -> [HelpBinding; 9] {
         },
         HelpBinding {
             key: "r",
-            description: "refresh current view",
+            description: "refresh current view and sources",
+        },
+        HelpBinding {
+            key: "R",
+            description: "rebuild usage index from sources",
         },
         HelpBinding {
             key: "g",
@@ -2745,6 +2750,10 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &AppState, palette: Palet
 fn dashboard_status(app: &AppState) -> String {
     if let Some(error) = &app.error {
         format!("error: {error}")
+    } else if let Some(mode) = app.source_sync {
+        source_sync_label(mode).to_string()
+    } else if let Some(error) = &app.source_sync_error {
+        format!("source warning: {error}")
     } else if let Some(stats) = app.current_stats() {
         let cutoff = cutoff_label(stats);
         format!(
@@ -2760,9 +2769,9 @@ fn dashboard_status(app: &AppState) -> String {
 }
 
 fn dashboard_status_color(app: &AppState, palette: Palette) -> Color {
-    if app.error.is_some() {
+    if app.error.is_some() || app.source_sync_error.is_some() {
         palette.error
-    } else if app.is_current_loading() {
+    } else if app.source_sync.is_some() || app.is_current_loading() {
         palette.tokens
     } else {
         palette.muted
@@ -2772,6 +2781,10 @@ fn dashboard_status_color(app: &AppState, palette: Palette) -> Color {
 fn calendar_status(app: &AppState) -> String {
     if let Some(error) = &app.error {
         format!("error: {error}")
+    } else if let Some(mode) = app.source_sync {
+        source_sync_label(mode).to_string()
+    } else if let Some(error) = &app.source_sync_error {
+        format!("source warning: {error}")
     } else if app.calendar_loading {
         "loading calendar".to_string()
     } else {
@@ -2784,9 +2797,9 @@ fn calendar_status(app: &AppState) -> String {
 }
 
 fn calendar_status_color(app: &AppState, palette: Palette) -> Color {
-    if app.error.is_some() {
+    if app.error.is_some() || app.source_sync_error.is_some() {
         palette.error
-    } else if app.calendar_loading {
+    } else if app.source_sync.is_some() || app.calendar_loading {
         palette.tokens
     } else {
         palette.muted
@@ -2796,6 +2809,10 @@ fn calendar_status_color(app: &AppState, palette: Palette) -> Color {
 fn history_status(app: &AppState) -> String {
     if let Some(error) = &app.error {
         format!("error: {error}")
+    } else if let Some(mode) = app.source_sync {
+        source_sync_label(mode).to_string()
+    } else if let Some(error) = &app.source_sync_error {
+        format!("source warning: {error}")
     } else if let Some(stats) = app.selected_history_stats() {
         let cutoff = cutoff_label(stats);
         format!(
@@ -2811,12 +2828,19 @@ fn history_status(app: &AppState) -> String {
 }
 
 fn history_status_color(app: &AppState, palette: Palette) -> Color {
-    if app.error.is_some() {
+    if app.error.is_some() || app.source_sync_error.is_some() {
         palette.error
-    } else if app.is_selected_history_loading() {
+    } else if app.source_sync.is_some() || app.is_selected_history_loading() {
         palette.tokens
     } else {
         palette.muted
+    }
+}
+
+fn source_sync_label(mode: SyncMode) -> &'static str {
+    match mode {
+        SyncMode::Incremental => "syncing sources",
+        SyncMode::Full => "rebuilding usage index",
     }
 }
 
@@ -3631,6 +3655,10 @@ mod tests {
             history_loading: HashSet::new(),
             history_graph_load: crate::app::DeferredLoadState::default(),
             error: None,
+            source_sync: None,
+            source_sync_error: None,
+            logical_day: test_calendar().selected,
+            pending_full_source_sync: false,
             last_refresh_started: None,
             next_refresh_due: Instant::now() + Duration::from_secs(60),
             request_generation: 0,
@@ -3666,6 +3694,10 @@ mod tests {
             history_loading: HashSet::new(),
             history_graph_load: crate::app::DeferredLoadState::default(),
             error: None,
+            source_sync: None,
+            source_sync_error: None,
+            logical_day: test_calendar().selected,
+            pending_full_source_sync: false,
             last_refresh_started: None,
             next_refresh_due: Instant::now() + Duration::from_secs(60),
             request_generation: 0,
@@ -3710,6 +3742,10 @@ mod tests {
             history_loading: HashSet::new(),
             history_graph_load: crate::app::DeferredLoadState::default(),
             error: None,
+            source_sync: None,
+            source_sync_error: None,
+            logical_day: selected,
+            pending_full_source_sync: false,
             last_refresh_started: None,
             next_refresh_due: Instant::now() + Duration::from_secs(60),
             request_generation: 0,

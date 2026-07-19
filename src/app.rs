@@ -24,6 +24,7 @@ use crate::{
     config::{self, ColorTheme, Config, Scope, ThemeScope},
     db::{self, UsageStats},
     index,
+    sources::{self, SyncMode, SyncSummary},
     time_window::{self, CalendarScale, DailyStart, Mode, PeriodKey, WeekStart},
     tui,
 };
@@ -222,8 +223,12 @@ pub struct AppState {
     pub history_loading: HashSet<PeriodKey>,
     pub history_graph_load: DeferredLoadState<PeriodKey>,
     pub error: Option<String>,
+    pub source_sync: Option<SyncMode>,
+    pub source_sync_error: Option<String>,
     pub last_refresh_started: Option<DateTime<Local>>,
     pub next_refresh_due: Instant,
+    pub logical_day: PeriodKey,
+    pub(crate) pending_full_source_sync: bool,
     pub(crate) request_generation: u64,
 }
 
@@ -272,8 +277,12 @@ impl AppState {
             history_loading: HashSet::new(),
             history_graph_load: DeferredLoadState::default(),
             error: None,
+            source_sync: None,
+            source_sync_error: None,
             last_refresh_started: None,
             next_refresh_due,
+            logical_day: selected,
+            pending_full_source_sync: false,
             request_generation: 0,
         })
     }
@@ -543,6 +552,77 @@ impl AppState {
         if !self.stats.contains_key(&mode) {
             self.trigger_dashboard_refresh(tx);
         }
+    }
+
+    fn trigger_source_sync(&mut self, mode: SyncMode, tx: &Sender<RefreshMessage>) {
+        if self.source_sync.is_some() {
+            if mode == SyncMode::Full {
+                self.pending_full_source_sync = true;
+            }
+            return;
+        }
+        self.source_sync = Some(mode);
+        self.source_sync_error = None;
+        let tx = tx.clone();
+        let config = self.config.clone();
+        thread::spawn(move || {
+            let result =
+                sources::sync_configured(&config, mode).map_err(|error| format!("{error:#}"));
+            let _ = tx.send(RefreshMessage::SourceSync { result });
+        });
+    }
+
+    fn apply_source_sync(
+        &mut self,
+        result: std::result::Result<SyncSummary, String>,
+        tx: &Sender<RefreshMessage>,
+    ) {
+        self.source_sync = None;
+        match result {
+            Ok(summary) => {
+                self.source_sync_error =
+                    (!summary.errors.is_empty()).then(|| summary.errors.join("; "));
+                if let Ok(projects) = index::list_projects(&self.config.index_path) {
+                    self.projects = projects;
+                }
+                if summary.changed() {
+                    self.invalidate_after_source_change(tx);
+                }
+            }
+            Err(error) => self.source_sync_error = Some(error),
+        }
+
+        if std::mem::take(&mut self.pending_full_source_sync) {
+            self.trigger_source_sync(SyncMode::Full, tx);
+        }
+    }
+
+    fn invalidate_after_source_change(&mut self, tx: &Sender<RefreshMessage>) {
+        self.request_generation = self.request_generation.wrapping_add(1);
+        self.loading.clear();
+        self.dashboard_graph_load.reset();
+        self.dashboard_prefetch_attempted.clear();
+        self.calendar_costs.clear();
+        self.calendar_loading = false;
+        self.history_loading.clear();
+        self.history_graph_load.reset();
+
+        match self.view {
+            View::Dashboard => {
+                self.stats.retain(|mode, _| *mode == self.mode);
+                self.history_stats.clear();
+            }
+            View::CalendarOverview => {
+                self.stats.clear();
+                self.history_stats.clear();
+            }
+            View::CalendarDetail => {
+                let selected = self.calendar.selected;
+                self.stats.clear();
+                self.history_stats.retain(|period, _| *period == selected);
+            }
+        }
+        self.trigger_current_refresh(tx);
     }
 
     fn trigger_current_refresh(&mut self, tx: &Sender<RefreshMessage>) {
@@ -1304,16 +1384,20 @@ enum RefreshMessage {
         snapshot_millis: i64,
         result: std::result::Result<Vec<db::TokenBucket>, String>,
     },
+    SourceSync {
+        result: std::result::Result<SyncSummary, String>,
+    },
 }
 
 impl RefreshMessage {
-    fn generation(&self) -> u64 {
+    fn generation(&self) -> Option<u64> {
         match self {
             Self::Dashboard { generation, .. }
             | Self::DashboardGraph { generation, .. }
             | Self::Calendar { generation, .. }
             | Self::History { generation, .. }
-            | Self::HistoryGraph { generation, .. } => *generation,
+            | Self::HistoryGraph { generation, .. } => Some(*generation),
+            Self::SourceSync { .. } => None,
         }
     }
 }
@@ -1342,11 +1426,13 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Confi
     let (tx, rx) = mpsc::channel();
     let mut app = AppState::new(config)?;
     app.trigger_dashboard_refresh(&tx);
+    app.trigger_source_sync(SyncMode::Incremental, &tx);
     let mut needs_draw = true;
     let mut last_size = None;
 
     loop {
         needs_draw |= drain_refreshes(&rx, &mut app, &tx);
+        needs_draw |= maybe_day_rollover(&mut app, &tx);
         needs_draw |= maybe_auto_refresh(&mut app, &tx);
         let size = terminal.size()?;
         let current_size = (size.width, size.height);
@@ -1586,6 +1672,13 @@ fn apply_action(action: Action, app: &mut AppState, tx: &Sender<RefreshMessage>)
         }
         Action::Refresh => {
             app.trigger_current_refresh(tx);
+            app.trigger_source_sync(SyncMode::Incremental, tx);
+            app.next_refresh_due = Instant::now() + app.config.refresh_interval;
+            false
+        }
+        Action::RebuildIndex => {
+            app.trigger_current_refresh(tx);
+            app.trigger_source_sync(SyncMode::Full, tx);
             app.next_refresh_due = Instant::now() + app.config.refresh_interval;
             false
         }
@@ -1739,7 +1832,10 @@ fn drain_refreshes(
 ) -> bool {
     let mut needs_draw = false;
     while let Ok(message) = rx.try_recv() {
-        if message.generation() != app.request_generation {
+        if message
+            .generation()
+            .is_some_and(|generation| generation != app.request_generation)
+        {
             continue;
         }
         match message {
@@ -1784,6 +1880,10 @@ fn drain_refreshes(
             } => {
                 needs_draw |= app.apply_history_graph_refresh(period, snapshot_millis, result);
             }
+            RefreshMessage::SourceSync { result } => {
+                app.apply_source_sync(result, tx);
+                needs_draw = true;
+            }
         }
     }
     needs_draw
@@ -1795,7 +1895,54 @@ fn maybe_auto_refresh(app: &mut AppState, tx: &Sender<RefreshMessage>) -> bool {
     }
 
     app.trigger_current_refresh(tx);
+    app.trigger_source_sync(SyncMode::Incremental, tx);
     app.next_refresh_due = Instant::now() + app.config.refresh_interval;
+    true
+}
+
+fn maybe_day_rollover(app: &mut AppState, tx: &Sender<RefreshMessage>) -> bool {
+    let current_day = match time_window::current_period(
+        CalendarScale::Day,
+        Local::now(),
+        app.config.daily_start,
+        app.config.week_start,
+    ) {
+        Ok(period) => period,
+        Err(error) => {
+            app.error = Some(format!("{error:#}"));
+            return true;
+        }
+    };
+    if current_day == app.logical_day {
+        return false;
+    }
+
+    let previous_day = app.logical_day;
+    app.logical_day = current_day;
+    let old_now = local_from_millis(previous_day.end_millis.saturating_sub(1));
+    let new_now = local_from_millis(current_day.start_millis);
+    if let (Ok(old_now), Ok(new_now)) = (old_now, new_now) {
+        let old_current = time_window::current_period(
+            app.calendar.scale,
+            old_now,
+            app.config.daily_start,
+            app.config.week_start,
+        );
+        let new_current = time_window::current_period(
+            app.calendar.scale,
+            new_now,
+            app.config.daily_start,
+            app.config.week_start,
+        );
+        if let (Ok(old_current), Ok(new_current)) = (old_current, new_current) {
+            if app.calendar.selected == old_current {
+                app.calendar.selected = new_current;
+                let _ = app.sync_visible_periods();
+            }
+        }
+    }
+    app.invalidate_after_source_change(tx);
+    app.trigger_source_sync(SyncMode::Incremental, tx);
     true
 }
 

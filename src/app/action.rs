@@ -12,6 +12,7 @@ pub(super) enum Action {
     NextTab,
     PreviousTab,
     Refresh,
+    RebuildIndex,
     ToggleGraphMetric,
     OpenScopePicker,
     OpenSelectedPeriod,
@@ -32,6 +33,7 @@ impl Action {
             KeyCode::Char('c') if view == View::Dashboard => Some(Self::OpenCalendar),
             KeyCode::Tab => Some(Self::NextTab),
             KeyCode::BackTab => Some(Self::PreviousTab),
+            KeyCode::Char('R') => Some(Self::RebuildIndex),
             KeyCode::Char('r') => Some(Self::Refresh),
             KeyCode::Char('g') => Some(Self::ToggleGraphMetric),
             KeyCode::Char('p') => Some(Self::OpenScopePicker),
@@ -105,6 +107,28 @@ mod tests {
                 CalendarScale::Day,
             ),
             None
+        );
+    }
+
+    #[test]
+    fn distinguishes_incremental_and_full_refreshes() {
+        assert_eq!(
+            Action::from_key(
+                KeyCode::Char('r'),
+                KeyModifiers::NONE,
+                View::Dashboard,
+                CalendarScale::Day,
+            ),
+            Some(Action::Refresh)
+        );
+        assert_eq!(
+            Action::from_key(
+                KeyCode::Char('R'),
+                KeyModifiers::SHIFT,
+                View::Dashboard,
+                CalendarScale::Day,
+            ),
+            Some(Action::RebuildIndex)
         );
     }
 }
