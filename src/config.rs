@@ -220,6 +220,10 @@ pub struct Cli {
     #[arg(long, value_name = "PATH", global = true)]
     pub db: Option<PathBuf>,
 
+    /// Expensive's local normalized usage index.
+    #[arg(long, value_name = "PATH", global = true)]
+    pub index: Option<PathBuf>,
+
     #[arg(long, value_name = "HH:MM")]
     pub daily_start: Option<DailyStart>,
 
@@ -295,6 +299,9 @@ impl ReportPeriod {
 #[derive(Clone, Debug)]
 pub struct Config {
     pub db_path: PathBuf,
+    pub index_path: PathBuf,
+    pub codex_home: PathBuf,
+    pub pi_sessions_root: PathBuf,
     pub current_directory: PathBuf,
     pub config_path: Option<PathBuf>,
     pub daily_start: DailyStart,
@@ -327,14 +334,23 @@ struct FileConfig {
 pub fn load(cli: Cli) -> Result<Config> {
     let file_config = load_file_config()?;
     let db_path = discover_db_path(cli.db.clone());
+    let index_path = discover_index_path(cli.index.clone());
     let current_directory = env::current_dir().context("reading current directory")?;
-    resolve_config(cli, file_config, db_path, config_path(), current_directory)
+    resolve_config(
+        cli,
+        file_config,
+        db_path,
+        index_path,
+        config_path(),
+        current_directory,
+    )
 }
 
 fn resolve_config(
     cli: Cli,
     file_config: FileConfig,
     db_path: PathBuf,
+    index_path: PathBuf,
     config_path: Option<PathBuf>,
     current_directory: PathBuf,
 ) -> Result<Config> {
@@ -381,6 +397,9 @@ fn resolve_config(
 
     Ok(Config {
         db_path,
+        index_path,
+        codex_home: discover_codex_home(),
+        pi_sessions_root: discover_pi_sessions_root(),
         current_directory,
         config_path,
         daily_start,
@@ -489,6 +508,49 @@ fn discover_db_path(cli_path: Option<PathBuf>) -> PathBuf {
         .join(".local/share/opencode/opencode.db")
 }
 
+fn discover_index_path(cli_path: Option<PathBuf>) -> PathBuf {
+    if let Some(path) = cli_path {
+        return path;
+    }
+    if let Ok(path) = env::var("EXPENSIVE_INDEX_PATH") {
+        let path = path.trim();
+        if !path.is_empty() {
+            return PathBuf::from(path);
+        }
+    }
+    dirs::data_local_dir()
+        .or_else(dirs::data_dir)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".local/share")))
+        .unwrap_or_else(|| Path::new(".").to_path_buf())
+        .join("expensive")
+        .join("usage.sqlite3")
+}
+
+fn discover_codex_home() -> PathBuf {
+    env::var("CODEX_HOME")
+        .ok()
+        .filter(|path| !path.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))
+        .unwrap_or_else(|| Path::new(".codex").to_path_buf())
+}
+
+fn discover_pi_sessions_root() -> PathBuf {
+    if let Ok(path) = env::var("PI_CODING_AGENT_SESSION_DIR") {
+        let path = path.trim();
+        if !path.is_empty() {
+            return PathBuf::from(path);
+        }
+    }
+    env::var("PI_CODING_AGENT_DIR")
+        .ok()
+        .filter(|path| !path.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".pi/agent")))
+        .unwrap_or_else(|| Path::new(".pi/agent").to_path_buf())
+        .join("sessions")
+}
+
 fn opencode_db_path() -> Option<PathBuf> {
     let output = ProcessCommand::new("opencode")
         .args(["db", "path"])
@@ -516,6 +578,7 @@ mod tests {
     fn cli() -> Cli {
         Cli {
             db: None,
+            index: None,
             daily_start: None,
             week_start: None,
             refresh: None,
@@ -533,12 +596,14 @@ mod tests {
             cli(),
             FileConfig::default(),
             PathBuf::from("/tmp/opencode.db"),
+            PathBuf::from("/tmp/expensive.sqlite3"),
             Some(PathBuf::from("/tmp/config.toml")),
             PathBuf::from("/tmp/project"),
         )
         .unwrap();
 
         assert_eq!(config.db_path, PathBuf::from("/tmp/opencode.db"));
+        assert_eq!(config.index_path, PathBuf::from("/tmp/expensive.sqlite3"));
         assert_eq!(config.current_directory, PathBuf::from("/tmp/project"));
         assert_eq!(config.config_path, Some(PathBuf::from("/tmp/config.toml")));
         assert_eq!(config.daily_start, DailyStart::default());
@@ -579,6 +644,7 @@ mod tests {
             cli,
             file_config,
             PathBuf::from("/tmp/opencode.db"),
+            PathBuf::from("/tmp/expensive.sqlite3"),
             None,
             PathBuf::from("/tmp/project"),
         )
@@ -615,6 +681,7 @@ mod tests {
             cli(),
             file_config,
             PathBuf::from("/tmp/opencode.db"),
+            PathBuf::from("/tmp/expensive.sqlite3"),
             None,
             PathBuf::from("/tmp/project"),
         )
@@ -633,6 +700,9 @@ mod tests {
         let path = tempdir.path().join("expensive").join("config.toml");
         let config = Config {
             db_path: PathBuf::from("/tmp/opencode.db"),
+            index_path: PathBuf::from("/tmp/expensive.sqlite3"),
+            codex_home: PathBuf::from("/tmp/codex"),
+            pi_sessions_root: PathBuf::from("/tmp/pi/sessions"),
             current_directory: PathBuf::from("/tmp/project"),
             config_path: Some(path.clone()),
             daily_start: "05:30".parse().unwrap(),
@@ -694,6 +764,7 @@ mod tests {
             cli,
             FileConfig::default(),
             PathBuf::from("/tmp/opencode.db"),
+            PathBuf::from("/tmp/expensive.sqlite3"),
             None,
             PathBuf::from("/tmp/project"),
         )
@@ -714,6 +785,7 @@ mod tests {
             cli(),
             file_config,
             PathBuf::from("/tmp/opencode.db"),
+            PathBuf::from("/tmp/expensive.sqlite3"),
             None,
             PathBuf::from("/tmp/project"),
         )
@@ -737,6 +809,7 @@ mod tests {
             cli(),
             file_config,
             PathBuf::from("/tmp/opencode.db"),
+            PathBuf::from("/tmp/expensive.sqlite3"),
             None,
             PathBuf::from("/tmp/project"),
         )

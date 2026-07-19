@@ -23,6 +23,7 @@ use crate::{
     analytics,
     config::{self, ColorTheme, Config, Scope, ThemeScope},
     db::{self, UsageStats},
+    index,
     time_window::{self, CalendarScale, DailyStart, Mode, PeriodKey, WeekStart},
     tui,
 };
@@ -237,7 +238,7 @@ impl AppState {
         )?;
         let visible_periods =
             time_window::visible_periods(selected, config.daily_start, config.week_start)?;
-        let projects = db::list_projects(&config.db_path).unwrap_or_default();
+        let projects = index::list_projects(&config.index_path).unwrap_or_default();
 
         Ok(Self {
             config,
@@ -467,8 +468,10 @@ impl AppState {
     }
 
     fn open_scope_picker(&mut self) {
-        if let Ok(projects) = db::list_projects(&self.config.db_path) {
-            self.projects = projects;
+        if let Ok(projects) = index::list_projects(&self.config.index_path) {
+            if !projects.is_empty() || self.projects.is_empty() {
+                self.projects = projects;
+            }
         }
         let selection = match &self.config.scope {
             Scope::All => 0,
@@ -606,8 +609,8 @@ impl AppState {
         let config = self.config.clone();
         let generation = self.request_generation;
         thread::spawn(move || {
-            let result = db::load_usage_token_buckets_at_scoped(
-                &config.db_path,
+            let result = index::load_usage_token_buckets_at_scoped(
+                &config.index_path,
                 mode,
                 cutoff_millis,
                 end_millis,
@@ -729,8 +732,8 @@ impl AppState {
         let config = self.config.clone();
         let generation = self.request_generation;
         thread::spawn(move || {
-            let result = db::load_period_costs_scoped(
-                &config.db_path,
+            let result = index::load_period_costs_scoped(
+                &config.index_path,
                 &periods,
                 &config.scope,
                 &config.current_directory,
@@ -784,8 +787,8 @@ impl AppState {
         let config = self.config.clone();
         let generation = self.request_generation;
         thread::spawn(move || {
-            let result = db::load_usage_token_buckets_at_scoped(
-                &config.db_path,
+            let result = index::load_usage_token_buckets_at_scoped(
+                &config.index_path,
                 period.mode(),
                 Some(period.start_millis),
                 Some(period.end_millis),
@@ -2555,6 +2558,9 @@ mod tests {
     fn test_config(config_path: PathBuf) -> Config {
         Config {
             db_path: PathBuf::from("/tmp/opencode.db"),
+            index_path: PathBuf::from("/tmp/expensive.sqlite3"),
+            codex_home: PathBuf::from("/tmp/codex"),
+            pi_sessions_root: PathBuf::from("/tmp/pi/sessions"),
             current_directory: PathBuf::from("/tmp/project"),
             config_path: Some(config_path),
             daily_start: DailyStart::default(),
@@ -2579,6 +2585,7 @@ mod tests {
                 totals: UsageTotals {
                     messages: 1,
                     cost: (count - idx) as f64,
+                    total: 100,
                     input: 10,
                     output: 20,
                     cache_read: 30,
@@ -2589,6 +2596,7 @@ mod tests {
         let totals = UsageTotals {
             messages: count as u64,
             cost: models.iter().map(|model| model.totals.cost).sum(),
+            total: count as u64 * 100,
             input: models.iter().map(|model| model.totals.input).sum(),
             output: models.iter().map(|model| model.totals.output).sum(),
             cache_read: models.iter().map(|model| model.totals.cache_read).sum(),

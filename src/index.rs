@@ -12,6 +12,13 @@ use std::{
 use anyhow::{anyhow, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
+mod query;
+
+pub use query::{
+    list_projects, load_period_costs_scoped, load_usage_range_scoped,
+    load_usage_token_buckets_at_scoped,
+};
+
 const SCHEMA_VERSION: i64 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

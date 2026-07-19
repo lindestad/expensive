@@ -3107,6 +3107,7 @@ mod tests {
             totals: UsageTotals {
                 messages: 1,
                 cost: 1.0,
+                total: 10,
                 input: 1,
                 output: 2,
                 cache_read: 3,
@@ -3120,6 +3121,7 @@ mod tests {
                 totals: UsageTotals {
                     messages: 1,
                     cost: 0.5,
+                    total: 10,
                     input: 1,
                     output: 2,
                     cache_read: 3,
@@ -3738,6 +3740,9 @@ mod tests {
     fn test_config() -> Config {
         Config {
             db_path: PathBuf::from("/tmp/opencode.db"),
+            index_path: PathBuf::from("/tmp/expensive.sqlite3"),
+            codex_home: PathBuf::from("/tmp/codex"),
+            pi_sessions_root: PathBuf::from("/tmp/pi/sessions"),
             current_directory: PathBuf::from("/tmp/project"),
             config_path: Some(PathBuf::from("/tmp/expensive/config.toml")),
             daily_start: DailyStart::default(),
@@ -3761,6 +3766,7 @@ mod tests {
             totals: UsageTotals {
                 messages: 1,
                 cost: 2.5,
+                total: 10,
                 input: 1,
                 output: 2,
                 cache_read: 3,
@@ -3775,6 +3781,7 @@ mod tests {
             totals: UsageTotals {
                 messages: 1,
                 cost: 1.25,
+                total: 100,
                 input: 10,
                 output: 20,
                 cache_read: 30,
@@ -3791,6 +3798,7 @@ mod tests {
             totals: UsageTotals {
                 messages: 2,
                 cost: 3.75,
+                total: 110,
                 input: 11,
                 output: 22,
                 cache_read: 33,
@@ -3813,6 +3821,7 @@ mod tests {
                 totals: UsageTotals {
                     messages: 1,
                     cost: (count - idx) as f64,
+                    total: 100,
                     input: 10,
                     output: 20,
                     cache_read: 30,
@@ -3823,6 +3832,7 @@ mod tests {
         let totals = UsageTotals {
             messages: count as u64,
             cost: models.iter().map(|model| model.totals.cost).sum(),
+            total: count as u64 * 100,
             input: models.iter().map(|model| model.totals.input).sum(),
             output: models.iter().map(|model| model.totals.output).sum(),
             cache_read: models.iter().map(|model| model.totals.cache_read).sum(),

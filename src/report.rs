@@ -8,6 +8,7 @@ use crate::{
     analytics,
     config::{Config, ReportArgs},
     db::{ModelUsage, TokenBucket, UsageComparison, UsageStats, UsageTotals},
+    sources::{self, SyncMode},
     time_window::{self, CalendarScale, Mode},
 };
 
@@ -45,6 +46,10 @@ struct ModelIncrease {
 }
 
 pub fn run(config: &Config, args: &ReportArgs) -> Result<()> {
+    let sync = sources::sync_configured(config, SyncMode::Incremental)?;
+    if !sync.errors.is_empty() {
+        bail!("source refresh failed: {}", sync.errors.join("; "));
+    }
     let report = build_report(config, args)?;
     let output = if args.pretty {
         serde_json::to_string_pretty(&report)
@@ -96,7 +101,7 @@ fn json_report(config: &Config, stats: UsageStats) -> JsonReport {
         schema_version: 1,
         expensive_version: env!("CARGO_PKG_VERSION"),
         generated_at: stats.refreshed_at.to_rfc3339(),
-        database: config.db_path.display().to_string(),
+        database: config.index_path.display().to_string(),
         scope: config.scope.key(),
         current_directory: config.current_directory.display().to_string(),
         window: ReportWindow {
@@ -168,6 +173,7 @@ mod tests {
 
     use super::*;
     use crate::config::{ColorTheme, ModelAliases, ReportPeriod, Scope, ThemeScope};
+    use crate::sources::{opencode::OpenCodeSource, UsageSource};
     use crate::time_window::{DailyStart, WeekStart};
 
     #[test]
@@ -188,6 +194,9 @@ mod tests {
         drop(connection);
         let config = Config {
             db_path: file.path().to_path_buf(),
+            index_path: file.path().with_extension("index.sqlite3"),
+            codex_home: PathBuf::from("/tmp/codex"),
+            pi_sessions_root: PathBuf::from("/tmp/pi/sessions"),
             current_directory: PathBuf::from("/work/project-a"),
             config_path: None,
             daily_start: DailyStart::default(),
@@ -209,6 +218,11 @@ mod tests {
             to: None,
             pretty: false,
         };
+
+        let mut index = crate::index::UsageIndex::open(&config.index_path).unwrap();
+        OpenCodeSource::new(config.db_path.clone())
+            .sync(&mut index, SyncMode::Full)
+            .unwrap();
 
         let report = build_report(&config, &args).unwrap();
         let value = serde_json::to_value(report).unwrap();

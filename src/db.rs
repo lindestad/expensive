@@ -23,6 +23,9 @@ use crate::{
 pub struct UsageTotals {
     pub messages: u64,
     pub cost: f64,
+    /// Canonical source-reported total. This avoids double-counting token
+    /// categories such as Codex cached input, which is a subset of input.
+    pub total: u64,
     pub input: u64,
     pub output: u64,
     pub cache_read: u64,
@@ -31,12 +34,17 @@ pub struct UsageTotals {
 
 impl UsageTotals {
     pub fn total_tokens(&self) -> u64 {
-        self.input + self.output + self.cache_read + self.cache_write
+        if self.total == 0 {
+            self.input + self.output + self.cache_read + self.cache_write
+        } else {
+            self.total
+        }
     }
 
-    fn add_model(&mut self, model: &ModelUsage) {
+    pub(crate) fn add_model(&mut self, model: &ModelUsage) {
         self.messages += model.totals.messages;
         self.cost += model.totals.cost;
+        self.total += model.totals.total_tokens();
         self.input += model.totals.input;
         self.output += model.totals.output;
         self.cache_read += model.totals.cache_read;
@@ -415,13 +423,18 @@ fn load_model_usage(
         let provider: String = row.get("provider")?;
         let model_id: String = row.get("model_id")?;
         let variant: String = row.get("variant")?;
+        let input = read_u64(row, "input")?;
+        let output = read_u64(row, "output")?;
+        let cache_read = read_u64(row, "cache_read")?;
+        let cache_write = read_u64(row, "cache_write")?;
         let totals = UsageTotals {
             messages: read_u64(row, "messages")?,
             cost: row.get("cost")?,
-            input: read_u64(row, "input")?,
-            output: read_u64(row, "output")?,
-            cache_read: read_u64(row, "cache_read")?,
-            cache_write: read_u64(row, "cache_write")?,
+            total: input + output + cache_read + cache_write,
+            input,
+            output,
+            cache_read,
+            cache_write,
         };
 
         Ok(ModelUsage {

@@ -2,7 +2,10 @@
 
 use anyhow::Result;
 
-use crate::index::{IndexChange, SourceRegistration, UsageIndex};
+use crate::{
+    config::Config,
+    index::{IndexChange, SourceRegistration, UsageIndex},
+};
 
 pub mod codex;
 mod jsonl;
@@ -48,6 +51,59 @@ impl SyncReport {
 pub trait UsageSource {
     fn registration(&self) -> SourceRegistration;
     fn sync(&self, index: &mut UsageIndex, mode: SyncMode) -> Result<SyncReport>;
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SyncSummary {
+    pub reports: Vec<(String, SyncReport)>,
+    pub errors: Vec<String>,
+    pub generation_before: i64,
+    pub generation_after: i64,
+}
+
+impl SyncSummary {
+    pub fn changed(&self) -> bool {
+        self.generation_after != self.generation_before
+    }
+}
+
+pub fn sync_configured(config: &Config, mode: SyncMode) -> Result<SyncSummary> {
+    let mut index = UsageIndex::open(&config.index_path)?;
+    let generation_before = index.diagnostics()?.generation;
+    let mut sources: Vec<Box<dyn UsageSource>> = Vec::new();
+    if config.db_path.is_file() {
+        sources.push(Box::new(opencode::OpenCodeSource::new(
+            config.db_path.clone(),
+        )));
+    }
+    if config.codex_home.join("sessions").is_dir()
+        || config.codex_home.join("archived_sessions").is_dir()
+    {
+        sources.push(Box::new(codex::CodexSource::new(config.codex_home.clone())));
+    }
+    if config.pi_sessions_root.is_dir() {
+        sources.push(Box::new(pi::PiSource::new(config.pi_sessions_root.clone())));
+    }
+
+    let mut summary = SyncSummary {
+        generation_before,
+        ..SyncSummary::default()
+    };
+    for source in sources {
+        let registration = source.registration();
+        match source.sync(&mut index, mode) {
+            Ok(report) => summary.reports.push((registration.display_name, report)),
+            Err(error) => {
+                let message = format!("{}: {error:#}", registration.display_name);
+                if let Ok(source_id) = index.register_source(&registration) {
+                    let _ = index.mark_source_error(source_id, &message);
+                }
+                summary.errors.push(message);
+            }
+        }
+    }
+    summary.generation_after = index.diagnostics()?.generation;
+    Ok(summary)
 }
 
 pub(crate) fn event_key(namespace: &str, native_id: &str) -> Vec<u8> {
