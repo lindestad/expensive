@@ -3,8 +3,8 @@ use clap::Parser;
 
 use expensive::{
     app,
-    config::{self, Cli, CliCommand},
-    db,
+    config::{self, Cli, CliCommand, Config},
+    db, index,
 };
 
 fn main() -> Result<()> {
@@ -12,18 +12,51 @@ fn main() -> Result<()> {
     let command = cli.command.clone();
     let config = config::load(cli)?;
     match command {
-        Some(CliCommand::Doctor) => run_doctor(&config.db_path),
+        Some(CliCommand::Doctor) => run_doctor(&config),
         Some(CliCommand::Report(args)) => expensive::report::run(&config, &args),
         None => app::run(config),
     }
 }
 
-fn run_doctor(path: &std::path::Path) -> Result<()> {
-    let diagnostics = db::diagnose(path)?;
-    println!("database: {}", diagnostics.path);
-    println!("sqlite: {}", diagnostics.sqlite_version);
+fn run_doctor(config: &Config) -> Result<()> {
+    let index = index::UsageIndex::open(&config.index_path)?;
+    let index_diagnostics = index.diagnostics()?;
+    println!("usage index: {}", index_diagnostics.path.display());
+    println!("index sqlite: {}", index_diagnostics.sqlite_version);
+    println!("index schema: {}", index_diagnostics.schema_version);
+    println!("index generation: {}", index_diagnostics.generation);
+    println!("indexed sources: {}", index_diagnostics.sources);
+    println!("indexed artifacts: {}", index_diagnostics.artifacts);
+    println!("indexed events: {}", index_diagnostics.events);
+
+    let opencode_available = config.db_path.is_file();
     println!(
-        "json functions: {}",
+        "opencode source: {} ({})",
+        config.db_path.display(),
+        availability(opencode_available)
+    );
+    println!(
+        "codex source: {} ({})",
+        config.codex_home.display(),
+        availability(
+            config.codex_home.join("sessions").is_dir()
+                || config.codex_home.join("archived_sessions").is_dir()
+        )
+    );
+    println!(
+        "pi source: {} ({})",
+        config.pi_sessions_root.display(),
+        availability(config.pi_sessions_root.is_dir())
+    );
+
+    if !opencode_available {
+        return Ok(());
+    }
+
+    let diagnostics = db::diagnose(&config.db_path)?;
+    println!("opencode sqlite: {}", diagnostics.sqlite_version);
+    println!(
+        "opencode json functions: {}",
         if diagnostics.json_functions {
             "available"
         } else {
@@ -31,7 +64,7 @@ fn run_doctor(path: &std::path::Path) -> Result<()> {
         }
     );
     println!(
-        "usage schema: {}",
+        "opencode usage schema: {}",
         if diagnostics.is_compatible() {
             "compatible"
         } else {
@@ -39,10 +72,10 @@ fn run_doctor(path: &std::path::Path) -> Result<()> {
         }
     );
     if let Some(messages) = diagnostics.assistant_messages {
-        println!("assistant messages: {messages}");
+        println!("opencode assistant messages: {messages}");
     }
     println!(
-        "project scope: {}",
+        "opencode project scope: {}",
         if diagnostics.project_scope {
             "available"
         } else {
@@ -65,5 +98,13 @@ fn run_doctor(path: &std::path::Path) -> Result<()> {
             "database is incompatible: {}",
             diagnostics.errors.join("; ")
         )
+    }
+}
+
+fn availability(available: bool) -> &'static str {
+    if available {
+        "available"
+    } else {
+        "not found"
     }
 }
