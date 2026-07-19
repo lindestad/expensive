@@ -7,13 +7,13 @@
 use std::{
     env, fmt, fs,
     path::{Path, PathBuf},
-    process::Command,
+    process::Command as ProcessCommand,
     str::FromStr,
     time::Duration,
 };
 
 use anyhow::{anyhow, Context, Result};
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 use serde::Deserialize;
 
 use crate::time_window::{DailyStart, WeekStart};
@@ -146,7 +146,7 @@ impl FromStr for ThemeScope {
 #[derive(Debug, Parser)]
 #[command(author, version, about = "OpenCode token and cost dashboard")]
 pub struct Cli {
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", global = true)]
     pub db: Option<PathBuf>,
 
     #[arg(long, value_name = "HH:MM")]
@@ -169,6 +169,15 @@ pub struct Cli {
 
     #[arg(long, value_enum)]
     pub theme_scope: Option<ThemeScope>,
+
+    #[command(subcommand)]
+    pub command: Option<CliCommand>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Subcommand)]
+pub enum CliCommand {
+    /// Check database access, schema compatibility, and optional capabilities.
+    Doctor,
 }
 
 #[derive(Clone, Debug)]
@@ -337,7 +346,7 @@ fn discover_db_path(cli_path: Option<PathBuf>) -> PathBuf {
 }
 
 fn opencode_db_path() -> Option<PathBuf> {
-    let output = Command::new("opencode")
+    let output = ProcessCommand::new("opencode")
         .args(["db", "path"])
         .output()
         .ok()?;
@@ -370,6 +379,7 @@ mod tests {
             scope: None,
             color_theme: None,
             theme_scope: None,
+            command: None,
         }
     }
 

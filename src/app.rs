@@ -256,18 +256,25 @@ impl AppState {
         }
 
         let cutoff_millis = stats.cutoff_millis;
-        let refreshed_at = stats.refreshed_at;
+        let end_millis = stats.end_millis;
+        let snapshot_millis = stats.snapshot_millis;
         self.graph_loading.insert(mode);
 
         let tx = tx.clone();
         let config = self.config.clone();
         thread::spawn(move || {
-            let result = db::load_usage_token_buckets(&config.db_path, mode, cutoff_millis)
-                .map_err(|error| format!("{error:#}"));
+            let result = db::load_usage_token_buckets_at(
+                &config.db_path,
+                mode,
+                cutoff_millis,
+                end_millis,
+                snapshot_millis,
+            )
+            .map_err(|error| format!("{error:#}"));
             let _ = tx.send(RefreshMessage::DashboardGraph {
                 mode,
                 cutoff_millis,
-                refreshed_at,
+                snapshot_millis,
                 result,
             });
         });
@@ -419,22 +426,23 @@ impl AppState {
             return;
         }
 
-        let refreshed_at = stats.refreshed_at;
+        let snapshot_millis = stats.snapshot_millis;
         self.history_graph_loading.insert(period);
 
         let tx = tx.clone();
         let config = self.config.clone();
         thread::spawn(move || {
-            let result = db::load_usage_token_buckets_between(
+            let result = db::load_usage_token_buckets_at(
                 &config.db_path,
                 period.mode(),
-                period.start_millis,
-                period.end_millis,
+                Some(period.start_millis),
+                Some(period.end_millis),
+                snapshot_millis,
             )
             .map_err(|error| format!("{error:#}"));
             let _ = tx.send(RefreshMessage::HistoryGraph {
                 period,
-                refreshed_at,
+                snapshot_millis,
                 result,
             });
         });
@@ -482,7 +490,7 @@ impl AppState {
         &mut self,
         mode: Mode,
         cutoff_millis: Option<i64>,
-        refreshed_at: DateTime<Local>,
+        snapshot_millis: i64,
         result: std::result::Result<Vec<db::TokenBucket>, String>,
     ) -> bool {
         let placeholder_was_visible = self.view == View::Dashboard
@@ -496,7 +504,9 @@ impl AppState {
         let is_current_request = self
             .stats
             .get(&mode)
-            .map(|stats| stats.cutoff_millis == cutoff_millis && stats.refreshed_at == refreshed_at)
+            .map(|stats| {
+                stats.cutoff_millis == cutoff_millis && stats.snapshot_millis == snapshot_millis
+            })
             .unwrap_or(false);
         if !is_current_request {
             return false;
@@ -603,7 +613,7 @@ impl AppState {
     fn apply_history_graph_refresh(
         &mut self,
         period: PeriodKey,
-        refreshed_at: DateTime<Local>,
+        snapshot_millis: i64,
         result: std::result::Result<Vec<db::TokenBucket>, String>,
     ) -> bool {
         let placeholder_was_visible = self.view == View::CalendarDetail
@@ -617,7 +627,7 @@ impl AppState {
         let is_current_request = self
             .history_stats
             .get(&period)
-            .map(|stats| stats.refreshed_at == refreshed_at)
+            .map(|stats| stats.snapshot_millis == snapshot_millis)
             .unwrap_or(false);
         if !is_current_request {
             return false;
@@ -905,7 +915,7 @@ enum RefreshMessage {
     DashboardGraph {
         mode: Mode,
         cutoff_millis: Option<i64>,
-        refreshed_at: DateTime<Local>,
+        snapshot_millis: i64,
         result: std::result::Result<Vec<db::TokenBucket>, String>,
     },
     Calendar {
@@ -917,7 +927,7 @@ enum RefreshMessage {
     },
     HistoryGraph {
         period: PeriodKey,
-        refreshed_at: DateTime<Local>,
+        snapshot_millis: i64,
         result: std::result::Result<Vec<db::TokenBucket>, String>,
     },
 }
@@ -1250,11 +1260,11 @@ fn drain_refreshes(
             RefreshMessage::DashboardGraph {
                 mode,
                 cutoff_millis,
-                refreshed_at,
+                snapshot_millis,
                 result,
             } => {
                 needs_draw |=
-                    app.apply_dashboard_graph_refresh(mode, cutoff_millis, refreshed_at, result);
+                    app.apply_dashboard_graph_refresh(mode, cutoff_millis, snapshot_millis, result);
             }
             RefreshMessage::Calendar { result } => {
                 app.apply_calendar_refresh(result, tx);
@@ -1266,10 +1276,10 @@ fn drain_refreshes(
             }
             RefreshMessage::HistoryGraph {
                 period,
-                refreshed_at,
+                snapshot_millis,
                 result,
             } => {
-                needs_draw |= app.apply_history_graph_refresh(period, refreshed_at, result);
+                needs_draw |= app.apply_history_graph_refresh(period, snapshot_millis, result);
             }
         }
     }
@@ -1835,10 +1845,12 @@ mod tests {
         let previous = many_model_stats(Mode::Daily, 4);
         let previous_buckets = previous.token_buckets.clone();
         let previous_refreshed_at = previous.refreshed_at;
+        let previous_snapshot_millis = previous.snapshot_millis;
         app.stats.insert(Mode::Daily, previous);
 
         let mut summary = many_model_stats(Mode::Daily, 4);
         summary.refreshed_at = previous_refreshed_at + chrono::Duration::minutes(1);
+        summary.snapshot_millis = previous_snapshot_millis + 60_000;
         summary.token_buckets.clear();
         app.apply_dashboard_refresh(Mode::Daily, Ok(summary));
         app.graph_loading.insert(Mode::Daily);
@@ -1851,7 +1863,7 @@ mod tests {
         let changed = app.apply_dashboard_graph_refresh(
             Mode::Daily,
             None,
-            previous_refreshed_at,
+            previous_snapshot_millis,
             Ok(replacement),
         );
 
@@ -1866,7 +1878,7 @@ mod tests {
         let mut app = AppState::new(test_config(tempdir.path().join("config.toml"))).unwrap();
         let stats = many_model_stats(Mode::Daily, 4);
         let cutoff_millis = stats.cutoff_millis;
-        let refreshed_at = stats.refreshed_at;
+        let snapshot_millis = stats.snapshot_millis;
         let buckets = stats.token_buckets.clone();
         app.stats.insert(Mode::Daily, stats);
         app.graph_loading.insert(Mode::Daily);
@@ -1875,7 +1887,7 @@ mod tests {
         let changed = app.apply_dashboard_graph_refresh(
             Mode::Daily,
             cutoff_millis,
-            refreshed_at,
+            snapshot_millis,
             Ok(buckets),
         );
 
@@ -1957,6 +1969,7 @@ mod tests {
         UsageStats {
             mode,
             refreshed_at: Local.with_ymd_and_hms(2026, 6, 15, 10, 0, 0).unwrap(),
+            snapshot_millis: 1_750_000_000_000,
             cutoff_millis: None,
             end_millis: None,
             totals,

@@ -3246,6 +3246,7 @@ mod tests {
         UsageStats {
             mode,
             refreshed_at: Local.with_ymd_and_hms(2026, 6, 15, 10, 0, 0).unwrap(),
+            snapshot_millis: 1_750_000_000_000,
             cutoff_millis,
             end_millis: None,
             totals: UsageTotals {
@@ -3290,6 +3291,7 @@ mod tests {
         UsageStats {
             mode,
             refreshed_at: Local.with_ymd_and_hms(2026, 6, 15, 10, 0, 0).unwrap(),
+            snapshot_millis: 1_750_000_000_000,
             cutoff_millis: None,
             end_millis: None,
             totals,

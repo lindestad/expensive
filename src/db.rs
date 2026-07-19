@@ -4,9 +4,12 @@
 //! module reads those rows directly and produces the same cost/token categories
 //! the TUI displays, grouped by provider, model, and variant.
 
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Local};
 use rusqlite::{params, Connection, OpenFlags};
 
@@ -50,6 +53,8 @@ pub struct ModelUsage {
 pub struct UsageStats {
     pub mode: Mode,
     pub refreshed_at: DateTime<Local>,
+    /// Exclusive upper bound shared by summary and deferred graph queries.
+    pub snapshot_millis: i64,
     pub cutoff_millis: Option<i64>,
     pub end_millis: Option<i64>,
     pub totals: UsageTotals,
@@ -68,6 +73,24 @@ pub struct TokenBucket {
 pub struct PeriodCost {
     pub period: PeriodKey,
     pub cost: f64,
+}
+
+#[derive(Clone, Debug)]
+pub struct DatabaseDiagnostics {
+    pub path: String,
+    pub sqlite_version: String,
+    pub json_functions: bool,
+    pub assistant_messages: Option<u64>,
+    pub project_scope: bool,
+    pub opencode_versions: Vec<String>,
+    pub errors: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+impl DatabaseDiagnostics {
+    pub fn is_compatible(&self) -> bool {
+        self.errors.is_empty()
+    }
 }
 
 pub fn load_usage(path: &Path, mode: Mode, cutoff_millis: Option<i64>) -> Result<UsageStats> {
@@ -105,7 +128,7 @@ pub fn load_usage_token_buckets(
     mode: Mode,
     cutoff_millis: Option<i64>,
 ) -> Result<Vec<TokenBucket>> {
-    load_token_buckets_range(path, mode, cutoff_millis, None)
+    load_token_buckets_range(path, mode, cutoff_millis, None, snapshot_now())
 }
 
 pub fn load_usage_token_buckets_between(
@@ -114,7 +137,23 @@ pub fn load_usage_token_buckets_between(
     start_millis: i64,
     end_millis: i64,
 ) -> Result<Vec<TokenBucket>> {
-    load_token_buckets_range(path, mode, Some(start_millis), Some(end_millis))
+    load_token_buckets_range(
+        path,
+        mode,
+        Some(start_millis),
+        Some(end_millis),
+        snapshot_now(),
+    )
+}
+
+pub fn load_usage_token_buckets_at(
+    path: &Path,
+    mode: Mode,
+    start_millis: Option<i64>,
+    end_millis: Option<i64>,
+    snapshot_millis: i64,
+) -> Result<Vec<TokenBucket>> {
+    load_token_buckets_range(path, mode, start_millis, end_millis, snapshot_millis)
 }
 
 fn load_usage_range(
@@ -124,22 +163,28 @@ fn load_usage_range(
     end_millis: Option<i64>,
     include_token_buckets: bool,
 ) -> Result<UsageStats> {
-    let connection = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .with_context(|| format!("opening {}", path.display()))?;
+    let refreshed_at = Local::now();
+    let snapshot_millis = refreshed_at.timestamp_millis().saturating_add(1);
+    let query_end_millis = effective_end(end_millis, snapshot_millis);
+    let connection = open_database(path)?;
 
-    let (totals, models) = load_model_usage(&connection, start_millis, end_millis)?;
+    let (totals, models) = load_model_usage(&connection, start_millis, query_end_millis)?;
     let token_buckets = if include_token_buckets && totals.messages > 0 {
-        load_token_buckets(&connection, mode, start_millis, end_millis)?
+        load_token_buckets(
+            &connection,
+            mode,
+            start_millis,
+            end_millis,
+            query_end_millis,
+        )?
     } else {
         Vec::new()
     };
 
     Ok(UsageStats {
         mode,
-        refreshed_at: Local::now(),
+        refreshed_at,
+        snapshot_millis,
         cutoff_millis: start_millis,
         end_millis,
         totals,
@@ -153,14 +198,18 @@ fn load_token_buckets_range(
     mode: Mode,
     start_millis: Option<i64>,
     end_millis: Option<i64>,
+    snapshot_millis: i64,
 ) -> Result<Vec<TokenBucket>> {
-    let connection = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .with_context(|| format!("opening {}", path.display()))?;
+    let connection = open_database(path)?;
+    let query_end_millis = effective_end(end_millis, snapshot_millis);
 
-    load_token_buckets(&connection, mode, start_millis, end_millis)
+    load_token_buckets(
+        &connection,
+        mode,
+        start_millis,
+        end_millis,
+        query_end_millis,
+    )
 }
 
 fn load_model_usage(
@@ -226,15 +275,21 @@ fn load_token_buckets(
     connection: &Connection,
     mode: Mode,
     start_millis: Option<i64>,
-    end_millis: Option<i64>,
+    logical_end_millis: Option<i64>,
+    query_end_millis: Option<i64>,
 ) -> Result<Vec<TokenBucket>> {
-    let Some((range_start, last_time)) =
-        token_bucket_time_range(connection, mode, start_millis, end_millis)?
+    let Some((range_start, last_time)) = token_bucket_time_range(
+        connection,
+        mode,
+        start_millis,
+        logical_end_millis,
+        query_end_millis,
+    )?
     else {
         return Ok(Vec::new());
     };
     let span = token_bucket_span_millis(mode, range_start, last_time.max(range_start));
-    let range_end = token_bucket_range_end(mode, range_start, last_time, end_millis, span);
+    let range_end = token_bucket_range_end(mode, range_start, last_time, logical_end_millis, span);
     if span <= 0 || range_end <= range_start {
         return Ok(Vec::new());
     }
@@ -273,7 +328,7 @@ fn load_token_buckets(
     )?;
 
     let rows = statement.query_map(
-        params![start_millis, end_millis, range_start, span, range_end],
+        params![start_millis, query_end_millis, range_start, span, range_end],
         |row| {
             let bucket_idx: i64 = row.get("bucket_idx")?;
             let tokens = read_u64(row, "tokens")?;
@@ -298,15 +353,19 @@ fn token_bucket_time_range(
     connection: &Connection,
     mode: Mode,
     start_millis: Option<i64>,
-    end_millis: Option<i64>,
+    logical_end_millis: Option<i64>,
+    query_end_millis: Option<i64>,
 ) -> Result<Option<(i64, i64)>> {
     if matches!(mode, Mode::Daily | Mode::Weekly | Mode::Monthly) {
         if let Some(start_millis) = start_millis {
-            return Ok(Some((start_millis, end_millis.unwrap_or(start_millis))));
+            return Ok(Some((
+                start_millis,
+                logical_end_millis.unwrap_or(start_millis),
+            )));
         }
     }
 
-    usage_time_bounds(connection, start_millis, end_millis)
+    usage_time_bounds(connection, start_millis, query_end_millis)
 }
 
 fn usage_time_bounds(
@@ -405,11 +464,7 @@ pub fn load_period_costs(path: &Path, periods: &[PeriodKey]) -> Result<Vec<Perio
         .max()
         .expect("periods is not empty");
 
-    let connection = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .with_context(|| format!("opening {}", path.display()))?;
+    let connection = open_database(path)?;
 
     let mut statement = connection.prepare(
         r#"
@@ -456,6 +511,150 @@ pub fn load_period_costs(path: &Path, periods: &[PeriodKey]) -> Result<Vec<Perio
         .collect())
 }
 
+pub fn diagnose(path: &Path) -> Result<DatabaseDiagnostics> {
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("opening {}", path.display()))?;
+    let sqlite_version = connection
+        .query_row("SELECT sqlite_version()", [], |row| row.get(0))
+        .context("reading SQLite version")?;
+    let json_functions = connection
+        .query_row("SELECT json_valid('{\"ok\":true}')", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map(|value| value == 1)
+        .unwrap_or(false);
+    let message_columns = table_columns(&connection, "message")?;
+    let session_columns = table_columns(&connection, "session")?;
+    let project_columns = table_columns(&connection, "project")?;
+    let mut errors = usage_schema_errors(&message_columns, json_functions);
+    let mut warnings = Vec::new();
+
+    let assistant_messages = if errors.is_empty() {
+        match connection.query_row(
+            "SELECT COUNT(*) FROM message WHERE json_extract(data, '$.role') = 'assistant'",
+            [],
+            |row| read_u64(row, "COUNT(*)"),
+        ) {
+            Ok(count) => Some(count),
+            Err(error) => {
+                errors.push(format!("could not inspect assistant messages: {error}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    if message_columns.contains("data") && json_functions {
+        let invalid_json: u64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM message WHERE NOT json_valid(data)",
+                [],
+                |row| read_u64(row, "COUNT(*)"),
+            )
+            .unwrap_or(0);
+        if invalid_json > 0 {
+            warnings.push(format!("{invalid_json} message rows contain invalid JSON"));
+        }
+    }
+
+    let project_scope = ["id", "project_id"]
+        .iter()
+        .all(|column| session_columns.contains(*column))
+        && ["id", "worktree", "name"]
+            .iter()
+            .all(|column| project_columns.contains(*column))
+        && message_columns.contains("session_id");
+    if !project_scope {
+        warnings.push("project-scoped reports are unavailable for this schema".to_string());
+    }
+
+    let opencode_versions = if session_columns.contains("version") {
+        let mut statement = connection.prepare(
+            "SELECT DISTINCT version FROM session WHERE version IS NOT NULL AND version != '' ORDER BY version DESC LIMIT 5",
+        )?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        rows.filter_map(Result::ok).collect()
+    } else {
+        Vec::new()
+    };
+
+    Ok(DatabaseDiagnostics {
+        path: path.display().to_string(),
+        sqlite_version,
+        json_functions,
+        assistant_messages,
+        project_scope,
+        opencode_versions,
+        errors,
+        warnings,
+    })
+}
+
+fn open_database(path: &Path) -> Result<Connection> {
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("opening {}", path.display()))?;
+    validate_usage_schema(&connection)
+        .with_context(|| format!("checking OpenCode database schema in {}", path.display()))?;
+    Ok(connection)
+}
+
+fn validate_usage_schema(connection: &Connection) -> Result<()> {
+    let json_functions = connection
+        .query_row("SELECT json_valid('{}')", [], |row| row.get::<_, i64>(0))
+        .map(|value| value == 1)
+        .unwrap_or(false);
+    let message_columns = table_columns(connection, "message")?;
+    let errors = usage_schema_errors(&message_columns, json_functions);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow!(errors.join("; ")))
+    }
+}
+
+fn usage_schema_errors(message_columns: &HashSet<String>, json_functions: bool) -> Vec<String> {
+    let mut errors = Vec::new();
+    if message_columns.is_empty() {
+        errors.push("missing message table".to_string());
+    } else {
+        for column in ["data", "time_created"] {
+            if !message_columns.contains(column) {
+                errors.push(format!("message table is missing {column} column"));
+            }
+        }
+    }
+    if !json_functions {
+        errors.push("SQLite JSON functions are unavailable".to_string());
+    }
+    errors
+}
+
+fn table_columns(connection: &Connection, table: &str) -> Result<HashSet<String>> {
+    let mut statement = connection.prepare("SELECT name FROM pragma_table_info(?1)")?;
+    let rows = statement.query_map([table], |row| row.get::<_, String>(0))?;
+    rows.collect::<rusqlite::Result<HashSet<_>>>()
+        .context("reading database schema")
+}
+
+fn snapshot_now() -> i64 {
+    Local::now().timestamp_millis().saturating_add(1)
+}
+
+fn effective_end(end_millis: Option<i64>, snapshot_millis: i64) -> Option<i64> {
+    Some(
+        end_millis
+            .map(|end| end.min(snapshot_millis))
+            .unwrap_or(snapshot_millis),
+    )
+}
+
 fn read_u64(row: &rusqlite::Row<'_>, name: &str) -> rusqlite::Result<u64> {
     let value: i64 = row.get(name)?;
     Ok(value.max(0) as u64)
@@ -494,6 +693,57 @@ mod tests {
     use crate::time_window::CalendarScale;
     use rusqlite::Connection;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn recognizes_supported_opencode_fixture() {
+        let file = NamedTempFile::new().unwrap();
+        let connection = Connection::open(file.path()).unwrap();
+        connection
+            .execute_batch(include_str!("../tests/fixtures/opencode.sql"))
+            .unwrap();
+        drop(connection);
+
+        let diagnostics = diagnose(file.path()).unwrap();
+
+        assert!(diagnostics.is_compatible());
+        assert!(diagnostics.json_functions);
+        assert!(diagnostics.project_scope);
+        assert_eq!(diagnostics.assistant_messages, Some(1));
+        assert_eq!(diagnostics.opencode_versions, vec!["1.2.3"]);
+    }
+
+    #[test]
+    fn deferred_graph_uses_summary_snapshot_upper_bound() {
+        let file = NamedTempFile::new().unwrap();
+        let connection = Connection::open(file.path()).unwrap();
+        create_message_table(&connection);
+        let before_snapshot = snapshot_now() - 1_000;
+        insert_usage_message(&connection, "initial", before_snapshot, "m", 1.0);
+        drop(connection);
+
+        let stats = load_usage_summary(file.path(), Mode::AllTime, None).unwrap();
+        let connection = Connection::open(file.path()).unwrap();
+        insert_usage_message(
+            &connection,
+            "after-summary",
+            stats.snapshot_millis,
+            "m",
+            1.0,
+        );
+        drop(connection);
+
+        let buckets = load_usage_token_buckets_at(
+            file.path(),
+            Mode::AllTime,
+            None,
+            None,
+            stats.snapshot_millis,
+        )
+        .unwrap();
+
+        assert_eq!(stats.totals.total_tokens(), 4);
+        assert_eq!(buckets.iter().map(|bucket| bucket.tokens).sum::<u64>(), 4);
+    }
 
     #[test]
     fn aggregates_assistant_messages_by_model_and_variant() {
