@@ -285,6 +285,9 @@ pub fn draw(frame: &mut Frame<'_>, app: &AppState) {
     if app.show_help {
         draw_help(frame, area, app, palette);
     }
+    if app.scope_picker.is_some() {
+        draw_scope_picker(frame, area, app, palette);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -427,6 +430,84 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &AppState, palette: Palette
     frame.render_widget(paragraph, inner);
 }
 
+fn draw_scope_picker(frame: &mut Frame<'_>, area: Rect, app: &AppState, palette: Palette) {
+    let Some(picker) = &app.scope_picker else {
+        return;
+    };
+    let option_count = app.projects.len().saturating_add(2);
+    let modal = centered_rect(area, 88, (option_count.saturating_add(4) as u16).min(24));
+    frame.render_widget(Clear, modal);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Project scope ")
+        .title_alignment(Alignment::Center)
+        .title_style(
+            Style::default()
+                .fg(palette.title)
+                .add_modifier(Modifier::BOLD),
+        )
+        .border_style(Style::default().fg(palette.border));
+    let inner = modal.inner(Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    frame.render_widget(block, modal);
+
+    let visible_options = inner.height.saturating_sub(2) as usize;
+    let scroll = picker
+        .selection
+        .saturating_add(1)
+        .saturating_sub(visible_options)
+        .min(option_count.saturating_sub(visible_options));
+    let mut options = vec![
+        (
+            "All projects".to_string(),
+            "aggregate every OpenCode project".to_string(),
+        ),
+        (
+            "Current directory".to_string(),
+            app.config.current_directory.display().to_string(),
+        ),
+    ];
+    options.extend(
+        app.projects
+            .iter()
+            .map(|project| (project.name.clone(), project.worktree.clone())),
+    );
+    let mut lines = options
+        .into_iter()
+        .enumerate()
+        .skip(scroll)
+        .take(visible_options)
+        .map(|(index, (label, detail))| {
+            let selected = index == picker.selection;
+            let marker = if selected { ">" } else { " " };
+            let style = if selected {
+                Style::default()
+                    .fg(palette.calendar_accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(palette.text)
+            };
+            Line::from(vec![
+                Span::styled(format!("{marker} {label}"), style),
+                Span::styled(format!("  {detail}"), Style::default().fg(palette.muted)),
+            ])
+        })
+        .collect::<Vec<_>>();
+    lines.push(Line::from(""));
+    lines.push(
+        Line::from(vec![
+            key_span(" Enter ", palette),
+            Span::styled(" select  ", Style::default().fg(palette.muted)),
+            key_span(" Esc ", palette),
+            Span::styled(" cancel", Style::default().fg(palette.muted)),
+        ])
+        .alignment(Alignment::Center),
+    );
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
 pub fn help_layout_state(area: Rect, app: &AppState) -> HelpLayoutState {
     let inner = help_inner_area(area);
     let document = help_document(app, active_palette(app), inner.width as usize, false);
@@ -525,7 +606,7 @@ fn help_inner_area(area: Rect) -> Rect {
     })
 }
 
-fn control_help_bindings() -> [HelpBinding; 7] {
+fn control_help_bindings() -> [HelpBinding; 8] {
     [
         HelpBinding {
             key: "Tab / Shift+Tab",
@@ -550,6 +631,10 @@ fn control_help_bindings() -> [HelpBinding; 7] {
         HelpBinding {
             key: "r",
             description: "refresh current view",
+        },
+        HelpBinding {
+            key: "p",
+            description: "choose project scope",
         },
         HelpBinding {
             key: "q",
@@ -2339,7 +2424,11 @@ fn dashboard_status(app: &AppState) -> String {
         format!("error: {error}")
     } else if let Some(stats) = app.current_stats() {
         let cutoff = cutoff_label(stats);
-        format!("{} | {cutoff}", format::timestamp(stats.refreshed_at))
+        format!(
+            "{} | {cutoff} | {}",
+            format::timestamp(stats.refreshed_at),
+            app.scope_label()
+        )
     } else if app.is_current_loading() {
         "loading".to_string()
     } else {
@@ -2364,8 +2453,9 @@ fn calendar_status(app: &AppState) -> String {
         "loading calendar".to_string()
     } else {
         format!(
-            "selected {}",
-            detail_period_label(app.calendar.selected, app.config.week_start)
+            "selected {} | {}",
+            detail_period_label(app.calendar.selected, app.config.week_start),
+            app.scope_label()
         )
     }
 }
@@ -2385,7 +2475,11 @@ fn history_status(app: &AppState) -> String {
         format!("error: {error}")
     } else if let Some(stats) = app.selected_history_stats() {
         let cutoff = cutoff_label(stats);
-        format!("{} | {cutoff}", format::timestamp(stats.refreshed_at))
+        format!(
+            "{} | {cutoff} | {}",
+            format::timestamp(stats.refreshed_at),
+            app.scope_label()
+        )
     } else if app.is_selected_history_loading() {
         "loading".to_string()
     } else {
@@ -2898,6 +2992,25 @@ mod tests {
     }
 
     #[test]
+    fn renders_project_scope_picker() {
+        let mut app = app_loading(Mode::Daily);
+        app.projects = vec![crate::db::ProjectInfo {
+            id: "project-a".to_string(),
+            name: "Project A".to_string(),
+            worktree: "/work/project-a".to_string(),
+        }];
+        app.scope_picker = Some(crate::app::ScopePickerState { selection: 2 });
+
+        let output = render(&app, 100, 24);
+
+        assert!(output.contains("Project scope"));
+        assert!(output.contains("All projects"));
+        assert!(output.contains("Current directory"));
+        assert!(output.contains("Project A"));
+        assert!(output.contains("/work/project-a"));
+    }
+
+    #[test]
     fn aligns_help_binding_descriptions_to_one_column() {
         let mut app = app_loading(Mode::Daily);
         app.show_help = true;
@@ -3078,6 +3191,8 @@ mod tests {
             config: test_config(),
             view: View::Dashboard,
             show_help: false,
+            scope_picker: None,
+            projects: Vec::new(),
             help_scroll: 0,
             dashboard_model_scroll: 0,
             history_model_scroll: 0,
@@ -3102,6 +3217,7 @@ mod tests {
             error: None,
             last_refresh_started: None,
             next_refresh_due: Instant::now() + Duration::from_secs(60),
+            request_generation: 0,
         }
     }
 
@@ -3110,6 +3226,8 @@ mod tests {
             config: test_config(),
             view: View::Dashboard,
             show_help: false,
+            scope_picker: None,
+            projects: Vec::new(),
             help_scroll: 0,
             dashboard_model_scroll: 0,
             history_model_scroll: 0,
@@ -3134,6 +3252,7 @@ mod tests {
             error: None,
             last_refresh_started: None,
             next_refresh_due: Instant::now() + Duration::from_secs(60),
+            request_generation: 0,
         }
     }
 
@@ -3142,6 +3261,8 @@ mod tests {
             config: test_config(),
             view: View::CalendarOverview,
             show_help: false,
+            scope_picker: None,
+            projects: Vec::new(),
             help_scroll: 0,
             dashboard_model_scroll: 0,
             history_model_scroll: 0,
@@ -3175,6 +3296,7 @@ mod tests {
             error: None,
             last_refresh_started: None,
             next_refresh_due: Instant::now() + Duration::from_secs(60),
+            request_generation: 0,
         }
     }
 
@@ -3202,6 +3324,7 @@ mod tests {
     fn test_config() -> Config {
         Config {
             db_path: PathBuf::from("/tmp/opencode.db"),
+            current_directory: PathBuf::from("/tmp/project"),
             config_path: Some(PathBuf::from("/tmp/expensive/config.toml")),
             daily_start: DailyStart::default(),
             week_start: WeekStart::default(),

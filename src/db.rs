@@ -13,7 +13,10 @@ use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Local};
 use rusqlite::{params, Connection, OpenFlags};
 
-use crate::time_window::{Mode, PeriodKey};
+use crate::{
+    config::Scope,
+    time_window::{Mode, PeriodKey},
+};
 
 #[derive(Clone, Debug, Default)]
 pub struct UsageTotals {
@@ -75,6 +78,19 @@ pub struct PeriodCost {
     pub cost: f64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectInfo {
+    pub id: String,
+    pub name: String,
+    pub worktree: String,
+}
+
+#[derive(Clone, Copy)]
+struct ScopeContext<'a> {
+    scope: &'a Scope,
+    current_directory: &'a Path,
+}
+
 #[derive(Clone, Debug)]
 pub struct DatabaseDiagnostics {
     pub path: String,
@@ -94,7 +110,7 @@ impl DatabaseDiagnostics {
 }
 
 pub fn load_usage(path: &Path, mode: Mode, cutoff_millis: Option<i64>) -> Result<UsageStats> {
-    load_usage_range(path, mode, cutoff_millis, None, true)
+    load_usage_range(path, mode, cutoff_millis, None, true, None)
 }
 
 pub fn load_usage_summary(
@@ -102,7 +118,27 @@ pub fn load_usage_summary(
     mode: Mode,
     cutoff_millis: Option<i64>,
 ) -> Result<UsageStats> {
-    load_usage_range(path, mode, cutoff_millis, None, false)
+    load_usage_range(path, mode, cutoff_millis, None, false, None)
+}
+
+pub fn load_usage_summary_scoped(
+    path: &Path,
+    mode: Mode,
+    cutoff_millis: Option<i64>,
+    scope: &Scope,
+    current_directory: &Path,
+) -> Result<UsageStats> {
+    load_usage_range(
+        path,
+        mode,
+        cutoff_millis,
+        None,
+        false,
+        Some(ScopeContext {
+            scope,
+            current_directory,
+        }),
+    )
 }
 
 pub fn load_usage_between(
@@ -111,7 +147,7 @@ pub fn load_usage_between(
     start_millis: i64,
     end_millis: i64,
 ) -> Result<UsageStats> {
-    load_usage_range(path, mode, Some(start_millis), Some(end_millis), true)
+    load_usage_range(path, mode, Some(start_millis), Some(end_millis), true, None)
 }
 
 pub fn load_usage_summary_between(
@@ -120,7 +156,35 @@ pub fn load_usage_summary_between(
     start_millis: i64,
     end_millis: i64,
 ) -> Result<UsageStats> {
-    load_usage_range(path, mode, Some(start_millis), Some(end_millis), false)
+    load_usage_range(
+        path,
+        mode,
+        Some(start_millis),
+        Some(end_millis),
+        false,
+        None,
+    )
+}
+
+pub fn load_usage_summary_between_scoped(
+    path: &Path,
+    mode: Mode,
+    start_millis: i64,
+    end_millis: i64,
+    scope: &Scope,
+    current_directory: &Path,
+) -> Result<UsageStats> {
+    load_usage_range(
+        path,
+        mode,
+        Some(start_millis),
+        Some(end_millis),
+        false,
+        Some(ScopeContext {
+            scope,
+            current_directory,
+        }),
+    )
 }
 
 pub fn load_usage_token_buckets(
@@ -128,7 +192,7 @@ pub fn load_usage_token_buckets(
     mode: Mode,
     cutoff_millis: Option<i64>,
 ) -> Result<Vec<TokenBucket>> {
-    load_token_buckets_range(path, mode, cutoff_millis, None, snapshot_now())
+    load_token_buckets_range(path, mode, cutoff_millis, None, snapshot_now(), None)
 }
 
 pub fn load_usage_token_buckets_between(
@@ -143,6 +207,7 @@ pub fn load_usage_token_buckets_between(
         Some(start_millis),
         Some(end_millis),
         snapshot_now(),
+        None,
     )
 }
 
@@ -153,7 +218,29 @@ pub fn load_usage_token_buckets_at(
     end_millis: Option<i64>,
     snapshot_millis: i64,
 ) -> Result<Vec<TokenBucket>> {
-    load_token_buckets_range(path, mode, start_millis, end_millis, snapshot_millis)
+    load_token_buckets_range(path, mode, start_millis, end_millis, snapshot_millis, None)
+}
+
+pub fn load_usage_token_buckets_at_scoped(
+    path: &Path,
+    mode: Mode,
+    start_millis: Option<i64>,
+    end_millis: Option<i64>,
+    snapshot_millis: i64,
+    scope: &Scope,
+    current_directory: &Path,
+) -> Result<Vec<TokenBucket>> {
+    load_token_buckets_range(
+        path,
+        mode,
+        start_millis,
+        end_millis,
+        snapshot_millis,
+        Some(ScopeContext {
+            scope,
+            current_directory,
+        }),
+    )
 }
 
 fn load_usage_range(
@@ -162,13 +249,20 @@ fn load_usage_range(
     start_millis: Option<i64>,
     end_millis: Option<i64>,
     include_token_buckets: bool,
+    scope: Option<ScopeContext<'_>>,
 ) -> Result<UsageStats> {
     let refreshed_at = Local::now();
     let snapshot_millis = refreshed_at.timestamp_millis().saturating_add(1);
     let query_end_millis = effective_end(end_millis, snapshot_millis);
     let connection = open_database(path)?;
+    let project_id = resolve_scope(&connection, scope)?;
 
-    let (totals, models) = load_model_usage(&connection, start_millis, query_end_millis)?;
+    let (totals, models) = load_model_usage(
+        &connection,
+        start_millis,
+        query_end_millis,
+        project_id.as_deref(),
+    )?;
     let token_buckets = if include_token_buckets && totals.messages > 0 {
         load_token_buckets(
             &connection,
@@ -176,6 +270,7 @@ fn load_usage_range(
             start_millis,
             end_millis,
             query_end_millis,
+            project_id.as_deref(),
         )?
     } else {
         Vec::new()
@@ -199,9 +294,11 @@ fn load_token_buckets_range(
     start_millis: Option<i64>,
     end_millis: Option<i64>,
     snapshot_millis: i64,
+    scope: Option<ScopeContext<'_>>,
 ) -> Result<Vec<TokenBucket>> {
     let connection = open_database(path)?;
     let query_end_millis = effective_end(end_millis, snapshot_millis);
+    let project_id = resolve_scope(&connection, scope)?;
 
     load_token_buckets(
         &connection,
@@ -209,6 +306,7 @@ fn load_token_buckets_range(
         start_millis,
         end_millis,
         query_end_millis,
+        project_id.as_deref(),
     )
 }
 
@@ -216,6 +314,7 @@ fn load_model_usage(
     connection: &Connection,
     start_millis: Option<i64>,
     end_millis: Option<i64>,
+    project_id: Option<&str>,
 ) -> Result<(UsageTotals, Vec<ModelUsage>)> {
     let mut statement = connection.prepare(
         r#"
@@ -233,12 +332,17 @@ fn load_model_usage(
         WHERE json_extract(data, '$.role') = 'assistant'
             AND (?1 IS NULL OR time_created >= ?1)
             AND (?2 IS NULL OR time_created < ?2)
+            AND (?3 IS NULL OR EXISTS (
+                SELECT 1 FROM session
+                WHERE session.id = message.session_id
+                    AND session.project_id = ?3
+            ))
         GROUP BY provider, model_id, variant
         ORDER BY cost DESC
         "#,
     )?;
 
-    let rows = statement.query_map(params![start_millis, end_millis], |row| {
+    let rows = statement.query_map(params![start_millis, end_millis, project_id], |row| {
         let provider: String = row.get("provider")?;
         let model_id: String = row.get("model_id")?;
         let variant: String = row.get("variant")?;
@@ -277,6 +381,7 @@ fn load_token_buckets(
     start_millis: Option<i64>,
     logical_end_millis: Option<i64>,
     query_end_millis: Option<i64>,
+    project_id: Option<&str>,
 ) -> Result<Vec<TokenBucket>> {
     let Some((range_start, last_time)) = token_bucket_time_range(
         connection,
@@ -284,6 +389,7 @@ fn load_token_buckets(
         start_millis,
         logical_end_millis,
         query_end_millis,
+        project_id,
     )?
     else {
         return Ok(Vec::new());
@@ -309,7 +415,7 @@ fn load_token_buckets(
     let mut statement = connection.prepare(
         r#"
         SELECT
-            (time_created - ?3) / ?4 AS bucket_idx,
+            (time_created - ?4) / ?5 AS bucket_idx,
             COALESCE(SUM(
                 COALESCE(json_extract(data, '$.tokens.input'), 0)
                 + COALESCE(json_extract(data, '$.tokens.output'), 0)
@@ -320,15 +426,27 @@ fn load_token_buckets(
         WHERE json_extract(data, '$.role') = 'assistant'
             AND (?1 IS NULL OR time_created >= ?1)
             AND (?2 IS NULL OR time_created < ?2)
-            AND time_created >= ?3
-            AND time_created < ?5
+            AND (?3 IS NULL OR EXISTS (
+                SELECT 1 FROM session
+                WHERE session.id = message.session_id
+                    AND session.project_id = ?3
+            ))
+            AND time_created >= ?4
+            AND time_created < ?6
         GROUP BY bucket_idx
         ORDER BY bucket_idx ASC
         "#,
     )?;
 
     let rows = statement.query_map(
-        params![start_millis, query_end_millis, range_start, span, range_end],
+        params![
+            start_millis,
+            query_end_millis,
+            project_id,
+            range_start,
+            span,
+            range_end
+        ],
         |row| {
             let bucket_idx: i64 = row.get("bucket_idx")?;
             let tokens = read_u64(row, "tokens")?;
@@ -355,6 +473,7 @@ fn token_bucket_time_range(
     start_millis: Option<i64>,
     logical_end_millis: Option<i64>,
     query_end_millis: Option<i64>,
+    project_id: Option<&str>,
 ) -> Result<Option<(i64, i64)>> {
     if matches!(mode, Mode::Daily | Mode::Weekly | Mode::Monthly) {
         if let Some(start_millis) = start_millis {
@@ -365,13 +484,14 @@ fn token_bucket_time_range(
         }
     }
 
-    usage_time_bounds(connection, start_millis, query_end_millis)
+    usage_time_bounds(connection, start_millis, query_end_millis, project_id)
 }
 
 fn usage_time_bounds(
     connection: &Connection,
     start_millis: Option<i64>,
     end_millis: Option<i64>,
+    project_id: Option<&str>,
 ) -> Result<Option<(i64, i64)>> {
     let mut statement = connection.prepare(
         r#"
@@ -382,10 +502,15 @@ fn usage_time_bounds(
         WHERE json_extract(data, '$.role') = 'assistant'
             AND (?1 IS NULL OR time_created >= ?1)
             AND (?2 IS NULL OR time_created < ?2)
+            AND (?3 IS NULL OR EXISTS (
+                SELECT 1 FROM session
+                WHERE session.id = message.session_id
+                    AND session.project_id = ?3
+            ))
         "#,
     )?;
 
-    let bounds = statement.query_row(params![start_millis, end_millis], |row| {
+    let bounds = statement.query_row(params![start_millis, end_millis, project_id], |row| {
         let first_time: Option<i64> = row.get("first_time")?;
         let last_time: Option<i64> = row.get("last_time")?;
         Ok(first_time.zip(last_time))
@@ -449,6 +574,30 @@ fn token_bucket_range_end(
 }
 
 pub fn load_period_costs(path: &Path, periods: &[PeriodKey]) -> Result<Vec<PeriodCost>> {
+    load_period_costs_with_scope(path, periods, None)
+}
+
+pub fn load_period_costs_scoped(
+    path: &Path,
+    periods: &[PeriodKey],
+    scope: &Scope,
+    current_directory: &Path,
+) -> Result<Vec<PeriodCost>> {
+    load_period_costs_with_scope(
+        path,
+        periods,
+        Some(ScopeContext {
+            scope,
+            current_directory,
+        }),
+    )
+}
+
+fn load_period_costs_with_scope(
+    path: &Path,
+    periods: &[PeriodKey],
+    scope: Option<ScopeContext<'_>>,
+) -> Result<Vec<PeriodCost>> {
     if periods.is_empty() {
         return Ok(Vec::new());
     }
@@ -465,6 +614,7 @@ pub fn load_period_costs(path: &Path, periods: &[PeriodKey]) -> Result<Vec<Perio
         .expect("periods is not empty");
 
     let connection = open_database(path)?;
+    let project_id = resolve_scope(&connection, scope)?;
 
     let mut statement = connection.prepare(
         r#"
@@ -475,6 +625,11 @@ pub fn load_period_costs(path: &Path, periods: &[PeriodKey]) -> Result<Vec<Perio
         WHERE json_extract(data, '$.role') = 'assistant'
             AND time_created >= ?1
             AND time_created < ?2
+            AND (?3 IS NULL OR EXISTS (
+                SELECT 1 FROM session
+                WHERE session.id = message.session_id
+                    AND session.project_id = ?3
+            ))
         "#,
     )?;
 
@@ -484,7 +639,7 @@ pub fn load_period_costs(path: &Path, periods: &[PeriodKey]) -> Result<Vec<Perio
         .map(|period| (period, 0.0))
         .collect::<HashMap<_, _>>();
 
-    let rows = statement.query_map(params![start_millis, end_millis], |row| {
+    let rows = statement.query_map(params![start_millis, end_millis, project_id], |row| {
         let time_created: i64 = row.get("time_created")?;
         let cost: f64 = row.get("cost")?;
         Ok((time_created, cost))
@@ -511,6 +666,103 @@ pub fn load_period_costs(path: &Path, periods: &[PeriodKey]) -> Result<Vec<Perio
         .collect())
 }
 
+pub fn list_projects(path: &Path) -> Result<Vec<ProjectInfo>> {
+    let connection = open_database(path)?;
+    query_projects(&connection)
+}
+
+pub fn project_for_directory(path: &Path, directory: &Path) -> Result<Option<ProjectInfo>> {
+    let projects = list_projects(path)?;
+    Ok(find_project_for_directory(&projects, directory).cloned())
+}
+
+fn resolve_scope(
+    connection: &Connection,
+    scope: Option<ScopeContext<'_>>,
+) -> Result<Option<String>> {
+    let Some(scope) = scope else {
+        return Ok(None);
+    };
+    match scope.scope {
+        Scope::All => Ok(None),
+        Scope::Project(id) => {
+            let exists = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM project WHERE id = ?1)",
+                [id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if exists {
+                Ok(Some(id.clone()))
+            } else {
+                Err(anyhow!(
+                    "configured OpenCode project {id:?} no longer exists"
+                ))
+            }
+        }
+        Scope::Current => {
+            let projects = query_projects(connection)?;
+            find_project_for_directory(&projects, scope.current_directory)
+                .map(|project| Some(project.id.clone()))
+                .ok_or_else(|| {
+                    anyhow!(
+                        "no OpenCode project matches current directory {}",
+                        scope.current_directory.display()
+                    )
+                })
+        }
+    }
+}
+
+fn query_projects(connection: &Connection) -> Result<Vec<ProjectInfo>> {
+    let session_columns = table_columns(connection, "session")?;
+    let project_columns = table_columns(connection, "project")?;
+    let project_scope = ["id", "project_id"]
+        .iter()
+        .all(|column| session_columns.contains(*column))
+        && ["id", "worktree", "name"]
+            .iter()
+            .all(|column| project_columns.contains(*column));
+    if !project_scope {
+        return Err(anyhow!(
+            "OpenCode database schema does not support project scoping"
+        ));
+    }
+
+    let mut statement = connection.prepare(
+        "SELECT id, COALESCE(NULLIF(name, ''), id), worktree FROM project ORDER BY name COLLATE NOCASE, worktree COLLATE NOCASE",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok(ProjectInfo {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            worktree: row.get(2)?,
+        })
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("listing OpenCode projects")
+}
+
+fn find_project_for_directory<'a>(
+    projects: &'a [ProjectInfo],
+    directory: &Path,
+) -> Option<&'a ProjectInfo> {
+    let directory = comparable_path(directory);
+    projects
+        .iter()
+        .filter_map(|project| {
+            let worktree = comparable_path(Path::new(&project.worktree));
+            directory
+                .starts_with(&worktree)
+                .then_some((worktree.components().count(), project))
+        })
+        .max_by_key(|(depth, _)| *depth)
+        .map(|(_, project)| project)
+}
+
+fn comparable_path(path: &Path) -> std::path::PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
 pub fn diagnose(path: &Path) -> Result<DatabaseDiagnostics> {
     let connection = Connection::open_with_flags(
         path,
@@ -529,7 +781,7 @@ pub fn diagnose(path: &Path) -> Result<DatabaseDiagnostics> {
     let message_columns = table_columns(&connection, "message")?;
     let session_columns = table_columns(&connection, "session")?;
     let project_columns = table_columns(&connection, "project")?;
-    let mut errors = usage_schema_errors(&message_columns, json_functions);
+    let mut errors = usage_schema_errors(&message_columns, &session_columns, json_functions);
     let mut warnings = Vec::new();
 
     let assistant_messages = if errors.is_empty() {
@@ -611,7 +863,8 @@ fn validate_usage_schema(connection: &Connection) -> Result<()> {
         .map(|value| value == 1)
         .unwrap_or(false);
     let message_columns = table_columns(connection, "message")?;
-    let errors = usage_schema_errors(&message_columns, json_functions);
+    let session_columns = table_columns(connection, "session")?;
+    let errors = usage_schema_errors(&message_columns, &session_columns, json_functions);
     if errors.is_empty() {
         Ok(())
     } else {
@@ -619,7 +872,11 @@ fn validate_usage_schema(connection: &Connection) -> Result<()> {
     }
 }
 
-fn usage_schema_errors(message_columns: &HashSet<String>, json_functions: bool) -> Vec<String> {
+fn usage_schema_errors(
+    message_columns: &HashSet<String>,
+    session_columns: &HashSet<String>,
+    json_functions: bool,
+) -> Vec<String> {
     let mut errors = Vec::new();
     if message_columns.is_empty() {
         errors.push("missing message table".to_string());
@@ -627,6 +884,15 @@ fn usage_schema_errors(message_columns: &HashSet<String>, json_functions: bool) 
         for column in ["data", "time_created"] {
             if !message_columns.contains(column) {
                 errors.push(format!("message table is missing {column} column"));
+            }
+        }
+    }
+    if session_columns.is_empty() {
+        errors.push("missing session table".to_string());
+    } else {
+        for column in ["id", "project_id"] {
+            if !session_columns.contains(column) {
+                errors.push(format!("session table is missing {column} column"));
             }
         }
     }
@@ -713,6 +979,78 @@ mod tests {
     }
 
     #[test]
+    fn scopes_usage_to_selected_or_current_project() {
+        let file = NamedTempFile::new().unwrap();
+        let connection = Connection::open(file.path()).unwrap();
+        connection
+            .execute_batch(include_str!("../tests/fixtures/opencode.sql"))
+            .unwrap();
+        connection
+            .execute_batch(
+                r#"
+                INSERT INTO project (id, worktree, name)
+                VALUES ('project-b', '/work/project-b', 'Project B');
+                INSERT INTO session (id, project_id, directory, title, version)
+                VALUES ('session-b', 'project-b', '/work/project-b', 'Other', '1.2.3');
+                INSERT INTO message (id, session_id, time_created, time_updated, data)
+                VALUES (
+                    'assistant-b',
+                    'session-b',
+                    1500,
+                    1500,
+                    '{"role":"assistant","cost":3.5,"tokens":{"input":1,"output":1,"cache":{"read":1,"write":1}},"modelID":"other","providerID":"provider"}'
+                );
+                "#,
+            )
+            .unwrap();
+        drop(connection);
+
+        let selected = load_usage_summary_scoped(
+            file.path(),
+            Mode::AllTime,
+            None,
+            &Scope::Project("project-a".to_string()),
+            Path::new("/elsewhere"),
+        )
+        .unwrap();
+        let current = load_usage_summary_scoped(
+            file.path(),
+            Mode::AllTime,
+            None,
+            &Scope::Current,
+            Path::new("/work/project-b/src"),
+        )
+        .unwrap();
+
+        assert_eq!(selected.totals.messages, 1);
+        assert!((selected.totals.cost - 1.25).abs() < f64::EPSILON);
+        assert_eq!(current.totals.messages, 1);
+        assert!((current.totals.cost - 3.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn current_scope_prefers_the_deepest_matching_worktree() {
+        let projects = vec![
+            ProjectInfo {
+                id: "outer".to_string(),
+                name: "Outer".to_string(),
+                worktree: "/work/project".to_string(),
+            },
+            ProjectInfo {
+                id: "inner".to_string(),
+                name: "Inner".to_string(),
+                worktree: "/work/project/packages/app".to_string(),
+            },
+        ];
+
+        let project =
+            find_project_for_directory(&projects, Path::new("/work/project/packages/app/src"))
+                .unwrap();
+
+        assert_eq!(project.id, "inner");
+    }
+
+    #[test]
     fn deferred_graph_uses_summary_snapshot_upper_bound() {
         let file = NamedTempFile::new().unwrap();
         let connection = Connection::open(file.path()).unwrap();
@@ -749,18 +1087,7 @@ mod tests {
     fn aggregates_assistant_messages_by_model_and_variant() {
         let file = NamedTempFile::new().unwrap();
         let connection = Connection::open(file.path()).unwrap();
-        connection
-            .execute(
-                "CREATE TABLE message (
-                    id TEXT PRIMARY KEY,
-                    session_id TEXT NOT NULL,
-                    time_created INTEGER NOT NULL,
-                    time_updated INTEGER NOT NULL,
-                    data TEXT NOT NULL
-                )",
-                [],
-            )
-            .unwrap();
+        create_message_table(&connection);
 
         insert_message(
             &connection,
@@ -810,18 +1137,7 @@ mod tests {
     fn applies_cutoff() {
         let file = NamedTempFile::new().unwrap();
         let connection = Connection::open(file.path()).unwrap();
-        connection
-            .execute(
-                "CREATE TABLE message (
-                    id TEXT PRIMARY KEY,
-                    session_id TEXT NOT NULL,
-                    time_created INTEGER NOT NULL,
-                    time_updated INTEGER NOT NULL,
-                    data TEXT NOT NULL
-                )",
-                [],
-            )
-            .unwrap();
+        create_message_table(&connection);
 
         let data = r#"{
             "role":"assistant",
@@ -1002,15 +1318,19 @@ mod tests {
 
     fn create_message_table(connection: &Connection) {
         connection
-            .execute(
-                "CREATE TABLE message (
+            .execute_batch(
+                "CREATE TABLE session (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL
+                );
+                INSERT INTO session (id, project_id) VALUES ('session', 'project');
+                CREATE TABLE message (
                     id TEXT PRIMARY KEY,
                     session_id TEXT NOT NULL,
                     time_created INTEGER NOT NULL,
                     time_updated INTEGER NOT NULL,
                     data TEXT NOT NULL
-                )",
-                [],
+                );",
             )
             .unwrap();
     }

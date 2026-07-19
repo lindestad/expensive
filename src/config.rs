@@ -18,15 +18,19 @@ use serde::Deserialize;
 
 use crate::time_window::{DailyStart, WeekStart};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Scope {
     All,
+    Current,
+    Project(String),
 }
 
 impl Scope {
-    pub fn key(self) -> &'static str {
+    pub fn key(&self) -> String {
         match self {
-            Self::All => "all",
+            Self::All => "all".to_string(),
+            Self::Current => "current".to_string(),
+            Self::Project(id) => format!("project:{id}"),
         }
     }
 }
@@ -34,6 +38,25 @@ impl Scope {
 impl fmt::Display for Scope {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.key())
+    }
+}
+
+impl FromStr for Scope {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        let value = value.trim();
+        match value.to_ascii_lowercase().as_str() {
+            "all" => Ok(Self::All),
+            "current" | "cwd" => Ok(Self::Current),
+            _ => value
+                .strip_prefix("project:")
+                .filter(|id| !id.trim().is_empty())
+                .map(|id| Self::Project(id.trim().to_string()))
+                .ok_or_else(|| {
+                    anyhow!("unsupported scope {value:?}; expected all, current, or project:<id>")
+                }),
+        }
     }
 }
 
@@ -161,7 +184,7 @@ pub struct Cli {
     #[arg(long)]
     pub no_refresh: bool,
 
-    #[arg(long, value_enum)]
+    #[arg(long, value_name = "all|current|project:ID")]
     pub scope: Option<Scope>,
 
     #[arg(long, value_enum)]
@@ -183,6 +206,7 @@ pub enum CliCommand {
 #[derive(Clone, Debug)]
 pub struct Config {
     pub db_path: PathBuf,
+    pub current_directory: PathBuf,
     pub config_path: Option<PathBuf>,
     pub daily_start: DailyStart,
     pub week_start: WeekStart,
@@ -207,7 +231,8 @@ struct FileConfig {
 pub fn load(cli: Cli) -> Result<Config> {
     let file_config = load_file_config()?;
     let db_path = discover_db_path(cli.db.clone());
-    resolve_config(cli, file_config, db_path, config_path())
+    let current_directory = env::current_dir().context("reading current directory")?;
+    resolve_config(cli, file_config, db_path, config_path(), current_directory)
 }
 
 fn resolve_config(
@@ -215,6 +240,7 @@ fn resolve_config(
     file_config: FileConfig,
     db_path: PathBuf,
     config_path: Option<PathBuf>,
+    current_directory: PathBuf,
 ) -> Result<Config> {
     let daily_start = match (cli.daily_start, file_config.daily_start.as_deref()) {
         (Some(value), _) => value,
@@ -240,12 +266,8 @@ fn resolve_config(
 
     let scope = match (cli.scope, file_config.scope.as_deref()) {
         (Some(value), _) => value,
-        (None, Some("all")) | (None, None) => Scope::All,
-        (None, Some(value)) => {
-            return Err(anyhow!(
-                "unsupported scope {value:?}; v1 supports only \"all\""
-            ))
-        }
+        (None, Some(value)) => value.parse()?,
+        (None, None) => Scope::All,
     };
 
     let color_theme = match (cli.color_theme, file_config.color_theme.as_deref()) {
@@ -262,6 +284,7 @@ fn resolve_config(
 
     Ok(Config {
         db_path,
+        current_directory,
         config_path,
         daily_start,
         week_start,
@@ -390,10 +413,12 @@ mod tests {
             FileConfig::default(),
             PathBuf::from("/tmp/opencode.db"),
             Some(PathBuf::from("/tmp/config.toml")),
+            PathBuf::from("/tmp/project"),
         )
         .unwrap();
 
         assert_eq!(config.db_path, PathBuf::from("/tmp/opencode.db"));
+        assert_eq!(config.current_directory, PathBuf::from("/tmp/project"));
         assert_eq!(config.config_path, Some(PathBuf::from("/tmp/config.toml")));
         assert_eq!(config.daily_start, DailyStart::default());
         assert_eq!(config.week_start, WeekStart::default());
@@ -425,8 +450,14 @@ mod tests {
             theme_scope: Some("calendar".to_string()),
         };
 
-        let config =
-            resolve_config(cli, file_config, PathBuf::from("/tmp/opencode.db"), None).unwrap();
+        let config = resolve_config(
+            cli,
+            file_config,
+            PathBuf::from("/tmp/opencode.db"),
+            None,
+            PathBuf::from("/tmp/project"),
+        )
+        .unwrap();
 
         assert_eq!(
             config.daily_start,
@@ -453,8 +484,14 @@ mod tests {
             ..FileConfig::default()
         };
 
-        let config =
-            resolve_config(cli(), file_config, PathBuf::from("/tmp/opencode.db"), None).unwrap();
+        let config = resolve_config(
+            cli(),
+            file_config,
+            PathBuf::from("/tmp/opencode.db"),
+            None,
+            PathBuf::from("/tmp/project"),
+        )
+        .unwrap();
 
         assert_eq!(config.week_start, WeekStart::Sunday);
         assert!(!config.auto_refresh);
@@ -468,6 +505,7 @@ mod tests {
         let path = tempdir.path().join("expensive").join("config.toml");
         let config = Config {
             db_path: PathBuf::from("/tmp/opencode.db"),
+            current_directory: PathBuf::from("/tmp/project"),
             config_path: Some(path.clone()),
             daily_start: "05:30".parse().unwrap(),
             week_start: WeekStart::Sunday,
@@ -500,6 +538,7 @@ mod tests {
             FileConfig::default(),
             PathBuf::from("/tmp/opencode.db"),
             None,
+            PathBuf::from("/tmp/project"),
         )
         .unwrap_err()
         .to_string();
@@ -508,17 +547,26 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_file_scope() {
+    fn supports_current_and_project_scopes() {
         let file_config = FileConfig {
             scope: Some("current".to_string()),
             ..FileConfig::default()
         };
 
-        let error = resolve_config(cli(), file_config, PathBuf::from("/tmp/opencode.db"), None)
-            .unwrap_err()
-            .to_string();
+        let config = resolve_config(
+            cli(),
+            file_config,
+            PathBuf::from("/tmp/opencode.db"),
+            None,
+            PathBuf::from("/tmp/project"),
+        )
+        .unwrap();
+        assert_eq!(config.scope, Scope::Current);
 
-        assert!(error.contains("unsupported scope"));
+        assert_eq!(
+            "project:abc".parse::<Scope>().unwrap(),
+            Scope::Project("abc".to_string())
+        );
     }
 
     #[test]
@@ -528,9 +576,15 @@ mod tests {
             ..FileConfig::default()
         };
 
-        let error = resolve_config(cli(), file_config, PathBuf::from("/tmp/opencode.db"), None)
-            .unwrap_err()
-            .to_string();
+        let error = resolve_config(
+            cli(),
+            file_config,
+            PathBuf::from("/tmp/opencode.db"),
+            None,
+            PathBuf::from("/tmp/project"),
+        )
+        .unwrap_err()
+        .to_string();
 
         assert!(error.contains("unsupported color theme"));
     }

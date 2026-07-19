@@ -19,7 +19,7 @@ use crossterm::{
 use ratatui::{backend::CrosstermBackend, layout::Rect, Terminal};
 
 use crate::{
-    config::{self, ColorTheme, Config, ThemeScope},
+    config::{self, ColorTheme, Config, Scope, ThemeScope},
     db::{self, UsageStats},
     time_window::{self, CalendarScale, DailyStart, Mode, PeriodKey, WeekStart},
     tui,
@@ -36,6 +36,10 @@ pub struct CalendarState {
     pub scale: CalendarScale,
     pub selected: PeriodKey,
     pub visible_periods: Vec<PeriodKey>,
+}
+
+pub struct ScopePickerState {
+    pub selection: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -80,6 +84,8 @@ pub struct AppState {
     pub config: Config,
     pub view: View,
     pub show_help: bool,
+    pub scope_picker: Option<ScopePickerState>,
+    pub projects: Vec<db::ProjectInfo>,
     pub help_scroll: usize,
     pub dashboard_model_scroll: usize,
     pub history_model_scroll: usize,
@@ -104,6 +110,7 @@ pub struct AppState {
     pub error: Option<String>,
     pub last_refresh_started: Option<DateTime<Local>>,
     pub next_refresh_due: Instant,
+    pub(crate) request_generation: u64,
 }
 
 impl AppState {
@@ -117,11 +124,14 @@ impl AppState {
         )?;
         let visible_periods =
             time_window::visible_periods(selected, config.daily_start, config.week_start)?;
+        let projects = db::list_projects(&config.db_path).unwrap_or_default();
 
         Ok(Self {
             config,
             view: View::Dashboard,
             show_help: false,
+            scope_picker: None,
+            projects,
             help_scroll: 0,
             dashboard_model_scroll: 0,
             history_model_scroll: 0,
@@ -150,6 +160,7 @@ impl AppState {
             error: None,
             last_refresh_started: None,
             next_refresh_due,
+            request_generation: 0,
         })
     }
 
@@ -187,10 +198,99 @@ impl AppState {
 
     fn toggle_help(&mut self) {
         self.show_help = !self.show_help;
+        self.scope_picker = None;
         if self.show_help {
             self.help_scroll = 0;
             self.config_selection = 0;
         }
+    }
+
+    pub fn scope_label(&self) -> String {
+        match &self.config.scope {
+            Scope::All => "all projects".to_string(),
+            Scope::Current => self
+                .projects
+                .iter()
+                .filter(|project| {
+                    std::path::Path::new(&self.config.current_directory)
+                        .starts_with(std::path::Path::new(&project.worktree))
+                })
+                .max_by_key(|project| std::path::Path::new(&project.worktree).components().count())
+                .map(|project| project.name.clone())
+                .unwrap_or_else(|| "current project".to_string()),
+            Scope::Project(id) => self
+                .projects
+                .iter()
+                .find(|project| &project.id == id)
+                .map(|project| project.name.clone())
+                .unwrap_or_else(|| id.clone()),
+        }
+    }
+
+    fn open_scope_picker(&mut self) {
+        if let Ok(projects) = db::list_projects(&self.config.db_path) {
+            self.projects = projects;
+        }
+        let selection = match &self.config.scope {
+            Scope::All => 0,
+            Scope::Current => 1,
+            Scope::Project(id) => self
+                .projects
+                .iter()
+                .position(|project| &project.id == id)
+                .map(|index| index + 2)
+                .unwrap_or(0),
+        };
+        self.show_help = false;
+        self.scope_picker = Some(ScopePickerState { selection });
+    }
+
+    fn move_scope_selection(&mut self, direction: i32) {
+        let option_count = self.projects.len().saturating_add(2);
+        let Some(picker) = self.scope_picker.as_mut() else {
+            return;
+        };
+        if direction > 0 {
+            picker.selection = (picker.selection + 1).min(option_count.saturating_sub(1));
+        } else {
+            picker.selection = picker.selection.saturating_sub(1);
+        }
+    }
+
+    fn apply_scope_selection(&mut self, tx: &Sender<RefreshMessage>) {
+        let Some(picker) = self.scope_picker.take() else {
+            return;
+        };
+        let scope = match picker.selection {
+            0 => Scope::All,
+            1 => Scope::Current,
+            index => match self.projects.get(index - 2) {
+                Some(project) => Scope::Project(project.id.clone()),
+                None => return,
+            },
+        };
+        if self.config.scope == scope {
+            return;
+        }
+
+        self.config.scope = scope;
+        self.request_generation = self.request_generation.wrapping_add(1);
+        self.stats.clear();
+        self.loading.clear();
+        self.graph_loading.clear();
+        self.graph_refresh_pending.clear();
+        self.dashboard_prefetch_attempted.clear();
+        self.calendar_costs.clear();
+        self.calendar_loading = false;
+        self.history_stats.clear();
+        self.history_loading.clear();
+        self.history_graph_loading.clear();
+        self.history_graph_refresh_pending.clear();
+        self.dashboard_token_bucket = None;
+        self.history_token_bucket = None;
+        self.error = None;
+        self.save_config_notice();
+        self.trigger_current_refresh(tx);
     }
 
     fn switch_mode(&mut self, mode: Mode, tx: &Sender<RefreshMessage>) {
@@ -236,10 +336,15 @@ impl AppState {
 
         let tx = tx.clone();
         let config = self.config.clone();
+        let generation = self.request_generation;
         thread::spawn(move || {
             let result =
                 refresh_dashboard_summary(config, mode).map_err(|error| format!("{error:#}"));
-            let _ = tx.send(RefreshMessage::Dashboard { mode, result });
+            let _ = tx.send(RefreshMessage::Dashboard {
+                generation,
+                mode,
+                result,
+            });
         });
     }
 
@@ -262,16 +367,20 @@ impl AppState {
 
         let tx = tx.clone();
         let config = self.config.clone();
+        let generation = self.request_generation;
         thread::spawn(move || {
-            let result = db::load_usage_token_buckets_at(
+            let result = db::load_usage_token_buckets_at_scoped(
                 &config.db_path,
                 mode,
                 cutoff_millis,
                 end_millis,
                 snapshot_millis,
+                &config.scope,
+                &config.current_directory,
             )
             .map_err(|error| format!("{error:#}"));
             let _ = tx.send(RefreshMessage::DashboardGraph {
+                generation,
                 mode,
                 cutoff_millis,
                 snapshot_millis,
@@ -381,10 +490,16 @@ impl AppState {
 
         let tx = tx.clone();
         let config = self.config.clone();
+        let generation = self.request_generation;
         thread::spawn(move || {
-            let result = db::load_period_costs(&config.db_path, &periods)
-                .map_err(|error| format!("{error:#}"));
-            let _ = tx.send(RefreshMessage::Calendar { result });
+            let result = db::load_period_costs_scoped(
+                &config.db_path,
+                &periods,
+                &config.scope,
+                &config.current_directory,
+            )
+            .map_err(|error| format!("{error:#}"));
+            let _ = tx.send(RefreshMessage::Calendar { generation, result });
         });
     }
 
@@ -400,15 +515,22 @@ impl AppState {
 
         let tx = tx.clone();
         let config = self.config.clone();
+        let generation = self.request_generation;
         thread::spawn(move || {
-            let result = db::load_usage_summary_between(
+            let result = db::load_usage_summary_between_scoped(
                 &config.db_path,
                 period.mode(),
                 period.start_millis,
                 period.end_millis,
+                &config.scope,
+                &config.current_directory,
             )
             .map_err(|error| format!("{error:#}"));
-            let _ = tx.send(RefreshMessage::History { period, result });
+            let _ = tx.send(RefreshMessage::History {
+                generation,
+                period,
+                result,
+            });
         });
     }
 
@@ -431,16 +553,20 @@ impl AppState {
 
         let tx = tx.clone();
         let config = self.config.clone();
+        let generation = self.request_generation;
         thread::spawn(move || {
-            let result = db::load_usage_token_buckets_at(
+            let result = db::load_usage_token_buckets_at_scoped(
                 &config.db_path,
                 period.mode(),
                 Some(period.start_millis),
                 Some(period.end_millis),
                 snapshot_millis,
+                &config.scope,
+                &config.current_directory,
             )
             .map_err(|error| format!("{error:#}"));
             let _ = tx.send(RefreshMessage::HistoryGraph {
+                generation,
                 period,
                 snapshot_millis,
                 result,
@@ -909,27 +1035,44 @@ impl AppState {
 
 enum RefreshMessage {
     Dashboard {
+        generation: u64,
         mode: Mode,
         result: std::result::Result<UsageStats, String>,
     },
     DashboardGraph {
+        generation: u64,
         mode: Mode,
         cutoff_millis: Option<i64>,
         snapshot_millis: i64,
         result: std::result::Result<Vec<db::TokenBucket>, String>,
     },
     Calendar {
+        generation: u64,
         result: std::result::Result<Vec<db::PeriodCost>, String>,
     },
     History {
+        generation: u64,
         period: PeriodKey,
         result: std::result::Result<UsageStats, String>,
     },
     HistoryGraph {
+        generation: u64,
         period: PeriodKey,
         snapshot_millis: i64,
         result: std::result::Result<Vec<db::TokenBucket>, String>,
     },
+}
+
+impl RefreshMessage {
+    fn generation(&self) -> u64 {
+        match self {
+            Self::Dashboard { generation, .. }
+            | Self::DashboardGraph { generation, .. }
+            | Self::Calendar { generation, .. }
+            | Self::History { generation, .. }
+            | Self::HistoryGraph { generation, .. } => *generation,
+        }
+    }
 }
 
 pub fn run(config: Config) -> Result<()> {
@@ -1006,6 +1149,19 @@ fn handle_key(
     app: &mut AppState,
     tx: &Sender<RefreshMessage>,
 ) -> bool {
+    if app.scope_picker.is_some() {
+        match code {
+            KeyCode::Char('q') => return true,
+            KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => return true,
+            KeyCode::Esc | KeyCode::Char('p') => app.scope_picker = None,
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => app.move_scope_selection(-1),
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => app.move_scope_selection(1),
+            KeyCode::Enter | KeyCode::Char(' ') => app.apply_scope_selection(tx),
+            _ => {}
+        }
+        return false;
+    }
+
     if code == KeyCode::Char('?') {
         app.toggle_help();
         return false;
@@ -1097,6 +1253,10 @@ fn handle_key(
             app.next_refresh_due = Instant::now() + app.config.refresh_interval;
             false
         }
+        KeyCode::Char('p') => {
+            app.open_scope_picker();
+            false
+        }
         KeyCode::Enter | KeyCode::Char(' ') if app.view == View::CalendarOverview => {
             app.open_calendar_detail(tx);
             false
@@ -1131,6 +1291,10 @@ fn handle_mouse(
     app: &mut AppState,
     tx: &Sender<RefreshMessage>,
 ) -> bool {
+    if app.scope_picker.is_some() {
+        return false;
+    }
+
     if app.show_help {
         let help_layout = tui::help_layout_state(area, app);
         return match mouse.kind {
@@ -1252,12 +1416,20 @@ fn drain_refreshes(
 ) -> bool {
     let mut needs_draw = false;
     while let Ok(message) = rx.try_recv() {
+        if message.generation() != app.request_generation {
+            continue;
+        }
         match message {
-            RefreshMessage::Dashboard { mode, result } => {
+            RefreshMessage::Dashboard {
+                generation: _,
+                mode,
+                result,
+            } => {
                 app.apply_dashboard_refresh(mode, result);
                 needs_draw = true;
             }
             RefreshMessage::DashboardGraph {
+                generation: _,
                 mode,
                 cutoff_millis,
                 snapshot_millis,
@@ -1266,15 +1438,23 @@ fn drain_refreshes(
                 needs_draw |=
                     app.apply_dashboard_graph_refresh(mode, cutoff_millis, snapshot_millis, result);
             }
-            RefreshMessage::Calendar { result } => {
+            RefreshMessage::Calendar {
+                generation: _,
+                result,
+            } => {
                 app.apply_calendar_refresh(result, tx);
                 needs_draw = true;
             }
-            RefreshMessage::History { period, result } => {
+            RefreshMessage::History {
+                generation: _,
+                period,
+                result,
+            } => {
                 app.apply_history_refresh(period, result);
                 needs_draw = true;
             }
             RefreshMessage::HistoryGraph {
+                generation: _,
                 period,
                 snapshot_millis,
                 result,
@@ -1299,7 +1479,13 @@ fn maybe_auto_refresh(app: &mut AppState, tx: &Sender<RefreshMessage>) -> bool {
 fn refresh_dashboard_summary(config: Config, mode: Mode) -> Result<UsageStats> {
     let cutoff_millis =
         time_window::cutoff_millis(mode, Local::now(), config.daily_start, config.week_start)?;
-    db::load_usage_summary(&config.db_path, mode, cutoff_millis)
+    db::load_usage_summary_scoped(
+        &config.db_path,
+        mode,
+        cutoff_millis,
+        &config.scope,
+        &config.current_directory,
+    )
 }
 
 fn overview_steps(scale: CalendarScale, code: KeyCode) -> Option<i32> {
@@ -1926,9 +2112,57 @@ mod tests {
         assert!(app.history_graph_refresh_pending.contains(&period));
     }
 
+    #[test]
+    fn project_picker_persists_scope_and_invalidates_cached_usage() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config_path = tempdir.path().join("config.toml");
+        let mut app = AppState::new(test_config(config_path.clone())).unwrap();
+        app.projects = vec![db::ProjectInfo {
+            id: "project-a".to_string(),
+            name: "Project A".to_string(),
+            worktree: "/tmp/project".to_string(),
+        }];
+        app.stats
+            .insert(Mode::Daily, many_model_stats(Mode::Daily, 1));
+        let (tx, _rx) = mpsc::channel();
+        let area = Rect::new(0, 0, 120, 30);
+
+        handle_key(KeyCode::Char('p'), KeyModifiers::NONE, area, &mut app, &tx);
+        handle_key(KeyCode::Down, KeyModifiers::NONE, area, &mut app, &tx);
+        handle_key(KeyCode::Down, KeyModifiers::NONE, area, &mut app, &tx);
+        handle_key(KeyCode::Enter, KeyModifiers::NONE, area, &mut app, &tx);
+
+        assert_eq!(app.config.scope, Scope::Project("project-a".to_string()));
+        assert_eq!(app.request_generation, 1);
+        assert!(app.stats.is_empty());
+        assert!(fs::read_to_string(config_path)
+            .unwrap()
+            .contains(r#"scope = "project:project-a""#));
+    }
+
+    #[test]
+    fn ignores_refresh_results_from_an_old_scope_generation() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut app = AppState::new(test_config(tempdir.path().join("config.toml"))).unwrap();
+        app.request_generation = 2;
+        let (tx, rx) = mpsc::channel();
+        tx.send(RefreshMessage::Dashboard {
+            generation: 1,
+            mode: Mode::Daily,
+            result: Ok(many_model_stats(Mode::Daily, 1)),
+        })
+        .unwrap();
+
+        let changed = drain_refreshes(&rx, &mut app, &tx);
+
+        assert!(!changed);
+        assert!(app.stats.is_empty());
+    }
+
     fn test_config(config_path: PathBuf) -> Config {
         Config {
             db_path: PathBuf::from("/tmp/opencode.db"),
+            current_directory: PathBuf::from("/tmp/project"),
             config_path: Some(config_path),
             daily_start: DailyStart::default(),
             week_start: WeekStart::default(),
