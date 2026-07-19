@@ -5,6 +5,7 @@
 //! command-line arguments, config file values, then built-in defaults.
 
 use std::{
+    collections::BTreeMap,
     env, fmt, fs,
     path::{Path, PathBuf},
     process::Command as ProcessCommand,
@@ -14,7 +15,7 @@ use std::{
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::time_window::{DailyStart, WeekStart};
 
@@ -23,6 +24,53 @@ pub enum Scope {
     All,
     Current,
     Project(String),
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ModelAliases {
+    pub providers: BTreeMap<String, String>,
+    pub models: BTreeMap<String, String>,
+}
+
+impl ModelAliases {
+    pub fn display_name(&self, provider: &str, model_id: &str, variant: &str) -> String {
+        let provider = cleaned(provider, "unknown");
+        let model_id = cleaned(model_id, "unknown");
+        let variant = cleaned(variant, "default");
+        let full_model_id = format!("{provider}/{model_id}");
+        let base = self
+            .models
+            .get(&full_model_id)
+            .or_else(|| self.models.get(model_id))
+            .cloned()
+            .unwrap_or_else(|| {
+                let provider = self
+                    .providers
+                    .get(provider)
+                    .map(String::as_str)
+                    .unwrap_or(provider);
+                if provider == "unknown" {
+                    model_id.to_string()
+                } else {
+                    format!("{provider}/{model_id}")
+                }
+            });
+
+        if variant == "default" {
+            base
+        } else {
+            format!("{base} ({variant})")
+        }
+    }
+}
+
+fn cleaned<'a>(value: &'a str, fallback: &'a str) -> &'a str {
+    let value = value.trim();
+    if value.is_empty() {
+        fallback
+    } else {
+        value
+    }
 }
 
 impl Scope {
@@ -215,6 +263,7 @@ pub struct Config {
     pub scope: Scope,
     pub color_theme: ColorTheme,
     pub theme_scope: ThemeScope,
+    pub aliases: ModelAliases,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -226,6 +275,10 @@ struct FileConfig {
     scope: Option<String>,
     color_theme: Option<String>,
     theme_scope: Option<String>,
+    #[serde(default)]
+    provider_aliases: BTreeMap<String, String>,
+    #[serde(default)]
+    model_aliases: BTreeMap<String, String>,
 }
 
 pub fn load(cli: Cli) -> Result<Config> {
@@ -293,6 +346,10 @@ fn resolve_config(
         scope,
         color_theme,
         theme_scope,
+        aliases: ModelAliases {
+            providers: file_config.provider_aliases,
+            models: file_config.model_aliases,
+        },
     })
 }
 
@@ -327,7 +384,7 @@ pub fn save(config: &Config) -> Result<()> {
 }
 
 fn format_config(config: &Config) -> String {
-    format!(
+    let mut content = format!(
         concat!(
             "daily_start = \"{}\"\n",
             "week_start = \"{}\"\n",
@@ -344,7 +401,24 @@ fn format_config(config: &Config) -> String {
         config.color_theme,
         config.theme_scope,
         config.scope,
-    )
+    );
+    let aliases = SerializableAliases {
+        provider_aliases: &config.aliases.providers,
+        model_aliases: &config.aliases.models,
+    };
+    if !config.aliases.providers.is_empty() || !config.aliases.models.is_empty() {
+        content.push('\n');
+        content.push_str(&toml::to_string(&aliases).expect("serializing string alias maps"));
+    }
+    content
+}
+
+#[derive(Serialize)]
+struct SerializableAliases<'a> {
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    provider_aliases: &'a BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    model_aliases: &'a BTreeMap<String, String>,
 }
 
 fn discover_db_path(cli_path: Option<PathBuf>) -> PathBuf {
@@ -448,6 +522,8 @@ mod tests {
             scope: Some("all".to_string()),
             color_theme: Some("ember".to_string()),
             theme_scope: Some("calendar".to_string()),
+            provider_aliases: BTreeMap::new(),
+            model_aliases: BTreeMap::new(),
         };
 
         let config = resolve_config(
@@ -514,6 +590,10 @@ mod tests {
             scope: Scope::All,
             color_theme: ColorTheme::Forest,
             theme_scope: ThemeScope::All,
+            aliases: ModelAliases {
+                providers: BTreeMap::from([("github-copilot".to_string(), "gc".to_string())]),
+                models: BTreeMap::from([("github-copilot/gpt-test".to_string(), "gt".to_string())]),
+            },
         };
 
         save(&config).unwrap();
@@ -526,6 +606,29 @@ mod tests {
         assert!(content.contains(r#"color_theme = "forest""#));
         assert!(content.contains(r#"theme_scope = "all""#));
         assert!(content.contains(r#"scope = "all""#));
+        let parsed: FileConfig = toml::from_str(&content).unwrap();
+        assert_eq!(parsed.provider_aliases["github-copilot"], "gc");
+        assert_eq!(parsed.model_aliases["github-copilot/gpt-test"], "gt");
+    }
+
+    #[test]
+    fn model_aliases_prefer_full_model_then_provider_prefix() {
+        let aliases = ModelAliases {
+            providers: BTreeMap::from([("github-copilot".to_string(), "gc".to_string())]),
+            models: BTreeMap::from([(
+                "github-copilot/gpt-special".to_string(),
+                "special".to_string(),
+            )]),
+        };
+
+        assert_eq!(
+            aliases.display_name("github-copilot", "gpt-test", "default"),
+            "gc/gpt-test"
+        );
+        assert_eq!(
+            aliases.display_name("github-copilot", "gpt-special", "high"),
+            "special (high)"
+        );
     }
 
     #[test]

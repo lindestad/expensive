@@ -288,6 +288,9 @@ pub fn draw(frame: &mut Frame<'_>, app: &AppState) {
     if app.scope_picker.is_some() {
         draw_scope_picker(frame, area, app, palette);
     }
+    if app.alias_editor.is_some() {
+        draw_alias_editor(frame, area, app, palette);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -508,6 +511,122 @@ fn draw_scope_picker(frame: &mut Frame<'_>, area: Rect, app: &AppState, palette:
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+fn draw_alias_editor(frame: &mut Frame<'_>, area: Rect, app: &AppState, palette: Palette) {
+    let Some(editor) = &app.alias_editor else {
+        return;
+    };
+    let modal = centered_rect(area, 92, 24);
+    frame.render_widget(Clear, modal);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {} ", editor.kind.title()))
+        .title_alignment(Alignment::Center)
+        .title_style(
+            Style::default()
+                .fg(palette.title)
+                .add_modifier(Modifier::BOLD),
+        )
+        .border_style(Style::default().fg(palette.border));
+    let inner = modal.inner(Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    frame.render_widget(block, modal);
+
+    if let Some(input) = &editor.input {
+        let source_style =
+            alias_input_style(input.field == crate::app::AliasInputField::Source, palette);
+        let alias_style =
+            alias_input_style(input.field == crate::app::AliasInputField::Alias, palette);
+        let lines = vec![
+            Line::from(Span::styled(
+                "Raw database values are preserved; aliases only change labels.",
+                Style::default().fg(palette.muted),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                editor.kind.source_label(),
+                Style::default().fg(palette.muted),
+            )),
+            Line::from(Span::styled(format!(" {} ", input.source), source_style)),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Display alias",
+                Style::default().fg(palette.muted),
+            )),
+            Line::from(Span::styled(format!(" {} ", input.alias), alias_style)),
+            Line::from(""),
+            Line::from(vec![
+                key_span(" Tab ", palette),
+                Span::styled(" field  ", Style::default().fg(palette.muted)),
+                key_span(" Enter ", palette),
+                Span::styled(" next/save  ", Style::default().fg(palette.muted)),
+                key_span(" Esc ", palette),
+                Span::styled(" cancel", Style::default().fg(palette.muted)),
+            ]),
+        ];
+        frame.render_widget(Paragraph::new(lines), inner);
+        return;
+    }
+
+    let mut entries = app.alias_entries(editor.kind);
+    let entry_count = entries.len();
+    entries.push(("+ add alias".to_string(), String::new()));
+    let visible_entries = inner.height.saturating_sub(3) as usize;
+    let scroll = editor
+        .selection
+        .saturating_add(1)
+        .saturating_sub(visible_entries)
+        .min(entries.len().saturating_sub(visible_entries));
+    let mut lines = entries
+        .into_iter()
+        .enumerate()
+        .skip(scroll)
+        .take(visible_entries)
+        .map(|(index, (source, alias))| {
+            let selected = index == editor.selection;
+            let style = if selected {
+                Style::default()
+                    .fg(palette.calendar_accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(palette.text)
+            };
+            let marker = if selected { ">" } else { " " };
+            if index == entry_count {
+                Line::from(Span::styled(format!("{marker} {source}"), style))
+            } else {
+                Line::from(vec![
+                    Span::styled(format!("{marker} {source}"), style),
+                    Span::styled("  →  ", Style::default().fg(palette.muted)),
+                    Span::styled(alias, Style::default().fg(palette.accent)),
+                ])
+            }
+        })
+        .collect::<Vec<_>>();
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        key_span(" Enter ", palette),
+        Span::styled(" edit/add  ", Style::default().fg(palette.muted)),
+        key_span(" d ", palette),
+        Span::styled(" delete  ", Style::default().fg(palette.muted)),
+        key_span(" Esc ", palette),
+        Span::styled(" close", Style::default().fg(palette.muted)),
+    ]));
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn alias_input_style(active: bool, palette: Palette) -> Style {
+    if active {
+        Style::default()
+            .fg(Color::Black)
+            .bg(palette.calendar_accent)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(palette.text).bg(Color::Rgb(35, 40, 48))
+    }
+}
+
 pub fn help_layout_state(area: Rect, app: &AppState) -> HelpLayoutState {
     let inner = help_inner_area(area);
     let document = help_document(app, active_palette(app), inner.width as usize, false);
@@ -564,8 +683,6 @@ fn help_document(
         content.columns,
         palette,
     ));
-    lines.extend([Line::from("")]);
-
     let config_start = lines.len();
     let config_editor = config_editor_lines(app, palette, width, highlight_config);
     let config_item_starts = config_editor
@@ -576,8 +693,10 @@ fn help_document(
     lines.extend(config_editor.lines);
     let config_end = lines.len();
 
+    if app.config_notice.is_some() {
+        lines.push(config_notice_line(app, palette));
+    }
     lines.extend([
-        config_notice_line(app, palette),
         Line::from(""),
         config_line("file", content.config_path.to_string(), palette),
         Line::from(""),
@@ -1091,6 +1210,14 @@ fn config_value_width(item: ConfigEditorItem, app: &AppState) -> usize {
         ConfigEditorItem::WeekStart => text_width(" monday  sunday "),
         ConfigEditorItem::ColorTheme => text_width(" aurora  ember  ocean  forest  graphite "),
         ConfigEditorItem::ThemeScope => text_width(" calendar  all "),
+        ConfigEditorItem::ProviderAliases => text_width(&format!(
+            " {} aliases  edit ",
+            app.config.aliases.providers.len()
+        )),
+        ConfigEditorItem::ModelAliases => text_width(&format!(
+            " {} aliases  edit ",
+            app.config.aliases.models.len()
+        )),
     }
 }
 
@@ -1217,7 +1344,26 @@ fn config_value_tokens(
             ],
             palette,
         ),
+        ConfigEditorItem::ProviderAliases => {
+            alias_config_tokens(app.config.aliases.providers.len(), palette)
+        }
+        ConfigEditorItem::ModelAliases => {
+            alias_config_tokens(app.config.aliases.models.len(), palette)
+        }
     }
+}
+
+fn alias_config_tokens(count: usize, palette: Palette) -> Vec<ValueToken> {
+    vec![
+        ValueToken {
+            text: format!(" {count} aliases "),
+            style: Style::default().fg(palette.text),
+        },
+        ValueToken {
+            text: " edit ".to_string(),
+            style: selected_value_style(palette),
+        },
+    ]
 }
 
 fn config_value_token(value: String, palette: Palette) -> ValueToken {
@@ -3011,6 +3157,37 @@ mod tests {
     }
 
     #[test]
+    fn renders_alias_editor_and_text_input() {
+        let mut app = app_loading(Mode::Daily);
+        app.config
+            .aliases
+            .providers
+            .insert("github-copilot".to_string(), "gc".to_string());
+        app.alias_editor = Some(crate::app::AliasEditorState {
+            kind: crate::app::AliasKind::Provider,
+            selection: 0,
+            input: None,
+        });
+
+        let list = render(&app, 100, 24);
+        assert!(list.contains("Provider aliases"));
+        assert!(list.contains("github-copilot"));
+        assert!(list.contains("gc"));
+        assert!(list.contains("+ add alias"));
+
+        app.alias_editor.as_mut().unwrap().input = Some(crate::app::AliasInputState {
+            original_source: None,
+            source: "github-copilot".to_string(),
+            alias: "gc".to_string(),
+            field: crate::app::AliasInputField::Alias,
+        });
+        let input = render(&app, 100, 24);
+        assert!(input.contains("Provider ID"));
+        assert!(input.contains("Display alias"));
+        assert!(input.contains("next/save"));
+    }
+
+    #[test]
     fn aligns_help_binding_descriptions_to_one_column() {
         let mut app = app_loading(Mode::Daily);
         app.show_help = true;
@@ -3192,6 +3369,7 @@ mod tests {
             view: View::Dashboard,
             show_help: false,
             scope_picker: None,
+            alias_editor: None,
             projects: Vec::new(),
             help_scroll: 0,
             dashboard_model_scroll: 0,
@@ -3227,6 +3405,7 @@ mod tests {
             view: View::Dashboard,
             show_help: false,
             scope_picker: None,
+            alias_editor: None,
             projects: Vec::new(),
             help_scroll: 0,
             dashboard_model_scroll: 0,
@@ -3262,6 +3441,7 @@ mod tests {
             view: View::CalendarOverview,
             show_help: false,
             scope_picker: None,
+            alias_editor: None,
             projects: Vec::new(),
             help_scroll: 0,
             dashboard_model_scroll: 0,
@@ -3333,6 +3513,7 @@ mod tests {
             scope: Scope::All,
             color_theme: ColorTheme::Aurora,
             theme_scope: ThemeScope::Calendar,
+            aliases: crate::config::ModelAliases::default(),
         }
     }
 

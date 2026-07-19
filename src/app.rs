@@ -56,16 +56,20 @@ pub enum ConfigEditorItem {
     WeekStart,
     ColorTheme,
     ThemeScope,
+    ProviderAliases,
+    ModelAliases,
 }
 
 impl ConfigEditorItem {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 8] = [
         Self::AutoRefresh,
         Self::DailyStart,
         Self::RefreshSeconds,
         Self::WeekStart,
         Self::ColorTheme,
         Self::ThemeScope,
+        Self::ProviderAliases,
+        Self::ModelAliases,
     ];
 
     pub fn label(self) -> &'static str {
@@ -76,8 +80,51 @@ impl ConfigEditorItem {
             Self::WeekStart => "week_start",
             Self::ColorTheme => "color_theme",
             Self::ThemeScope => "theme_scope",
+            Self::ProviderAliases => "provider_aliases",
+            Self::ModelAliases => "model_aliases",
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AliasKind {
+    Provider,
+    Model,
+}
+
+impl AliasKind {
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Provider => "Provider aliases",
+            Self::Model => "Model aliases",
+        }
+    }
+
+    pub fn source_label(self) -> &'static str {
+        match self {
+            Self::Provider => "Provider ID",
+            Self::Model => "Model ID or provider/model",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AliasInputField {
+    Source,
+    Alias,
+}
+
+pub struct AliasInputState {
+    pub original_source: Option<String>,
+    pub source: String,
+    pub alias: String,
+    pub field: AliasInputField,
+}
+
+pub struct AliasEditorState {
+    pub kind: AliasKind,
+    pub selection: usize,
+    pub input: Option<AliasInputState>,
 }
 
 pub struct AppState {
@@ -85,6 +132,7 @@ pub struct AppState {
     pub view: View,
     pub show_help: bool,
     pub scope_picker: Option<ScopePickerState>,
+    pub alias_editor: Option<AliasEditorState>,
     pub projects: Vec<db::ProjectInfo>,
     pub help_scroll: usize,
     pub dashboard_model_scroll: usize,
@@ -131,6 +179,7 @@ impl AppState {
             view: View::Dashboard,
             show_help: false,
             scope_picker: None,
+            alias_editor: None,
             projects,
             help_scroll: 0,
             dashboard_model_scroll: 0,
@@ -199,9 +248,137 @@ impl AppState {
     fn toggle_help(&mut self) {
         self.show_help = !self.show_help;
         self.scope_picker = None;
+        self.alias_editor = None;
         if self.show_help {
             self.help_scroll = 0;
             self.config_selection = 0;
+        }
+    }
+
+    pub fn alias_entries(&self, kind: AliasKind) -> Vec<(String, String)> {
+        let aliases = match kind {
+            AliasKind::Provider => &self.config.aliases.providers,
+            AliasKind::Model => &self.config.aliases.models,
+        };
+        aliases
+            .iter()
+            .map(|(source, alias)| (source.clone(), alias.clone()))
+            .collect()
+    }
+
+    fn open_alias_editor(&mut self, kind: AliasKind) {
+        self.scope_picker = None;
+        self.alias_editor = Some(AliasEditorState {
+            kind,
+            selection: 0,
+            input: None,
+        });
+    }
+
+    fn move_alias_selection(&mut self, direction: i32) {
+        let Some(editor) = self.alias_editor.as_ref() else {
+            return;
+        };
+        let option_count = self.alias_entries(editor.kind).len().saturating_add(1);
+        let Some(editor) = self.alias_editor.as_mut() else {
+            return;
+        };
+        if direction > 0 {
+            editor.selection = (editor.selection + 1).min(option_count.saturating_sub(1));
+        } else {
+            editor.selection = editor.selection.saturating_sub(1);
+        }
+    }
+
+    fn begin_alias_input(&mut self) {
+        let Some(editor) = self.alias_editor.as_ref() else {
+            return;
+        };
+        let entries = self.alias_entries(editor.kind);
+        let selected = entries.get(editor.selection).cloned();
+        let Some(editor) = self.alias_editor.as_mut() else {
+            return;
+        };
+        editor.input = Some(match selected {
+            Some((source, alias)) => AliasInputState {
+                original_source: Some(source.clone()),
+                source,
+                alias,
+                field: AliasInputField::Source,
+            },
+            None => AliasInputState {
+                original_source: None,
+                source: String::new(),
+                alias: String::new(),
+                field: AliasInputField::Source,
+            },
+        });
+    }
+
+    fn delete_selected_alias(&mut self) {
+        let Some(editor) = self.alias_editor.as_ref() else {
+            return;
+        };
+        let entries = self.alias_entries(editor.kind);
+        let Some((source, _)) = entries.get(editor.selection) else {
+            return;
+        };
+        match editor.kind {
+            AliasKind::Provider => self.config.aliases.providers.remove(source),
+            AliasKind::Model => self.config.aliases.models.remove(source),
+        };
+        let remaining = entries.len().saturating_sub(1);
+        if let Some(editor) = self.alias_editor.as_mut() {
+            editor.selection = editor.selection.min(remaining);
+        }
+        self.apply_cached_aliases();
+        self.save_config_notice();
+    }
+
+    fn save_alias_input(&mut self) {
+        let Some(editor) = self.alias_editor.as_mut() else {
+            return;
+        };
+        let Some(input) = editor.input.take() else {
+            return;
+        };
+        let source = input.source.trim().to_string();
+        let alias = input.alias.trim().to_string();
+        if source.is_empty() || alias.is_empty() {
+            editor.input = Some(input);
+            self.config_notice = Some(ConfigNotice {
+                message: "alias source and replacement are required".to_string(),
+                is_error: true,
+            });
+            return;
+        }
+
+        let aliases = match editor.kind {
+            AliasKind::Provider => &mut self.config.aliases.providers,
+            AliasKind::Model => &mut self.config.aliases.models,
+        };
+        if let Some(original) = input.original_source {
+            if original != source {
+                aliases.remove(&original);
+            }
+        }
+        aliases.insert(source.clone(), alias);
+        editor.selection = aliases.keys().position(|key| key == &source).unwrap_or(0);
+        self.apply_cached_aliases();
+        self.save_config_notice();
+    }
+
+    fn apply_cached_aliases(&mut self) {
+        let aliases = &self.config.aliases;
+        for stats in self
+            .stats
+            .values_mut()
+            .chain(self.history_stats.values_mut())
+        {
+            for model in &mut stats.models {
+                model.display_name =
+                    aliases.display_name(&model.provider, &model.model_id, &model.variant);
+            }
         }
     }
 
@@ -525,6 +702,10 @@ impl AppState {
                 &config.scope,
                 &config.current_directory,
             )
+            .map(|mut stats| {
+                apply_model_aliases(&config, &mut stats);
+                stats
+            })
             .map_err(|error| format!("{error:#}"));
             let _ = tx.send(RefreshMessage::History {
                 generation,
@@ -977,6 +1158,14 @@ impl AppState {
                     direction,
                 );
             }
+            ConfigEditorItem::ProviderAliases => {
+                self.open_alias_editor(AliasKind::Provider);
+                return Ok(());
+            }
+            ConfigEditorItem::ModelAliases => {
+                self.open_alias_editor(AliasKind::Model);
+                return Ok(());
+            }
         }
 
         self.save_config_notice();
@@ -1149,6 +1338,95 @@ fn handle_key(
     app: &mut AppState,
     tx: &Sender<RefreshMessage>,
 ) -> bool {
+    if app.alias_editor.is_some() {
+        let editing = app
+            .alias_editor
+            .as_ref()
+            .and_then(|editor| editor.input.as_ref())
+            .is_some();
+        if editing {
+            match code {
+                KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => return true,
+                KeyCode::Esc => {
+                    if let Some(editor) = app.alias_editor.as_mut() {
+                        editor.input = None;
+                    }
+                }
+                KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down => {
+                    if let Some(input) = app
+                        .alias_editor
+                        .as_mut()
+                        .and_then(|editor| editor.input.as_mut())
+                    {
+                        input.field = match input.field {
+                            AliasInputField::Source => AliasInputField::Alias,
+                            AliasInputField::Alias => AliasInputField::Source,
+                        };
+                    }
+                }
+                KeyCode::Enter => {
+                    let field = app
+                        .alias_editor
+                        .as_ref()
+                        .and_then(|editor| editor.input.as_ref())
+                        .map(|input| input.field);
+                    if field == Some(AliasInputField::Source) {
+                        if let Some(input) = app
+                            .alias_editor
+                            .as_mut()
+                            .and_then(|editor| editor.input.as_mut())
+                        {
+                            input.field = AliasInputField::Alias;
+                        }
+                    } else {
+                        app.save_alias_input();
+                    }
+                }
+                KeyCode::Backspace => {
+                    if let Some(input) = app
+                        .alias_editor
+                        .as_mut()
+                        .and_then(|editor| editor.input.as_mut())
+                    {
+                        match input.field {
+                            AliasInputField::Source => {
+                                input.source.pop();
+                            }
+                            AliasInputField::Alias => {
+                                input.alias.pop();
+                            }
+                        }
+                    }
+                }
+                KeyCode::Char(character) if !modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let Some(input) = app
+                        .alias_editor
+                        .as_mut()
+                        .and_then(|editor| editor.input.as_mut())
+                    {
+                        match input.field {
+                            AliasInputField::Source => input.source.push(character),
+                            AliasInputField::Alias => input.alias.push(character),
+                        }
+                    }
+                }
+                _ => {}
+            }
+        } else {
+            match code {
+                KeyCode::Char('q') => return true,
+                KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => return true,
+                KeyCode::Esc => app.alias_editor = None,
+                KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => app.move_alias_selection(-1),
+                KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => app.move_alias_selection(1),
+                KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Char('a') => app.begin_alias_input(),
+                KeyCode::Char('d') | KeyCode::Delete => app.delete_selected_alias(),
+                _ => {}
+            }
+        }
+        return false;
+    }
+
     if app.scope_picker.is_some() {
         match code {
             KeyCode::Char('q') => return true,
@@ -1291,7 +1569,7 @@ fn handle_mouse(
     app: &mut AppState,
     tx: &Sender<RefreshMessage>,
 ) -> bool {
-    if app.scope_picker.is_some() {
+    if app.scope_picker.is_some() || app.alias_editor.is_some() {
         return false;
     }
 
@@ -1479,13 +1757,24 @@ fn maybe_auto_refresh(app: &mut AppState, tx: &Sender<RefreshMessage>) -> bool {
 fn refresh_dashboard_summary(config: Config, mode: Mode) -> Result<UsageStats> {
     let cutoff_millis =
         time_window::cutoff_millis(mode, Local::now(), config.daily_start, config.week_start)?;
-    db::load_usage_summary_scoped(
+    let mut stats = db::load_usage_summary_scoped(
         &config.db_path,
         mode,
         cutoff_millis,
         &config.scope,
         &config.current_directory,
-    )
+    )?;
+    apply_model_aliases(&config, &mut stats);
+    Ok(stats)
+}
+
+fn apply_model_aliases(config: &Config, stats: &mut UsageStats) {
+    for model in &mut stats.models {
+        model.display_name =
+            config
+                .aliases
+                .display_name(&model.provider, &model.model_id, &model.variant);
+    }
 }
 
 fn overview_steps(scale: CalendarScale, code: KeyCode) -> Option<i32> {
@@ -2159,6 +2448,51 @@ mod tests {
         assert!(app.stats.is_empty());
     }
 
+    #[test]
+    fn tui_alias_editor_saves_and_updates_loaded_model_names() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config_path = tempdir.path().join("config.toml");
+        let mut app = AppState::new(test_config(config_path.clone())).unwrap();
+        let mut stats = many_model_stats(Mode::Daily, 1);
+        stats.models[0].provider = "github-copilot".to_string();
+        stats.models[0].display_name = "github-copilot/model-0".to_string();
+        app.stats.insert(Mode::Daily, stats);
+        app.open_alias_editor(AliasKind::Provider);
+        app.begin_alias_input();
+        let (tx, _rx) = mpsc::channel();
+        let area = Rect::new(0, 0, 100, 24);
+
+        for character in "github-copilot".chars() {
+            handle_key(
+                KeyCode::Char(character),
+                KeyModifiers::NONE,
+                area,
+                &mut app,
+                &tx,
+            );
+        }
+        handle_key(KeyCode::Enter, KeyModifiers::NONE, area, &mut app, &tx);
+        for character in "gc".chars() {
+            handle_key(
+                KeyCode::Char(character),
+                KeyModifiers::NONE,
+                area,
+                &mut app,
+                &tx,
+            );
+        }
+        handle_key(KeyCode::Enter, KeyModifiers::NONE, area, &mut app, &tx);
+
+        assert_eq!(app.config.aliases.providers["github-copilot"], "gc");
+        assert_eq!(
+            app.current_stats().unwrap().models[0].display_name,
+            "gc/model-0"
+        );
+        let content = fs::read_to_string(config_path).unwrap();
+        assert!(content.contains("provider_aliases"));
+        assert!(content.contains("github-copilot = \"gc\""));
+    }
+
     fn test_config(config_path: PathBuf) -> Config {
         Config {
             db_path: PathBuf::from("/tmp/opencode.db"),
@@ -2171,6 +2505,7 @@ mod tests {
             scope: Scope::All,
             color_theme: ColorTheme::Aurora,
             theme_scope: ThemeScope::Calendar,
+            aliases: config::ModelAliases::default(),
         }
     }
 
