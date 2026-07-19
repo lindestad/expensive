@@ -19,8 +19,9 @@ use crossterm::{
 use ratatui::{backend::CrosstermBackend, layout::Rect, Terminal};
 
 use crate::{
+    analytics,
     config::{self, ColorTheme, Config, Scope, ThemeScope},
-    db::{self, UsageComparison, UsageStats},
+    db::{self, UsageStats},
     time_window::{self, CalendarScale, DailyStart, Mode, PeriodKey, WeekStart},
     tui,
 };
@@ -386,16 +387,12 @@ impl AppState {
     }
 
     fn apply_cached_aliases(&mut self) {
-        let aliases = &self.config.aliases;
         for stats in self
             .stats
             .values_mut()
             .chain(self.history_stats.values_mut())
         {
-            for model in &mut stats.models {
-                model.display_name =
-                    aliases.display_name(&model.provider, &model.model_id, &model.variant);
-            }
+            analytics::apply_model_aliases(&self.config, stats);
         }
     }
 
@@ -1765,83 +1762,11 @@ fn maybe_auto_refresh(app: &mut AppState, tx: &Sender<RefreshMessage>) -> bool {
 }
 
 fn refresh_dashboard_summary(config: Config, mode: Mode) -> Result<UsageStats> {
-    let cutoff_millis =
-        time_window::cutoff_millis(mode, Local::now(), config.daily_start, config.week_start)?;
-    let mut stats = db::load_usage_summary_scoped(
-        &config.db_path,
-        mode,
-        cutoff_millis,
-        &config.scope,
-        &config.current_directory,
-    )?;
-    apply_model_aliases(&config, &mut stats);
-    if let Some(scale) = CalendarScale::from_mode(mode) {
-        let now = local_from_millis(stats.snapshot_millis.saturating_sub(1))?;
-        let period =
-            time_window::current_period(scale, now, config.daily_start, config.week_start)?;
-        attach_period_comparison(&config, &mut stats, period)?;
-    }
-    Ok(stats)
+    analytics::load_dashboard(&config, mode)
 }
 
 fn refresh_period_summary(config: Config, period: PeriodKey) -> Result<UsageStats> {
-    let mut stats = db::load_usage_summary_between_scoped(
-        &config.db_path,
-        period.mode(),
-        period.start_millis,
-        period.end_millis,
-        &config.scope,
-        &config.current_directory,
-    )?;
-    apply_model_aliases(&config, &mut stats);
-    attach_period_comparison(&config, &mut stats, period)?;
-    Ok(stats)
-}
-
-fn attach_period_comparison(
-    config: &Config,
-    stats: &mut UsageStats,
-    period: PeriodKey,
-) -> Result<()> {
-    let previous_period = time_window::shift_period(period, -1)?;
-    let mut previous = db::load_usage_summary_between_scoped(
-        &config.db_path,
-        previous_period.mode(),
-        previous_period.start_millis,
-        previous_period.end_millis,
-        &config.scope,
-        &config.current_directory,
-    )?;
-    apply_model_aliases(config, &mut previous);
-    stats.comparison = Some(UsageComparison {
-        start_millis: previous_period.start_millis,
-        end_millis: previous_period.end_millis,
-        totals: previous.totals,
-        models: previous.models,
-    });
-    stats.projected_cost = projected_cost(stats, period);
-    Ok(())
-}
-
-fn projected_cost(stats: &UsageStats, period: PeriodKey) -> Option<f64> {
-    let observed = stats
-        .snapshot_millis
-        .clamp(period.start_millis, period.end_millis);
-    if observed <= period.start_millis || observed >= period.end_millis {
-        return None;
-    }
-    let elapsed = observed.saturating_sub(period.start_millis) as f64;
-    let duration = period.end_millis.saturating_sub(period.start_millis) as f64;
-    (elapsed > 0.0).then_some(stats.totals.cost * duration / elapsed)
-}
-
-fn apply_model_aliases(config: &Config, stats: &mut UsageStats) {
-    for model in &mut stats.models {
-        model.display_name =
-            config
-                .aliases
-                .display_name(&model.provider, &model.model_id, &model.variant);
-    }
+    analytics::load_period(&config, period)
 }
 
 fn overview_steps(scale: CalendarScale, code: KeyCode) -> Option<i32> {
@@ -2580,23 +2505,6 @@ mod tests {
         assert_eq!(app.graph_metric, GraphMetric::Cost);
         assert!(rx.try_recv().is_err());
         assert!(app.current_stats().is_some());
-    }
-
-    #[test]
-    fn projects_active_period_cost_at_current_run_rate() {
-        let mut stats = many_model_stats(Mode::Daily, 1);
-        stats.snapshot_millis = 5_000;
-        stats.totals.cost = 2.0;
-        let period = PeriodKey {
-            scale: CalendarScale::Day,
-            start_millis: 1_000,
-            end_millis: 9_000,
-        };
-
-        assert_eq!(projected_cost(&stats, period), Some(4.0));
-
-        stats.snapshot_millis = period.end_millis;
-        assert_eq!(projected_cost(&stats, period), None);
     }
 
     fn test_config(config_path: PathBuf) -> Config {

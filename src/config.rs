@@ -14,7 +14,7 @@ use std::{
 };
 
 use anyhow::{anyhow, Context, Result};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 
 use crate::time_window::{DailyStart, WeekStart};
@@ -232,7 +232,7 @@ pub struct Cli {
     #[arg(long)]
     pub no_refresh: bool,
 
-    #[arg(long, value_name = "all|current|project:ID")]
+    #[arg(long, value_name = "all|current|project:ID", global = true)]
     pub scope: Option<Scope>,
 
     #[arg(long, value_enum)]
@@ -245,10 +245,51 @@ pub struct Cli {
     pub command: Option<CliCommand>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Subcommand)]
+#[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
 pub enum CliCommand {
     /// Check database access, schema compatibility, and optional capabilities.
     Doctor,
+    /// Write a machine-readable usage report to stdout.
+    Report(ReportArgs),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Args)]
+pub struct ReportArgs {
+    /// Bucket/window shape used when explicit bounds are omitted.
+    #[arg(long, value_enum, default_value = "daily")]
+    pub period: ReportPeriod,
+
+    /// Inclusive local or RFC 3339 lower bound.
+    #[arg(long, value_name = "DATE|DATETIME")]
+    pub from: Option<String>,
+
+    /// Exclusive local or RFC 3339 upper bound.
+    #[arg(long, value_name = "DATE|DATETIME")]
+    pub to: Option<String>,
+
+    /// Pretty-print JSON instead of emitting one compact line.
+    #[arg(long)]
+    pub pretty: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub enum ReportPeriod {
+    #[default]
+    Daily,
+    Weekly,
+    Monthly,
+    All,
+}
+
+impl ReportPeriod {
+    pub fn mode(self) -> crate::time_window::Mode {
+        match self {
+            Self::Daily => crate::time_window::Mode::Daily,
+            Self::Weekly => crate::time_window::Mode::Weekly,
+            Self::Monthly => crate::time_window::Mode::Monthly,
+            Self::All => crate::time_window::Mode::AllTime,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

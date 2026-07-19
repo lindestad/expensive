@@ -12,13 +12,14 @@ use std::{
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Local};
 use rusqlite::{params, Connection, OpenFlags};
+use serde::Serialize;
 
 use crate::{
     config::Scope,
     time_window::{Mode, PeriodKey},
 };
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct UsageTotals {
     pub messages: u64,
     pub cost: f64,
@@ -43,7 +44,7 @@ impl UsageTotals {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct ModelUsage {
     pub provider: String,
     pub model_id: String,
@@ -100,7 +101,7 @@ impl UsageStats {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct UsageComparison {
     pub start_millis: i64,
     pub end_millis: i64,
@@ -108,7 +109,7 @@ pub struct UsageComparison {
     pub models: Vec<ModelUsage>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct TokenBucket {
     pub start_millis: i64,
     pub end_millis: i64,
@@ -178,6 +179,28 @@ pub fn load_usage_summary_scoped(
         cutoff_millis,
         None,
         false,
+        Some(ScopeContext {
+            scope,
+            current_directory,
+        }),
+    )
+}
+
+pub fn load_usage_range_scoped(
+    path: &Path,
+    mode: Mode,
+    start_millis: Option<i64>,
+    end_millis: Option<i64>,
+    include_token_buckets: bool,
+    scope: &Scope,
+    current_directory: &Path,
+) -> Result<UsageStats> {
+    load_usage_range(
+        path,
+        mode,
+        start_millis,
+        end_millis,
+        include_token_buckets,
         Some(ScopeContext {
             scope,
             current_directory,

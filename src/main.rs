@@ -9,10 +9,11 @@ use expensive::{
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let command = cli.command;
+    let command = cli.command.clone();
     let config = config::load(cli)?;
     match command {
         Some(CliCommand::Doctor) => run_doctor(&config.db_path),
+        Some(CliCommand::Report(args)) => expensive::report::run(&config, &args),
         None => app::run(config),
     }
 }
