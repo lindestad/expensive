@@ -481,7 +481,7 @@ fn draw_scope_picker(frame: &mut Frame<'_>, area: Rect, app: &AppState, palette:
     let mut options = vec![
         (
             "All projects".to_string(),
-            "aggregate every OpenCode project".to_string(),
+            "aggregate every indexed project".to_string(),
         ),
         (
             "Current directory".to_string(),
@@ -2462,7 +2462,7 @@ fn draw_models(
 ) {
     let Some(stats) = stats else {
         let message = if loading {
-            "Loading OpenCode usage..."
+            "Loading usage..."
         } else {
             "No usage loaded. Press r to refresh."
         };
@@ -3267,7 +3267,7 @@ mod tests {
 
         assert!(output.contains("Weekly"));
         assert!(output.contains("refreshing"));
-        assert!(output.contains("Loading OpenCode usage"));
+        assert!(output.contains("Loading usage"));
         assert!(output.contains("loading"));
     }
 

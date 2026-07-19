@@ -17,7 +17,7 @@ struct JsonReport {
     schema_version: u8,
     expensive_version: &'static str,
     generated_at: String,
-    database: String,
+    index: String,
     scope: String,
     current_directory: String,
     window: ReportWindow,
@@ -98,10 +98,10 @@ fn json_report(config: &Config, stats: UsageStats) -> JsonReport {
                 cost_delta,
             });
     JsonReport {
-        schema_version: 1,
+        schema_version: 2,
         expensive_version: env!("CARGO_PKG_VERSION"),
         generated_at: stats.refreshed_at.to_rfc3339(),
-        database: config.index_path.display().to_string(),
+        index: config.index_path.display().to_string(),
         scope: config.scope.key(),
         current_directory: config.current_directory.display().to_string(),
         window: ReportWindow {
@@ -227,7 +227,8 @@ mod tests {
         let report = build_report(&config, &args).unwrap();
         let value = serde_json::to_value(report).unwrap();
 
-        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["schema_version"], 2);
+        assert_eq!(value["index"], config.index_path.display().to_string());
         assert_eq!(value["scope"], "project:project-a");
         assert_eq!(value["totals"]["messages"], 1);
         assert_eq!(value["models"][0]["display_name"], "gc/gpt-test");

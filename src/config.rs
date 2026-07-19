@@ -1,7 +1,7 @@
 //! Configuration loading for the `expensive` binary.
 //!
-//! This module resolves CLI flags, optional TOML config, and OpenCode database
-//! discovery into a single [`Config`]. The intended precedence is:
+//! This module resolves CLI flags, optional TOML config, usage-source discovery,
+//! and index storage into a single [`Config`]. The intended precedence is:
 //! command-line arguments, config file values, then built-in defaults.
 
 use std::{
@@ -215,8 +215,9 @@ impl FromStr for ThemeScope {
 }
 
 #[derive(Debug, Parser)]
-#[command(author, version, about = "OpenCode token and cost dashboard")]
+#[command(author, version, about = "AI coding harness token and cost dashboard")]
 pub struct Cli {
+    /// OpenCode source database.
     #[arg(long, value_name = "PATH", global = true)]
     pub db: Option<PathBuf>,
 
@@ -251,7 +252,7 @@ pub struct Cli {
 
 #[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
 pub enum CliCommand {
-    /// Check database access, schema compatibility, and optional capabilities.
+    /// Check the usage index, discovered sources, and OpenCode compatibility.
     Doctor,
     /// Write a machine-readable usage report to stdout.
     Report(ReportArgs),
