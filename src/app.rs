@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    hash::Hash,
     io,
     sync::mpsc::{self, Receiver, Sender},
     thread,
@@ -25,6 +26,10 @@ use crate::{
     time_window::{self, CalendarScale, DailyStart, Mode, PeriodKey, WeekStart},
     tui,
 };
+
+mod action;
+
+use action::Action;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum View {
@@ -56,6 +61,48 @@ pub struct CalendarState {
 
 pub struct ScopePickerState {
     pub selection: usize,
+}
+
+pub struct DeferredLoadState<K> {
+    pub loading: HashSet<K>,
+    pub pending: HashSet<K>,
+}
+
+impl<K> Default for DeferredLoadState<K> {
+    fn default() -> Self {
+        Self {
+            loading: HashSet::new(),
+            pending: HashSet::new(),
+        }
+    }
+}
+
+impl<K: Copy + Eq + Hash> DeferredLoadState<K> {
+    fn mark_pending(&mut self, key: K) {
+        self.pending.insert(key);
+    }
+
+    fn clear_pending(&mut self, key: K) {
+        self.pending.remove(&key);
+    }
+
+    fn begin(&mut self, key: K) -> bool {
+        if self.loading.contains(&key) || !self.pending.contains(&key) {
+            false
+        } else {
+            self.loading.insert(key);
+            true
+        }
+    }
+
+    fn finish(&mut self, key: K) {
+        self.loading.remove(&key);
+    }
+
+    fn reset(&mut self) {
+        self.loading.clear();
+        self.pending.clear();
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -162,16 +209,14 @@ pub struct AppState {
     pub mode: Mode,
     pub stats: HashMap<Mode, UsageStats>,
     pub loading: HashSet<Mode>,
-    pub graph_loading: HashSet<Mode>,
-    pub graph_refresh_pending: HashSet<Mode>,
+    pub dashboard_graph_load: DeferredLoadState<Mode>,
     pub dashboard_prefetch_attempted: HashSet<Mode>,
     pub calendar: CalendarState,
     pub calendar_costs: HashMap<PeriodKey, f64>,
     pub calendar_loading: bool,
     pub history_stats: HashMap<PeriodKey, UsageStats>,
     pub history_loading: HashSet<PeriodKey>,
-    pub history_graph_loading: HashSet<PeriodKey>,
-    pub history_graph_refresh_pending: HashSet<PeriodKey>,
+    pub history_graph_load: DeferredLoadState<PeriodKey>,
     pub error: Option<String>,
     pub last_refresh_started: Option<DateTime<Local>>,
     pub next_refresh_due: Instant,
@@ -210,8 +255,7 @@ impl AppState {
             mode: Mode::Daily,
             stats: HashMap::new(),
             loading: HashSet::new(),
-            graph_loading: HashSet::new(),
-            graph_refresh_pending: HashSet::new(),
+            dashboard_graph_load: DeferredLoadState::default(),
             dashboard_prefetch_attempted: HashSet::new(),
             calendar: CalendarState {
                 scale: CalendarScale::Day,
@@ -222,8 +266,7 @@ impl AppState {
             calendar_loading: false,
             history_stats: HashMap::new(),
             history_loading: HashSet::new(),
-            history_graph_loading: HashSet::new(),
-            history_graph_refresh_pending: HashSet::new(),
+            history_graph_load: DeferredLoadState::default(),
             error: None,
             last_refresh_started: None,
             next_refresh_due,
@@ -240,7 +283,7 @@ impl AppState {
     }
 
     pub fn is_current_graph_loading(&self) -> bool {
-        self.graph_loading.contains(&self.mode)
+        self.dashboard_graph_load.loading.contains(&self.mode)
     }
 
     pub fn selected_history_stats(&self) -> Option<&UsageStats> {
@@ -252,7 +295,9 @@ impl AppState {
     }
 
     pub fn is_selected_history_graph_loading(&self) -> bool {
-        self.history_graph_loading.contains(&self.calendar.selected)
+        self.history_graph_load
+            .loading
+            .contains(&self.calendar.selected)
     }
 
     pub fn calendar_cost(&self, period: PeriodKey) -> Option<f64> {
@@ -468,15 +513,13 @@ impl AppState {
         self.request_generation = self.request_generation.wrapping_add(1);
         self.stats.clear();
         self.loading.clear();
-        self.graph_loading.clear();
-        self.graph_refresh_pending.clear();
+        self.dashboard_graph_load.reset();
         self.dashboard_prefetch_attempted.clear();
         self.calendar_costs.clear();
         self.calendar_loading = false;
         self.history_stats.clear();
         self.history_loading.clear();
-        self.history_graph_loading.clear();
-        self.history_graph_refresh_pending.clear();
+        self.history_graph_load.reset();
         self.dashboard_token_bucket = None;
         self.history_token_bucket = None;
         self.error = None;
@@ -540,22 +583,22 @@ impl AppState {
     }
 
     fn trigger_dashboard_graph_refresh(&mut self, mode: Mode, tx: &Sender<RefreshMessage>) {
-        if self.graph_loading.contains(&mode) || !self.graph_refresh_pending.contains(&mode) {
+        if !self.dashboard_graph_load.begin(mode) {
             return;
         }
         let Some(stats) = self.stats.get(&mode) else {
+            self.dashboard_graph_load.finish(mode);
             return;
         };
         if stats.totals.messages == 0 {
-            self.graph_refresh_pending.remove(&mode);
+            self.dashboard_graph_load.finish(mode);
+            self.dashboard_graph_load.clear_pending(mode);
             return;
         }
 
         let cutoff_millis = stats.cutoff_millis;
         let end_millis = stats.end_millis;
         let snapshot_millis = stats.snapshot_millis;
-        self.graph_loading.insert(mode);
-
         let tx = tx.clone();
         let config = self.config.clone();
         let generation = self.request_generation;
@@ -719,21 +762,20 @@ impl AppState {
     }
 
     fn trigger_history_graph_refresh(&mut self, period: PeriodKey, tx: &Sender<RefreshMessage>) {
-        if self.history_graph_loading.contains(&period)
-            || !self.history_graph_refresh_pending.contains(&period)
-        {
+        if !self.history_graph_load.begin(period) {
             return;
         }
         let Some(stats) = self.history_stats.get(&period) else {
+            self.history_graph_load.finish(period);
             return;
         };
         if stats.totals.messages == 0 {
-            self.history_graph_refresh_pending.remove(&period);
+            self.history_graph_load.finish(period);
+            self.history_graph_load.clear_pending(period);
             return;
         }
 
         let snapshot_millis = stats.snapshot_millis;
-        self.history_graph_loading.insert(period);
 
         let tx = tx.clone();
         let config = self.config.clone();
@@ -776,9 +818,9 @@ impl AppState {
                     retained_graph = !stats.token_buckets.is_empty();
                 }
                 if stats.totals.messages > 0 {
-                    self.graph_refresh_pending.insert(mode);
+                    self.dashboard_graph_load.mark_pending(mode);
                 } else {
-                    self.graph_refresh_pending.remove(&mode);
+                    self.dashboard_graph_load.clear_pending(mode);
                 }
                 self.stats.insert(mode, stats);
                 if self.view == View::Dashboard && mode == self.mode {
@@ -810,7 +852,7 @@ impl AppState {
                 .get(&mode)
                 .map(|stats| stats.token_buckets.is_empty())
                 .unwrap_or(false);
-        self.graph_loading.remove(&mode);
+        self.dashboard_graph_load.finish(mode);
         let is_current_request = self
             .stats
             .get(&mode)
@@ -821,7 +863,7 @@ impl AppState {
         if !is_current_request {
             return false;
         }
-        self.graph_refresh_pending.remove(&mode);
+        self.dashboard_graph_load.clear_pending(mode);
         match result {
             Ok(token_buckets) => {
                 let mut graph_changed = false;
@@ -900,9 +942,9 @@ impl AppState {
                     retained_graph = !stats.token_buckets.is_empty();
                 }
                 if stats.totals.messages > 0 {
-                    self.history_graph_refresh_pending.insert(period);
+                    self.history_graph_load.mark_pending(period);
                 } else {
-                    self.history_graph_refresh_pending.remove(&period);
+                    self.history_graph_load.clear_pending(period);
                 }
                 self.history_stats.insert(period, stats);
                 if self.view == View::CalendarDetail && period == self.calendar.selected {
@@ -933,7 +975,7 @@ impl AppState {
                 .get(&period)
                 .map(|stats| stats.token_buckets.is_empty())
                 .unwrap_or(false);
-        self.history_graph_loading.remove(&period);
+        self.history_graph_load.finish(period);
         let is_current_request = self
             .history_stats
             .get(&period)
@@ -942,7 +984,7 @@ impl AppState {
         if !is_current_request {
             return false;
         }
-        self.history_graph_refresh_pending.remove(&period);
+        self.history_graph_load.clear_pending(period);
         match result {
             Ok(token_buckets) => {
                 let mut graph_changed = false;
@@ -986,10 +1028,10 @@ impl AppState {
 
         match self.view {
             View::Dashboard => {
-                let was_loading = self.graph_loading.contains(&self.mode);
+                let was_loading = self.dashboard_graph_load.loading.contains(&self.mode);
                 self.trigger_dashboard_graph_refresh(self.mode, tx);
                 !was_loading
-                    && self.graph_loading.contains(&self.mode)
+                    && self.dashboard_graph_load.loading.contains(&self.mode)
                     && self
                         .current_stats()
                         .map(|stats| stats.token_buckets.is_empty())
@@ -997,10 +1039,10 @@ impl AppState {
             }
             View::CalendarDetail => {
                 let period = self.calendar.selected;
-                let was_loading = self.history_graph_loading.contains(&period);
+                let was_loading = self.history_graph_load.loading.contains(&period);
                 self.trigger_history_graph_refresh(period, tx);
                 !was_loading
-                    && self.history_graph_loading.contains(&period)
+                    && self.history_graph_load.loading.contains(&period)
                     && self
                         .selected_history_stats()
                         .map(|stats| stats.token_buckets.is_empty())
@@ -1014,10 +1056,10 @@ impl AppState {
         if self.view != View::Dashboard
             || !self.stats.contains_key(&self.mode)
             || !self.loading.is_empty()
-            || !self.graph_loading.is_empty()
+            || !self.dashboard_graph_load.loading.is_empty()
             || self.calendar_loading
             || !self.history_loading.is_empty()
-            || !self.history_graph_loading.is_empty()
+            || !self.history_graph_load.loading.is_empty()
         {
             return;
         }
@@ -1485,29 +1527,33 @@ fn handle_key(
         }
     }
 
-    match code {
-        KeyCode::Char('q') => true,
-        KeyCode::Esc => match app.view {
+    let Some(action) = Action::from_key(code, modifiers, app.view, app.calendar.scale) else {
+        return false;
+    };
+    apply_action(action, app, tx)
+}
+
+fn apply_action(action: Action, app: &mut AppState, tx: &Sender<RefreshMessage>) -> bool {
+    match action {
+        Action::Quit => true,
+        Action::Back => match app.view {
             View::Dashboard => true,
             View::CalendarOverview => {
-                app.show_help = false;
                 app.view = View::Dashboard;
                 app.error = None;
                 false
             }
             View::CalendarDetail => {
-                app.show_help = false;
                 app.view = View::CalendarOverview;
                 app.error = None;
                 false
             }
         },
-        KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => true,
-        KeyCode::Char('c') if app.view == View::Dashboard => {
+        Action::OpenCalendar => {
             app.enter_calendar(tx);
             false
         }
-        KeyCode::Tab => {
+        Action::NextTab => {
             match app.view {
                 View::Dashboard => app.switch_mode(app.mode.next(), tx),
                 View::CalendarOverview | View::CalendarDetail => {
@@ -1518,7 +1564,7 @@ fn handle_key(
             }
             false
         }
-        KeyCode::BackTab => {
+        Action::PreviousTab => {
             match app.view {
                 View::Dashboard => app.switch_mode(app.mode.previous(), tx),
                 View::CalendarOverview | View::CalendarDetail => {
@@ -1529,42 +1575,25 @@ fn handle_key(
             }
             false
         }
-        KeyCode::Char('r') => {
+        Action::Refresh => {
             app.trigger_current_refresh(tx);
             app.next_refresh_due = Instant::now() + app.config.refresh_interval;
             false
         }
-        KeyCode::Char('g') => {
+        Action::ToggleGraphMetric => {
             app.graph_metric = app.graph_metric.toggle();
             false
         }
-        KeyCode::Char('p') => {
+        Action::OpenScopePicker => {
             app.open_scope_picker();
             false
         }
-        KeyCode::Enter | KeyCode::Char(' ') if app.view == View::CalendarOverview => {
+        Action::OpenSelectedPeriod => {
             app.open_calendar_detail(tx);
             false
         }
-        _ => {
-            if app.view == View::CalendarOverview {
-                if let Some(steps) = overview_steps(app.calendar.scale, code) {
-                    apply_calendar_action(app, tx, |app, tx| {
-                        app.move_calendar_selection(steps, tx)
-                    });
-                    return false;
-                }
-            }
-
-            if app.view == View::CalendarDetail {
-                if let Some(steps) = detail_steps(code) {
-                    apply_calendar_action(app, tx, |app, tx| {
-                        app.move_calendar_selection(steps, tx)
-                    });
-                    return false;
-                }
-            }
-
+        Action::MoveCalendar(steps) => {
+            apply_calendar_action(app, tx, |app, tx| app.move_calendar_selection(steps, tx));
             false
         }
     }
@@ -1767,32 +1796,6 @@ fn refresh_dashboard_summary(config: Config, mode: Mode) -> Result<UsageStats> {
 
 fn refresh_period_summary(config: Config, period: PeriodKey) -> Result<UsageStats> {
     analytics::load_period(&config, period)
-}
-
-fn overview_steps(scale: CalendarScale, code: KeyCode) -> Option<i32> {
-    match code {
-        KeyCode::Left | KeyCode::Char('h') => Some(-1),
-        KeyCode::Right | KeyCode::Char('l') => Some(1),
-        KeyCode::Up | KeyCode::Char('k') => Some(-overview_columns(scale)),
-        KeyCode::Down | KeyCode::Char('j') => Some(overview_columns(scale)),
-        _ => None,
-    }
-}
-
-fn overview_columns(scale: CalendarScale) -> i32 {
-    match scale {
-        CalendarScale::Day => 7,
-        CalendarScale::Week => 4,
-        CalendarScale::Month => 3,
-    }
-}
-
-fn detail_steps(code: KeyCode) -> Option<i32> {
-    match code {
-        KeyCode::Left | KeyCode::Up | KeyCode::Char('h') | KeyCode::Char('k') => Some(-1),
-        KeyCode::Right | KeyCode::Down | KeyCode::Char('l') | KeyCode::Char('j') => Some(1),
-        _ => None,
-    }
 }
 
 fn apply_calendar_action(
@@ -2282,7 +2285,7 @@ mod tests {
         app.apply_dashboard_refresh(Mode::Daily, Ok(summary));
 
         assert!(app.current_stats().unwrap().token_buckets.is_empty());
-        assert!(app.graph_refresh_pending.contains(&Mode::Daily));
+        assert!(app.dashboard_graph_load.pending.contains(&Mode::Daily));
     }
 
     #[test]
@@ -2302,7 +2305,7 @@ mod tests {
 
         assert_eq!(app.current_stats().unwrap().token_buckets, previous_buckets);
         assert_eq!(app.dashboard_token_bucket, Some(2));
-        assert!(app.graph_refresh_pending.contains(&Mode::Daily));
+        assert!(app.dashboard_graph_load.pending.contains(&Mode::Daily));
     }
 
     #[test]
@@ -2320,7 +2323,7 @@ mod tests {
         summary.snapshot_millis = previous_snapshot_millis + 60_000;
         summary.token_buckets.clear();
         app.apply_dashboard_refresh(Mode::Daily, Ok(summary));
-        app.graph_loading.insert(Mode::Daily);
+        app.dashboard_graph_load.loading.insert(Mode::Daily);
 
         let replacement = vec![TokenBucket {
             start_millis: 0,
@@ -2337,7 +2340,7 @@ mod tests {
 
         assert!(!changed);
         assert_eq!(app.current_stats().unwrap().token_buckets, previous_buckets);
-        assert!(app.graph_refresh_pending.contains(&Mode::Daily));
+        assert!(app.dashboard_graph_load.pending.contains(&Mode::Daily));
     }
 
     #[test]
@@ -2349,8 +2352,8 @@ mod tests {
         let snapshot_millis = stats.snapshot_millis;
         let buckets = stats.token_buckets.clone();
         app.stats.insert(Mode::Daily, stats);
-        app.graph_loading.insert(Mode::Daily);
-        app.graph_refresh_pending.insert(Mode::Daily);
+        app.dashboard_graph_load.loading.insert(Mode::Daily);
+        app.dashboard_graph_load.pending.insert(Mode::Daily);
 
         let changed = app.apply_dashboard_graph_refresh(
             Mode::Daily,
@@ -2360,7 +2363,7 @@ mod tests {
         );
 
         assert!(!changed);
-        assert!(!app.graph_refresh_pending.contains(&Mode::Daily));
+        assert!(!app.dashboard_graph_load.pending.contains(&Mode::Daily));
     }
 
     #[test]
@@ -2391,7 +2394,7 @@ mod tests {
             previous_buckets
         );
         assert_eq!(app.history_token_bucket, Some(2));
-        assert!(app.history_graph_refresh_pending.contains(&period));
+        assert!(app.history_graph_load.pending.contains(&period));
     }
 
     #[test]
@@ -2505,6 +2508,20 @@ mod tests {
         assert_eq!(app.graph_metric, GraphMetric::Cost);
         assert!(rx.try_recv().is_err());
         assert!(app.current_stats().is_some());
+    }
+
+    #[test]
+    fn deferred_load_state_keeps_pending_work_until_completion() {
+        let mut state = DeferredLoadState::default();
+        state.mark_pending(Mode::Daily);
+
+        assert!(state.begin(Mode::Daily));
+        assert!(!state.begin(Mode::Daily));
+        state.finish(Mode::Daily);
+        assert!(state.begin(Mode::Daily));
+        state.finish(Mode::Daily);
+        state.clear_pending(Mode::Daily);
+        assert!(!state.begin(Mode::Daily));
     }
 
     fn test_config(config_path: PathBuf) -> Config {

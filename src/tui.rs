@@ -3100,7 +3100,7 @@ mod tests {
         let mut stats = many_model_stats(Mode::Daily, 8);
         stats.token_buckets.clear();
         let mut app = app_with_stats(Mode::Daily, stats);
-        app.graph_loading.insert(Mode::Daily);
+        app.dashboard_graph_load.loading.insert(Mode::Daily);
 
         let output = render(&app, 100, 24);
 
@@ -3570,16 +3570,14 @@ mod tests {
             mode,
             stats: stats_by_mode,
             loading: HashSet::new(),
-            graph_loading: HashSet::new(),
-            graph_refresh_pending: HashSet::new(),
+            dashboard_graph_load: crate::app::DeferredLoadState::default(),
             dashboard_prefetch_attempted: HashSet::new(),
             calendar: test_calendar(),
             calendar_costs: HashMap::new(),
             calendar_loading: false,
             history_stats: HashMap::new(),
             history_loading: HashSet::new(),
-            history_graph_loading: HashSet::new(),
-            history_graph_refresh_pending: HashSet::new(),
+            history_graph_load: crate::app::DeferredLoadState::default(),
             error: None,
             last_refresh_started: None,
             next_refresh_due: Instant::now() + Duration::from_secs(60),
@@ -3607,16 +3605,14 @@ mod tests {
             mode,
             stats: HashMap::new(),
             loading: HashSet::from([mode]),
-            graph_loading: HashSet::new(),
-            graph_refresh_pending: HashSet::new(),
+            dashboard_graph_load: crate::app::DeferredLoadState::default(),
             dashboard_prefetch_attempted: HashSet::new(),
             calendar: test_calendar(),
             calendar_costs: HashMap::new(),
             calendar_loading: false,
             history_stats: HashMap::new(),
             history_loading: HashSet::new(),
-            history_graph_loading: HashSet::new(),
-            history_graph_refresh_pending: HashSet::new(),
+            history_graph_load: crate::app::DeferredLoadState::default(),
             error: None,
             last_refresh_started: None,
             next_refresh_due: Instant::now() + Duration::from_secs(60),
@@ -3644,8 +3640,7 @@ mod tests {
             mode: Mode::Daily,
             stats: HashMap::new(),
             loading: HashSet::new(),
-            graph_loading: HashSet::new(),
-            graph_refresh_pending: HashSet::new(),
+            dashboard_graph_load: crate::app::DeferredLoadState::default(),
             dashboard_prefetch_attempted: HashSet::new(),
             calendar: CalendarState {
                 scale: selected.scale,
@@ -3661,8 +3656,7 @@ mod tests {
             calendar_loading: false,
             history_stats: HashMap::new(),
             history_loading: HashSet::new(),
-            history_graph_loading: HashSet::new(),
-            history_graph_refresh_pending: HashSet::new(),
+            history_graph_load: crate::app::DeferredLoadState::default(),
             error: None,
             last_refresh_started: None,
             next_refresh_due: Instant::now() + Duration::from_secs(60),
