@@ -15,6 +15,7 @@ categories = ["command-line-utilities"]
 
 [dependencies]
 anyhow = "1"
+blake3 = "1"
 chrono = { version = "0.4", features = ["clock"] }
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"

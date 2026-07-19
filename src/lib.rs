@@ -25,6 +25,7 @@ pub mod app;
 pub mod config;
 pub mod db;
 pub mod format;
+pub mod index;
 pub mod report;
 pub mod time_window;
 #[doc(hidden)]
