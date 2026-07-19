@@ -119,18 +119,20 @@ pub enum ConfigEditorItem {
     WeekStart,
     ColorTheme,
     ThemeScope,
+    ShowComparison,
     ProviderAliases,
     ModelAliases,
 }
 
 impl ConfigEditorItem {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::AutoRefresh,
         Self::DailyStart,
         Self::RefreshSeconds,
         Self::WeekStart,
         Self::ColorTheme,
         Self::ThemeScope,
+        Self::ShowComparison,
         Self::ProviderAliases,
         Self::ModelAliases,
     ];
@@ -143,6 +145,7 @@ impl ConfigEditorItem {
             Self::WeekStart => "week_start",
             Self::ColorTheme => "color_theme",
             Self::ThemeScope => "theme_scope",
+            Self::ShowComparison => "show_comparison",
             Self::ProviderAliases => "provider_aliases",
             Self::ModelAliases => "model_aliases",
         }
@@ -1203,6 +1206,9 @@ impl AppState {
                     direction,
                 );
             }
+            ConfigEditorItem::ShowComparison => {
+                self.config.show_comparison = !self.config.show_comparison;
+            }
             ConfigEditorItem::ProviderAliases => {
                 self.open_alias_editor(AliasKind::Provider);
                 return Ok(());
@@ -1910,6 +1916,28 @@ mod tests {
     }
 
     #[test]
+    fn help_space_enables_comparison_panel_and_saves_config() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config_path = tempdir.path().join("config.toml");
+        let mut app = AppState::new(test_config(config_path.clone())).unwrap();
+        app.show_help = true;
+        app.config_selection = ConfigEditorItem::ALL
+            .iter()
+            .position(|item| *item == ConfigEditorItem::ShowComparison)
+            .unwrap();
+        let (tx, _rx) = mpsc::channel();
+        let area = Rect::new(0, 0, 120, 40);
+
+        let should_quit = handle_key(KeyCode::Char(' '), KeyModifiers::NONE, area, &mut app, &tx);
+
+        assert!(!should_quit);
+        assert!(app.config.show_comparison);
+        assert!(fs::read_to_string(config_path)
+            .unwrap()
+            .contains("show_comparison = true"));
+    }
+
+    #[test]
     fn help_mouse_wheel_moves_config_selection() {
         let tempdir = tempfile::tempdir().unwrap();
         let config_path = tempdir.path().join("config.toml");
@@ -2533,6 +2561,7 @@ mod tests {
             week_start: WeekStart::default(),
             refresh_interval: Duration::from_secs(60),
             auto_refresh: true,
+            show_comparison: false,
             scope: Scope::All,
             color_theme: ColorTheme::Aurora,
             theme_scope: ThemeScope::Calendar,

@@ -219,6 +219,7 @@ struct StatsViewState<'a> {
     model_scroll: usize,
     selected_token_bucket: Option<usize>,
     graph_metric: GraphMetric,
+    show_comparison: bool,
 }
 
 #[derive(Clone)]
@@ -262,6 +263,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &AppState) {
                 model_scroll: app.dashboard_model_scroll,
                 selected_token_bucket: app.dashboard_token_bucket,
                 graph_metric: app.graph_metric,
+                show_comparison: app.config.show_comparison,
             },
             palette,
         ),
@@ -280,6 +282,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &AppState) {
                 model_scroll: app.history_model_scroll,
                 selected_token_bucket: app.history_token_bucket,
                 graph_metric: app.graph_metric,
+                show_comparison: app.config.show_comparison,
             },
             palette,
         ),
@@ -335,6 +338,7 @@ pub fn model_breakdown_area(area: Rect, app: &AppState) -> Option<Rect> {
             main_body_area(area),
             Some(stats),
             graph_available_for_view(app),
+            app.config.show_comparison,
         )
         .models
     })
@@ -356,6 +360,7 @@ pub fn token_graph_area(area: Rect, app: &AppState) -> Option<Rect> {
             main_body_area(area),
             Some(stats),
             graph_available_for_view(app),
+            app.config.show_comparison,
         )
         .graph
     })
@@ -366,7 +371,13 @@ pub fn token_graph_capacity_area(area: Rect, app: &AppState) -> Option<Rect> {
         if stats.totals.messages == 0 {
             return None;
         }
-        stats_view_layout(main_body_area(area), Some(stats), true).graph
+        stats_view_layout(
+            main_body_area(area),
+            Some(stats),
+            true,
+            app.config.show_comparison,
+        )
+        .graph
     })
 }
 
@@ -1214,6 +1225,13 @@ fn config_value_width(item: ConfigEditorItem, app: &AppState) -> usize {
         ConfigEditorItem::WeekStart => text_width(" monday  sunday "),
         ConfigEditorItem::ColorTheme => text_width(" aurora  ember  ocean  forest  graphite "),
         ConfigEditorItem::ThemeScope => text_width(" calendar  all "),
+        ConfigEditorItem::ShowComparison => {
+            if app.config.show_comparison {
+                text_width(" [x]  visible")
+            } else {
+                text_width(" [ ]  hidden")
+            }
+        }
         ConfigEditorItem::ProviderAliases => text_width(&format!(
             " {} aliases  edit ",
             app.config.aliases.providers.len()
@@ -1348,6 +1366,24 @@ fn config_value_tokens(
             ],
             palette,
         ),
+        ConfigEditorItem::ShowComparison => vec![
+            ValueToken {
+                text: if app.config.show_comparison {
+                    " [x] ".to_string()
+                } else {
+                    " [ ] ".to_string()
+                },
+                style: checkbox_style(app.config.show_comparison, palette),
+            },
+            ValueToken {
+                text: if app.config.show_comparison {
+                    "visible".to_string()
+                } else {
+                    "hidden".to_string()
+                },
+                style: Style::default().fg(palette.muted),
+            },
+        ],
         ConfigEditorItem::ProviderAliases => {
             alias_config_tokens(app.config.aliases.providers.len(), palette)
         }
@@ -1552,7 +1588,7 @@ fn draw_stats_view(frame: &mut Frame<'_>, area: Rect, view: StatsViewState<'_>, 
         .map(|stats| !stats.token_buckets.is_empty())
         .unwrap_or(false)
         || view.graph_loading;
-    let layout = stats_view_layout(area, view.stats, graph_available);
+    let layout = stats_view_layout(area, view.stats, graph_available, view.show_comparison);
 
     draw_summary(frame, layout.summary, view.stats, view.loading, palette);
     if let (Some(stats), Some(comparison)) = (view.stats, layout.comparison) {
@@ -1584,10 +1620,16 @@ fn draw_stats_view(frame: &mut Frame<'_>, area: Rect, view: StatsViewState<'_>, 
     }
 }
 
-fn stats_view_layout(area: Rect, stats: Option<&UsageStats>, graph_available: bool) -> StatsLayout {
-    let show_comparison = stats
-        .map(|stats| stats.comparison.is_some() && area.height >= 18)
-        .unwrap_or(false);
+fn stats_view_layout(
+    area: Rect,
+    stats: Option<&UsageStats>,
+    graph_available: bool,
+    comparison_enabled: bool,
+) -> StatsLayout {
+    let show_comparison = comparison_enabled
+        && stats
+            .map(|stats| stats.comparison.is_some() && area.height >= 18)
+            .unwrap_or(false);
     let chunks = if show_comparison {
         Layout::default()
             .direction(Direction::Vertical)
@@ -3085,7 +3127,13 @@ mod tests {
                 },
             }],
         });
-        let app = app_with_stats(Mode::Daily, stats);
+        let mut app = app_with_stats(Mode::Daily, stats);
+
+        let output = render(&app, 140, 30);
+
+        assert!(!output.contains("Compared with previous period"));
+
+        app.config.show_comparison = true;
 
         let output = render(&app, 140, 30);
 
@@ -3312,13 +3360,15 @@ mod tests {
         let mut app = app_loading(Mode::Daily);
         app.show_help = true;
 
-        let output = render(&app, 120, 32);
+        let output = render(&app, 120, 34);
 
         assert!(output.contains("Help"));
         assert!(output.contains("Config"));
         assert!(output.contains("daily_start"));
         assert!(output.contains("refresh_seconds"));
         assert!(output.contains("week_start"));
+        assert!(output.contains("show_comparison"));
+        assert!(output.contains("hidden"));
         assert!(output.contains("[x]"));
         assert!(output.contains("Space / Enter"));
         assert!(output.contains("/tmp/expensive/config.toml"));
@@ -3694,6 +3744,7 @@ mod tests {
             week_start: WeekStart::default(),
             refresh_interval: Duration::from_secs(60),
             auto_refresh: true,
+            show_comparison: false,
             scope: Scope::All,
             color_theme: ColorTheme::Aurora,
             theme_scope: ThemeScope::Calendar,

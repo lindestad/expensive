@@ -301,6 +301,7 @@ pub struct Config {
     pub week_start: WeekStart,
     pub refresh_interval: Duration,
     pub auto_refresh: bool,
+    pub show_comparison: bool,
     pub scope: Scope,
     pub color_theme: ColorTheme,
     pub theme_scope: ThemeScope,
@@ -313,6 +314,7 @@ struct FileConfig {
     week_start: Option<String>,
     refresh_seconds: Option<u64>,
     auto_refresh: Option<bool>,
+    show_comparison: Option<bool>,
     scope: Option<String>,
     color_theme: Option<String>,
     theme_scope: Option<String>,
@@ -357,6 +359,7 @@ fn resolve_config(
     } else {
         file_config.auto_refresh.unwrap_or(true)
     };
+    let show_comparison = file_config.show_comparison.unwrap_or(false);
 
     let scope = match (cli.scope, file_config.scope.as_deref()) {
         (Some(value), _) => value,
@@ -384,6 +387,7 @@ fn resolve_config(
         week_start,
         refresh_interval: Duration::from_secs(refresh_seconds),
         auto_refresh,
+        show_comparison,
         scope,
         color_theme,
         theme_scope,
@@ -431,6 +435,7 @@ fn format_config(config: &Config) -> String {
             "week_start = \"{}\"\n",
             "refresh_seconds = {}\n",
             "auto_refresh = {}\n",
+            "show_comparison = {}\n",
             "color_theme = \"{}\"\n",
             "theme_scope = \"{}\"\n",
             "scope = \"{}\"\n",
@@ -439,6 +444,7 @@ fn format_config(config: &Config) -> String {
         config.week_start,
         config.refresh_interval.as_secs(),
         config.auto_refresh,
+        config.show_comparison,
         config.color_theme,
         config.theme_scope,
         config.scope,
@@ -539,6 +545,7 @@ mod tests {
         assert_eq!(config.week_start, WeekStart::default());
         assert_eq!(config.refresh_interval, Duration::from_secs(60));
         assert!(config.auto_refresh);
+        assert!(!config.show_comparison);
         assert_eq!(config.scope, Scope::All);
         assert_eq!(config.color_theme, ColorTheme::Aurora);
         assert_eq!(config.theme_scope, ThemeScope::Calendar);
@@ -560,6 +567,7 @@ mod tests {
             week_start: Some("monday".to_string()),
             refresh_seconds: Some(60),
             auto_refresh: Some(true),
+            show_comparison: Some(true),
             scope: Some("all".to_string()),
             color_theme: Some("ember".to_string()),
             theme_scope: Some("calendar".to_string()),
@@ -586,6 +594,7 @@ mod tests {
         assert_eq!(config.week_start, WeekStart::Sunday);
         assert_eq!(config.refresh_interval, Duration::from_secs(10));
         assert!(!config.auto_refresh);
+        assert!(config.show_comparison);
         assert_eq!(config.scope, Scope::All);
         assert_eq!(config.color_theme, ColorTheme::Ocean);
         assert_eq!(config.theme_scope, ThemeScope::All);
@@ -596,6 +605,7 @@ mod tests {
         let file_config = FileConfig {
             week_start: Some("sunday".to_string()),
             auto_refresh: Some(false),
+            show_comparison: Some(true),
             color_theme: Some("forest".to_string()),
             theme_scope: Some("all".to_string()),
             ..FileConfig::default()
@@ -612,6 +622,7 @@ mod tests {
 
         assert_eq!(config.week_start, WeekStart::Sunday);
         assert!(!config.auto_refresh);
+        assert!(config.show_comparison);
         assert_eq!(config.color_theme, ColorTheme::Forest);
         assert_eq!(config.theme_scope, ThemeScope::All);
     }
@@ -628,6 +639,7 @@ mod tests {
             week_start: WeekStart::Sunday,
             refresh_interval: Duration::from_secs(15),
             auto_refresh: false,
+            show_comparison: true,
             scope: Scope::All,
             color_theme: ColorTheme::Forest,
             theme_scope: ThemeScope::All,
@@ -644,6 +656,7 @@ mod tests {
         assert!(content.contains(r#"week_start = "sunday""#));
         assert!(content.contains("refresh_seconds = 15"));
         assert!(content.contains("auto_refresh = false"));
+        assert!(content.contains("show_comparison = true"));
         assert!(content.contains(r#"color_theme = "forest""#));
         assert!(content.contains(r#"theme_scope = "all""#));
         assert!(content.contains(r#"scope = "all""#));

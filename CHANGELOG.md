@@ -4,7 +4,7 @@
 
 - add all-project, current-directory, and persisted project scopes with a TUI picker
 - add provider and model aliases in TOML and the interactive config editor
-- add previous-period comparisons, model cost attribution, projections, and cost graphs
+- add optional previous-period comparisons, model cost attribution, projections, and cost graphs
 - add versioned JSON reports with date bounds and project scopes
 - add database schema diagnostics and the `doctor` command
 - keep deferred graphs on the same snapshot as their summary and ignore stale scope results

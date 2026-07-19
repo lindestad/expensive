@@ -194,6 +194,7 @@ mod tests {
             week_start: WeekStart::default(),
             refresh_interval: Duration::from_secs(60),
             auto_refresh: false,
+            show_comparison: false,
             scope: Scope::Project("project-a".to_string()),
             color_theme: ColorTheme::default(),
             theme_scope: ThemeScope::default(),
