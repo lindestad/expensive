@@ -228,7 +228,7 @@ pub struct AppState {
     pub last_refresh_started: Option<DateTime<Local>>,
     pub next_refresh_due: Instant,
     pub logical_day: PeriodKey,
-    pub(crate) pending_full_source_sync: bool,
+    pub(crate) pending_source_sync: Option<SyncMode>,
     pub(crate) request_generation: u64,
 }
 
@@ -282,7 +282,7 @@ impl AppState {
             last_refresh_started: None,
             next_refresh_due,
             logical_day: selected,
-            pending_full_source_sync: false,
+            pending_source_sync: None,
             request_generation: 0,
         })
     }
@@ -556,9 +556,10 @@ impl AppState {
 
     fn trigger_source_sync(&mut self, mode: SyncMode, tx: &Sender<RefreshMessage>) {
         if self.source_sync.is_some() {
-            if mode == SyncMode::Full {
-                self.pending_full_source_sync = true;
-            }
+            self.pending_source_sync = Some(match (self.pending_source_sync, mode) {
+                (Some(SyncMode::Full), _) | (_, SyncMode::Full) => SyncMode::Full,
+                _ => SyncMode::Incremental,
+            });
             return;
         }
         self.source_sync = Some(mode);
@@ -592,8 +593,8 @@ impl AppState {
             Err(error) => self.source_sync_error = Some(error),
         }
 
-        if std::mem::take(&mut self.pending_full_source_sync) {
-            self.trigger_source_sync(SyncMode::Full, tx);
+        if let Some(mode) = self.pending_source_sync.take() {
+            self.trigger_source_sync(mode, tx);
         }
     }
 
@@ -2620,6 +2621,23 @@ mod tests {
 
         assert!(!changed);
         assert!(app.stats.is_empty());
+    }
+
+    #[test]
+    fn coalesces_source_refreshes_while_one_is_running() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut app = AppState::new(test_config(tempdir.path().join("config.toml"))).unwrap();
+        let (tx, _rx) = mpsc::channel();
+        app.source_sync = Some(SyncMode::Incremental);
+
+        app.trigger_source_sync(SyncMode::Incremental, &tx);
+        assert_eq!(app.pending_source_sync, Some(SyncMode::Incremental));
+
+        app.trigger_source_sync(SyncMode::Full, &tx);
+        assert_eq!(app.pending_source_sync, Some(SyncMode::Full));
+
+        app.trigger_source_sync(SyncMode::Incremental, &tx);
+        assert_eq!(app.pending_source_sync, Some(SyncMode::Full));
     }
 
     #[test]
