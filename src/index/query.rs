@@ -150,6 +150,8 @@ fn load_model_usage(
     let mut statement = connection.prepare(
         "SELECT provider, model, variant,
                 COALESCE(SUM(messages), 0) AS messages,
+                COALESCE(SUM(CASE WHEN cost_microusd IS NULL THEN messages ELSE 0 END), 0)
+                    AS unpriced_messages,
                 COALESCE(SUM(cost_microusd), 0) AS cost_microusd,
                 COALESCE(SUM(total_tokens), 0) AS total_tokens,
                 COALESCE(SUM(input_tokens), 0) AS input_tokens,
@@ -174,6 +176,7 @@ fn load_model_usage(
             variant,
             totals: UsageTotals {
                 messages: nonnegative(row.get("messages")?),
+                unpriced_messages: nonnegative(row.get("unpriced_messages")?),
                 cost: micros_to_usd(row.get("cost_microusd")?),
                 total: nonnegative(row.get("total_tokens")?),
                 input: nonnegative(row.get("input_tokens")?),
@@ -527,6 +530,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(stats.totals.total_tokens(), 12);
+        assert_eq!(stats.totals.unpriced_messages, 1);
         assert_eq!(stats.totals.input, 6);
         assert_eq!(stats.totals.cache_read, 4);
         assert_eq!(stats.token_buckets[0].tokens, 12);

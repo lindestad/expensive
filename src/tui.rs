@@ -2318,8 +2318,23 @@ fn draw_summary(
         .map(|totals| format::cost(totals.cost))
         .unwrap_or_else(|| "--".to_string());
     let messages = totals
-        .map(|totals| format!("{} msgs", format::integer(totals.messages)))
+        .map(|totals| {
+            if totals.unpriced_messages > 0 {
+                format!(
+                    "{} msgs | {} unpriced",
+                    format::integer(totals.messages),
+                    format::integer(totals.unpriced_messages)
+                )
+            } else {
+                format!("{} msgs", format::integer(totals.messages))
+            }
+        })
         .unwrap_or_else(|| metric_sub("messages", loading));
+    let cost_title = if totals.is_some_and(|totals| totals.unpriced_messages > 0) {
+        "Known Cost"
+    } else {
+        "Cost"
+    };
     let total_tokens = totals
         .map(|totals| format::tokens(totals.total_tokens()))
         .unwrap_or_else(|| "--".to_string());
@@ -2348,7 +2363,7 @@ fn draw_summary(
     draw_metric(
         frame,
         chunks[0],
-        "Cost",
+        cost_title,
         &cost,
         &messages,
         MetricStyle {
@@ -3130,6 +3145,7 @@ mod tests {
             end_millis: local_millis(2026, 6, 15, 4, 0, 0),
             totals: UsageTotals {
                 messages: 1,
+                unpriced_messages: 0,
                 cost: 1.0,
                 total: 10,
                 input: 1,
@@ -3144,6 +3160,7 @@ mod tests {
                 display_name: "provider/gpt-test".to_string(),
                 totals: UsageTotals {
                     messages: 1,
+                    unpriced_messages: 0,
                     cost: 0.5,
                     total: 10,
                     input: 1,
@@ -3266,6 +3283,18 @@ mod tests {
         assert!(output.contains("all categories"));
         assert!(output.contains("input / output"));
         assert!(output.contains("read / write"));
+    }
+
+    #[test]
+    fn labels_partial_cost_totals() {
+        let mut stats = sample_stats(Mode::Daily, None);
+        stats.totals.unpriced_messages = 1;
+        let app = app_with_stats(Mode::Daily, stats);
+
+        let output = render(&app, 100, 24);
+
+        assert!(output.contains("Known Cost"));
+        assert!(output.contains("1 unpriced"));
     }
 
     #[test]
@@ -3801,6 +3830,7 @@ mod tests {
             display_name: "provider/gpt-test (high)".to_string(),
             totals: UsageTotals {
                 messages: 1,
+                unpriced_messages: 0,
                 cost: 2.5,
                 total: 10,
                 input: 1,
@@ -3816,6 +3846,7 @@ mod tests {
             display_name: "provider/gpt-test".to_string(),
             totals: UsageTotals {
                 messages: 1,
+                unpriced_messages: 0,
                 cost: 1.25,
                 total: 100,
                 input: 10,
@@ -3833,6 +3864,7 @@ mod tests {
             end_millis: None,
             totals: UsageTotals {
                 messages: 2,
+                unpriced_messages: 0,
                 cost: 3.75,
                 total: 110,
                 input: 11,
@@ -3856,6 +3888,7 @@ mod tests {
                 display_name: format!("provider/model-{idx}"),
                 totals: UsageTotals {
                     messages: 1,
+                    unpriced_messages: 0,
                     cost: (count - idx) as f64,
                     total: 100,
                     input: 10,
@@ -3867,6 +3900,7 @@ mod tests {
             .collect::<Vec<_>>();
         let totals = UsageTotals {
             messages: count as u64,
+            unpriced_messages: 0,
             cost: models.iter().map(|model| model.totals.cost).sum(),
             total: count as u64 * 100,
             input: models.iter().map(|model| model.totals.input).sum(),

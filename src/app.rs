@@ -2731,6 +2731,7 @@ mod tests {
                 display_name: format!("provider/model-{idx}"),
                 totals: UsageTotals {
                     messages: 1,
+                    unpriced_messages: 0,
                     cost: (count - idx) as f64,
                     total: 100,
                     input: 10,
@@ -2742,6 +2743,7 @@ mod tests {
             .collect::<Vec<_>>();
         let totals = UsageTotals {
             messages: count as u64,
+            unpriced_messages: 0,
             cost: models.iter().map(|model| model.totals.cost).sum(),
             total: count as u64 * 100,
             input: models.iter().map(|model| model.totals.input).sum(),
