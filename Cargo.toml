@@ -2,6 +2,7 @@
 name = "expensive"
 version = "0.3.1"
 edition = "2021"
+rust-version = "1.88"
 license = "MIT"
 description = "Terminal dashboard for OpenCode token usage and spend"
 repository = "https://github.com/lindestad/expensive"
