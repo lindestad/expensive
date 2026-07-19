@@ -7,6 +7,7 @@ use ratatui::{
 };
 
 use crate::{
+    app::GraphMetric,
     db::{TokenBucket, UsageStats},
     format,
     time_window::Mode,
@@ -21,6 +22,7 @@ struct GraphBucket {
     start_millis: i64,
     end_millis: i64,
     tokens: u64,
+    cost: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -34,6 +36,7 @@ pub(super) fn draw_token_graph(
     area: Rect,
     stats: &UsageStats,
     selected_bucket: Option<usize>,
+    metric: GraphMetric,
     palette: Palette,
 ) {
     let inner = token_graph_inner_area(area);
@@ -43,11 +46,10 @@ pub(super) fn draw_token_graph(
         inner.width as usize,
         visible_start,
     );
-    let max_tokens = columns
+    let max_value = columns
         .iter()
-        .map(|column| column.bucket.tokens)
-        .max()
-        .unwrap_or(0);
+        .map(|column| graph_bucket_value(column.bucket, metric))
+        .fold(0.0_f64, f64::max);
     let axis_height = usize::from(inner.height > 1);
     let graph_height = (inner.height as usize).saturating_sub(axis_height).max(1);
     let selected_bucket = selected_bucket.filter(|idx| *idx < stats.token_buckets.len());
@@ -59,21 +61,24 @@ pub(super) fn draw_token_graph(
                 .iter()
                 .map(|column| {
                     let bucket = column.bucket;
-                    let filled_height = if max_tokens == 0 || bucket.tokens == 0 {
+                    let value = graph_bucket_value(bucket, metric);
+                    let filled_height = if max_value <= 0.0 || value <= 0.0 {
                         0
                     } else {
-                        ((bucket.tokens as f64 / max_tokens as f64) * graph_height as f64).ceil()
-                            as usize
+                        ((value / max_value) * graph_height as f64).ceil() as usize
                     };
                     let selected = selected_bucket
                         .map(|idx| idx >= bucket.start_idx && idx < bucket.end_idx)
                         .unwrap_or(false);
                     let color = if selected {
                         palette.calendar_accent
-                    } else if bucket.tokens == 0 {
+                    } else if value <= 0.0 {
                         palette.muted
                     } else {
-                        palette.tokens
+                        match metric {
+                            GraphMetric::Tokens => palette.tokens,
+                            GraphMetric::Cost => palette.cost,
+                        }
                     };
                     let mut style = Style::default().fg(color);
                     if selected {
@@ -98,35 +103,73 @@ pub(super) fn draw_token_graph(
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(token_graph_title(stats, selected_bucket))
+        .title(token_graph_title(stats, selected_bucket, metric))
         .title_style(Style::default().fg(palette.title))
         .border_style(Style::default().fg(palette.border));
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-pub(super) fn draw_token_graph_loading(frame: &mut Frame<'_>, area: Rect, palette: Palette) {
+pub(super) fn draw_token_graph_loading(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    metric: GraphMetric,
+    palette: Palette,
+) {
+    let label = match metric {
+        GraphMetric::Tokens => "Token usage",
+        GraphMetric::Cost => "Cost",
+    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" Token usage over time ")
+        .title(format!(" {label} over time "))
         .title_style(Style::default().fg(palette.title))
         .border_style(Style::default().fg(palette.border));
-    let paragraph = Paragraph::new("Loading token graph...")
+    let loading = match metric {
+        GraphMetric::Tokens => "Loading token graph...",
+        GraphMetric::Cost => "Loading cost graph...",
+    };
+    let paragraph = Paragraph::new(loading)
         .block(block)
         .style(Style::default().fg(palette.tokens));
 
     frame.render_widget(paragraph, area);
 }
 
-fn token_graph_title(stats: &UsageStats, selected_bucket: Option<usize>) -> String {
+fn token_graph_title(
+    stats: &UsageStats,
+    selected_bucket: Option<usize>,
+    metric: GraphMetric,
+) -> String {
+    let (label, value) = match metric {
+        GraphMetric::Tokens => (
+            "Token usage",
+            selected_bucket
+                .and_then(|idx| stats.token_buckets.get(idx))
+                .map(|bucket| format::tokens(bucket.tokens)),
+        ),
+        GraphMetric::Cost => (
+            "Cost",
+            selected_bucket
+                .and_then(|idx| stats.token_buckets.get(idx))
+                .map(|bucket| format::precise_cost(bucket.cost)),
+        ),
+    };
     if let Some(bucket) = selected_bucket.and_then(|idx| stats.token_buckets.get(idx)) {
         return format!(
-            " Token usage over time | {} {} ",
+            " {label} over time | {} {} ",
             token_bucket_range_label(bucket, stats.mode),
-            format::tokens(bucket.tokens)
+            value.unwrap_or_default()
         );
     }
 
-    " Token usage over time ".to_string()
+    format!(" {label} over time | g toggles ")
+}
+
+fn graph_bucket_value(bucket: GraphBucket, metric: GraphMetric) -> f64 {
+    match metric {
+        GraphMetric::Tokens => bucket.tokens as f64,
+        GraphMetric::Cost => bucket.cost,
+    }
 }
 
 fn token_graph_axis_line(columns: &[GraphColumn], mode: Mode, palette: Palette) -> Line<'static> {
@@ -326,6 +369,7 @@ fn graph_bucket_for_column(
             start_millis: buckets[bucket_idx].start_millis,
             end_millis: buckets[bucket_idx].end_millis,
             tokens: buckets[bucket_idx].tokens,
+            cost: buckets[bucket_idx].cost,
         };
     }
 
@@ -334,6 +378,10 @@ fn graph_bucket_for_column(
     let tokens = buckets[start_idx..end_idx]
         .iter()
         .fold(0_u64, |total, bucket| total.saturating_add(bucket.tokens));
+    let cost = buckets[start_idx..end_idx]
+        .iter()
+        .map(|bucket| bucket.cost)
+        .sum();
 
     GraphBucket {
         start_idx: start_offset + start_idx,
@@ -341,5 +389,6 @@ fn graph_bucket_for_column(
         start_millis: buckets[start_idx].start_millis,
         end_millis: buckets[end_idx - 1].end_millis,
         tokens,
+        cost,
     }
 }

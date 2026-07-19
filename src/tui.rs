@@ -8,7 +8,7 @@ use ratatui::{
 };
 
 use crate::{
-    app::{AppState, ConfigEditorItem, View},
+    app::{AppState, ConfigEditorItem, GraphMetric, View},
     config::{ColorTheme, ThemeScope},
     db::{ModelUsage, UsageStats, UsageTotals},
     format,
@@ -206,6 +206,7 @@ struct ConfigEditorLines {
 #[derive(Clone, Copy)]
 struct StatsLayout {
     summary: Rect,
+    comparison: Option<Rect>,
     models: Rect,
     graph: Option<Rect>,
 }
@@ -217,6 +218,7 @@ struct StatsViewState<'a> {
     model_title: String,
     model_scroll: usize,
     selected_token_bucket: Option<usize>,
+    graph_metric: GraphMetric,
 }
 
 #[derive(Clone)]
@@ -259,6 +261,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &AppState) {
                     .unwrap_or_else(|| "Models".to_string()),
                 model_scroll: app.dashboard_model_scroll,
                 selected_token_bucket: app.dashboard_token_bucket,
+                graph_metric: app.graph_metric,
             },
             palette,
         ),
@@ -276,6 +279,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &AppState) {
                 ),
                 model_scroll: app.history_model_scroll,
                 selected_token_bucket: app.history_token_bucket,
+                graph_metric: app.graph_metric,
             },
             palette,
         ),
@@ -673,11 +677,7 @@ fn help_document(
         content.columns,
         palette,
     ));
-    lines.extend([
-        Line::from(""),
-        section_title("Config", palette),
-        Line::from(""),
-    ]);
+    lines.extend([section_title("Config", palette), Line::from("")]);
     lines.extend(help_binding_lines(
         content.config_bindings,
         content.columns,
@@ -725,7 +725,7 @@ fn help_inner_area(area: Rect) -> Rect {
     })
 }
 
-fn control_help_bindings() -> [HelpBinding; 8] {
+fn control_help_bindings() -> [HelpBinding; 9] {
     [
         HelpBinding {
             key: "Tab / Shift+Tab",
@@ -750,6 +750,10 @@ fn control_help_bindings() -> [HelpBinding; 8] {
         HelpBinding {
             key: "r",
             description: "refresh current view",
+        },
+        HelpBinding {
+            key: "g",
+            description: "toggle token and cost graph",
         },
         HelpBinding {
             key: "p",
@@ -1551,6 +1555,9 @@ fn draw_stats_view(frame: &mut Frame<'_>, area: Rect, view: StatsViewState<'_>, 
     let layout = stats_view_layout(area, view.stats, graph_available);
 
     draw_summary(frame, layout.summary, view.stats, view.loading, palette);
+    if let (Some(stats), Some(comparison)) = (view.stats, layout.comparison) {
+        draw_comparison(frame, comparison, stats, palette);
+    }
     draw_models(
         frame,
         layout.models,
@@ -1563,21 +1570,43 @@ fn draw_stats_view(frame: &mut Frame<'_>, area: Rect, view: StatsViewState<'_>, 
 
     if let (Some(stats), Some(graph)) = (view.stats, layout.graph) {
         if stats.token_buckets.is_empty() {
-            draw_token_graph_loading(frame, graph, palette);
+            draw_token_graph_loading(frame, graph, view.graph_metric, palette);
         } else {
-            draw_token_graph(frame, graph, stats, view.selected_token_bucket, palette);
+            draw_token_graph(
+                frame,
+                graph,
+                stats,
+                view.selected_token_bucket,
+                view.graph_metric,
+                palette,
+            );
         }
     }
 }
 
 fn stats_view_layout(area: Rect, stats: Option<&UsageStats>, graph_available: bool) -> StatsLayout {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(5), Constraint::Min(6)])
-        .split(area);
-    let lower = chunks[1];
+    let show_comparison = stats
+        .map(|stats| stats.comparison.is_some() && area.height >= 18)
+        .unwrap_or(false);
+    let chunks = if show_comparison {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(5),
+                Constraint::Length(4),
+                Constraint::Min(6),
+            ])
+            .split(area)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(5), Constraint::Min(6)])
+            .split(area)
+    };
+    let lower = chunks[if show_comparison { 2 } else { 1 }];
     let mut layout = StatsLayout {
         summary: chunks[0],
+        comparison: show_comparison.then_some(chunks[1]),
         models: lower,
         graph: None,
     };
@@ -1601,6 +1630,112 @@ fn stats_view_layout(area: Rect, stats: Option<&UsageStats>, graph_available: bo
     layout.models = chunks[0];
     layout.graph = Some(chunks[1]);
     layout
+}
+
+fn draw_comparison(frame: &mut Frame<'_>, area: Rect, stats: &UsageStats, palette: Palette) {
+    let Some(previous) = &stats.comparison else {
+        return;
+    };
+    let cost_delta = stats.totals.cost - previous.totals.cost;
+    let token_delta = stats.totals.total_tokens() as i128 - previous.totals.total_tokens() as i128;
+    let mut first = vec![
+        Span::styled("cost ", Style::default().fg(palette.muted)),
+        Span::styled(
+            signed_cost(cost_delta),
+            Style::default().fg(delta_color(cost_delta, palette)),
+        ),
+        Span::styled(
+            format!(
+                " ({})",
+                percent_change(stats.totals.cost, previous.totals.cost)
+            ),
+            Style::default().fg(palette.muted),
+        ),
+        Span::styled("   tokens ", Style::default().fg(palette.muted)),
+        Span::styled(
+            signed_integer(token_delta),
+            Style::default().fg(delta_color(token_delta as f64, palette)),
+        ),
+        Span::styled(
+            format!(
+                " ({})",
+                percent_change(
+                    stats.totals.total_tokens() as f64,
+                    previous.totals.total_tokens() as f64,
+                )
+            ),
+            Style::default().fg(palette.muted),
+        ),
+    ];
+    if let Some(projected) = stats.projected_cost {
+        first.extend([
+            Span::styled("   projected ", Style::default().fg(palette.muted)),
+            Span::styled(format::cost(projected), Style::default().fg(palette.cost)),
+        ]);
+    }
+
+    let second = if let Some((model, delta)) = stats.biggest_cost_increase() {
+        Line::from(vec![
+            Span::styled("biggest increase  ", Style::default().fg(palette.muted)),
+            Span::styled(model.to_string(), Style::default().fg(palette.accent)),
+            Span::styled(
+                format!("  {}", signed_cost(delta)),
+                Style::default().fg(palette.cost),
+            ),
+        ])
+    } else {
+        Line::from(Span::styled(
+            "no model increased in cost",
+            Style::default().fg(palette.muted),
+        ))
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Compared with previous period ")
+        .title_style(Style::default().fg(palette.title))
+        .border_style(Style::default().fg(palette.border));
+    frame.render_widget(
+        Paragraph::new(vec![Line::from(first), second]).block(block),
+        area,
+    );
+}
+
+fn percent_change(current: f64, previous: f64) -> String {
+    if previous.abs() < f64::EPSILON {
+        if current.abs() < f64::EPSILON {
+            "0.0%".to_string()
+        } else {
+            "new".to_string()
+        }
+    } else {
+        format!("{:+.1}%", (current - previous) / previous * 100.0)
+    }
+}
+
+fn signed_cost(value: f64) -> String {
+    if value >= 0.0 {
+        format!("+{}", format::precise_cost(value))
+    } else {
+        format!("-{}", format::precise_cost(value.abs()))
+    }
+}
+
+fn signed_integer(value: i128) -> String {
+    if value >= 0 {
+        format!("+{}", format::integer(value as u64))
+    } else {
+        format!("-{}", format::integer(value.unsigned_abs() as u64))
+    }
+}
+
+fn delta_color(value: f64, palette: Palette) -> Color {
+    if value > 0.0 {
+        palette.cost
+    } else if value < 0.0 {
+        palette.accent
+    } else {
+        palette.muted
+    }
 }
 
 const MODEL_TABLE_OVERHEAD: u16 = 3;
@@ -2909,6 +3044,58 @@ mod tests {
     }
 
     #[test]
+    fn renders_cost_graph_without_reloading_buckets() {
+        let stats = many_model_stats(Mode::Daily, 8);
+        let mut app = app_with_stats(Mode::Daily, stats);
+        app.graph_metric = GraphMetric::Cost;
+
+        let output = render(&app, 100, 24);
+
+        assert!(output.contains("Cost over time"));
+        assert!(output.contains("g toggles"));
+    }
+
+    #[test]
+    fn renders_period_comparison_projection_and_biggest_increase() {
+        let mut stats = sample_stats(Mode::Daily, Some(local_millis(2026, 6, 15, 4, 0, 0)));
+        stats.projected_cost = Some(6.0);
+        stats.comparison = Some(crate::db::UsageComparison {
+            start_millis: local_millis(2026, 6, 14, 4, 0, 0),
+            end_millis: local_millis(2026, 6, 15, 4, 0, 0),
+            totals: UsageTotals {
+                messages: 1,
+                cost: 1.0,
+                input: 1,
+                output: 2,
+                cache_read: 3,
+                cache_write: 4,
+            },
+            models: vec![ModelUsage {
+                provider: "provider".to_string(),
+                model_id: "gpt-test".to_string(),
+                variant: "default".to_string(),
+                display_name: "provider/gpt-test".to_string(),
+                totals: UsageTotals {
+                    messages: 1,
+                    cost: 0.5,
+                    input: 1,
+                    output: 2,
+                    cache_read: 3,
+                    cache_write: 4,
+                },
+            }],
+        });
+        let app = app_with_stats(Mode::Daily, stats);
+
+        let output = render(&app, 140, 30);
+
+        assert!(output.contains("Compared with previous period"));
+        assert!(output.contains("projected $6.00"));
+        assert!(output.contains("biggest increase"));
+        assert!(output.contains("provider/gpt-test (high)"));
+    }
+
+    #[test]
     fn renders_token_graph_loading_with_summary_data() {
         let mut stats = many_model_stats(Mode::Daily, 8);
         stats.token_buckets.clear();
@@ -3377,6 +3564,7 @@ mod tests {
             dashboard_token_bucket: None,
             history_token_bucket: None,
             token_graph_dragging: false,
+            graph_metric: crate::app::GraphMetric::Tokens,
             config_selection: 0,
             config_notice: None,
             mode,
@@ -3413,6 +3601,7 @@ mod tests {
             dashboard_token_bucket: None,
             history_token_bucket: None,
             token_graph_dragging: false,
+            graph_metric: crate::app::GraphMetric::Tokens,
             config_selection: 0,
             config_notice: None,
             mode,
@@ -3449,6 +3638,7 @@ mod tests {
             dashboard_token_bucket: None,
             history_token_bucket: None,
             token_graph_dragging: false,
+            graph_metric: crate::app::GraphMetric::Tokens,
             config_selection: 0,
             config_notice: None,
             mode: Mode::Daily,
@@ -3563,6 +3753,8 @@ mod tests {
             },
             models: vec![high, default],
             token_buckets: token_buckets(4),
+            comparison: None,
+            projected_cost: None,
         }
     }
 
@@ -3601,6 +3793,8 @@ mod tests {
             totals,
             models,
             token_buckets: token_buckets(count),
+            comparison: None,
+            projected_cost: None,
         }
     }
 
@@ -3616,6 +3810,7 @@ mod tests {
             start_millis: idx as i64 * 2 * HOUR,
             end_millis: (idx as i64 + 1) * 2 * HOUR,
             tokens,
+            cost: tokens as f64 / 100.0,
         }
     }
 

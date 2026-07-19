@@ -20,7 +20,7 @@ use ratatui::{backend::CrosstermBackend, layout::Rect, Terminal};
 
 use crate::{
     config::{self, ColorTheme, Config, Scope, ThemeScope},
-    db::{self, UsageStats},
+    db::{self, UsageComparison, UsageStats},
     time_window::{self, CalendarScale, DailyStart, Mode, PeriodKey, WeekStart},
     tui,
 };
@@ -30,6 +30,21 @@ pub enum View {
     Dashboard,
     CalendarOverview,
     CalendarDetail,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GraphMetric {
+    Tokens,
+    Cost,
+}
+
+impl GraphMetric {
+    fn toggle(self) -> Self {
+        match self {
+            Self::Tokens => Self::Cost,
+            Self::Cost => Self::Tokens,
+        }
+    }
 }
 
 pub struct CalendarState {
@@ -140,6 +155,7 @@ pub struct AppState {
     pub dashboard_token_bucket: Option<usize>,
     pub history_token_bucket: Option<usize>,
     pub token_graph_dragging: bool,
+    pub graph_metric: GraphMetric,
     pub config_selection: usize,
     pub config_notice: Option<ConfigNotice>,
     pub mode: Mode,
@@ -187,6 +203,7 @@ impl AppState {
             dashboard_token_bucket: None,
             history_token_bucket: None,
             token_graph_dragging: false,
+            graph_metric: GraphMetric::Tokens,
             config_selection: 0,
             config_notice: None,
             mode: Mode::Daily,
@@ -694,19 +711,8 @@ impl AppState {
         let config = self.config.clone();
         let generation = self.request_generation;
         thread::spawn(move || {
-            let result = db::load_usage_summary_between_scoped(
-                &config.db_path,
-                period.mode(),
-                period.start_millis,
-                period.end_millis,
-                &config.scope,
-                &config.current_directory,
-            )
-            .map(|mut stats| {
-                apply_model_aliases(&config, &mut stats);
-                stats
-            })
-            .map_err(|error| format!("{error:#}"));
+            let result =
+                refresh_period_summary(config, period).map_err(|error| format!("{error:#}"));
             let _ = tx.send(RefreshMessage::History {
                 generation,
                 period,
@@ -1531,6 +1537,10 @@ fn handle_key(
             app.next_refresh_due = Instant::now() + app.config.refresh_interval;
             false
         }
+        KeyCode::Char('g') => {
+            app.graph_metric = app.graph_metric.toggle();
+            false
+        }
         KeyCode::Char('p') => {
             app.open_scope_picker();
             false
@@ -1765,7 +1775,64 @@ fn refresh_dashboard_summary(config: Config, mode: Mode) -> Result<UsageStats> {
         &config.current_directory,
     )?;
     apply_model_aliases(&config, &mut stats);
+    if let Some(scale) = CalendarScale::from_mode(mode) {
+        let now = local_from_millis(stats.snapshot_millis.saturating_sub(1))?;
+        let period =
+            time_window::current_period(scale, now, config.daily_start, config.week_start)?;
+        attach_period_comparison(&config, &mut stats, period)?;
+    }
     Ok(stats)
+}
+
+fn refresh_period_summary(config: Config, period: PeriodKey) -> Result<UsageStats> {
+    let mut stats = db::load_usage_summary_between_scoped(
+        &config.db_path,
+        period.mode(),
+        period.start_millis,
+        period.end_millis,
+        &config.scope,
+        &config.current_directory,
+    )?;
+    apply_model_aliases(&config, &mut stats);
+    attach_period_comparison(&config, &mut stats, period)?;
+    Ok(stats)
+}
+
+fn attach_period_comparison(
+    config: &Config,
+    stats: &mut UsageStats,
+    period: PeriodKey,
+) -> Result<()> {
+    let previous_period = time_window::shift_period(period, -1)?;
+    let mut previous = db::load_usage_summary_between_scoped(
+        &config.db_path,
+        previous_period.mode(),
+        previous_period.start_millis,
+        previous_period.end_millis,
+        &config.scope,
+        &config.current_directory,
+    )?;
+    apply_model_aliases(config, &mut previous);
+    stats.comparison = Some(UsageComparison {
+        start_millis: previous_period.start_millis,
+        end_millis: previous_period.end_millis,
+        totals: previous.totals,
+        models: previous.models,
+    });
+    stats.projected_cost = projected_cost(stats, period);
+    Ok(())
+}
+
+fn projected_cost(stats: &UsageStats, period: PeriodKey) -> Option<f64> {
+    let observed = stats
+        .snapshot_millis
+        .clamp(period.start_millis, period.end_millis);
+    if observed <= period.start_millis || observed >= period.end_millis {
+        return None;
+    }
+    let elapsed = observed.saturating_sub(period.start_millis) as f64;
+    let duration = period.end_millis.saturating_sub(period.start_millis) as f64;
+    (elapsed > 0.0).then_some(stats.totals.cost * duration / elapsed)
 }
 
 fn apply_model_aliases(config: &Config, stats: &mut UsageStats) {
@@ -2334,6 +2401,7 @@ mod tests {
             start_millis: 0,
             end_millis: 1,
             tokens: 999,
+            cost: 9.99,
         }];
         let changed = app.apply_dashboard_graph_refresh(
             Mode::Daily,
@@ -2493,6 +2561,44 @@ mod tests {
         assert!(content.contains("github-copilot = \"gc\""));
     }
 
+    #[test]
+    fn graph_metric_toggle_does_not_reload_usage() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut app = AppState::new(test_config(tempdir.path().join("config.toml"))).unwrap();
+        app.stats
+            .insert(Mode::Daily, many_model_stats(Mode::Daily, 1));
+        let (tx, rx) = mpsc::channel();
+
+        handle_key(
+            KeyCode::Char('g'),
+            KeyModifiers::NONE,
+            Rect::new(0, 0, 100, 24),
+            &mut app,
+            &tx,
+        );
+
+        assert_eq!(app.graph_metric, GraphMetric::Cost);
+        assert!(rx.try_recv().is_err());
+        assert!(app.current_stats().is_some());
+    }
+
+    #[test]
+    fn projects_active_period_cost_at_current_run_rate() {
+        let mut stats = many_model_stats(Mode::Daily, 1);
+        stats.snapshot_millis = 5_000;
+        stats.totals.cost = 2.0;
+        let period = PeriodKey {
+            scale: CalendarScale::Day,
+            start_millis: 1_000,
+            end_millis: 9_000,
+        };
+
+        assert_eq!(projected_cost(&stats, period), Some(4.0));
+
+        stats.snapshot_millis = period.end_millis;
+        assert_eq!(projected_cost(&stats, period), None);
+    }
+
     fn test_config(config_path: PathBuf) -> Config {
         Config {
             db_path: PathBuf::from("/tmp/opencode.db"),
@@ -2544,6 +2650,8 @@ mod tests {
             totals,
             models,
             token_buckets: token_buckets(count),
+            comparison: None,
+            projected_cost: None,
         }
     }
 
@@ -2554,6 +2662,7 @@ mod tests {
                 start_millis: idx as i64 * HOUR,
                 end_millis: (idx as i64 + 1) * HOUR,
                 tokens: (idx as u64 + 1) * 10,
+                cost: (idx as f64 + 1.0) / 10.0,
             })
             .collect()
     }

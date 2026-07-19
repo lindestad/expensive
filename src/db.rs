@@ -63,13 +63,57 @@ pub struct UsageStats {
     pub totals: UsageTotals,
     pub models: Vec<ModelUsage>,
     pub token_buckets: Vec<TokenBucket>,
+    pub comparison: Option<UsageComparison>,
+    pub projected_cost: Option<f64>,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+impl UsageStats {
+    pub fn biggest_cost_increase(&self) -> Option<(&str, f64)> {
+        let comparison = self.comparison.as_ref()?;
+        let previous = comparison
+            .models
+            .iter()
+            .map(|model| {
+                (
+                    (
+                        model.provider.as_str(),
+                        model.model_id.as_str(),
+                        model.variant.as_str(),
+                    ),
+                    model.totals.cost,
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        self.models
+            .iter()
+            .map(|model| {
+                let key = (
+                    model.provider.as_str(),
+                    model.model_id.as_str(),
+                    model.variant.as_str(),
+                );
+                let delta = model.totals.cost - previous.get(&key).copied().unwrap_or(0.0);
+                (model.display_name.as_str(), delta)
+            })
+            .filter(|(_, delta)| *delta > 0.0)
+            .max_by(|(_, left), (_, right)| left.total_cmp(right))
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct UsageComparison {
+    pub start_millis: i64,
+    pub end_millis: i64,
+    pub totals: UsageTotals,
+    pub models: Vec<ModelUsage>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct TokenBucket {
     pub start_millis: i64,
     pub end_millis: i64,
     pub tokens: u64,
+    pub cost: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -285,6 +329,8 @@ fn load_usage_range(
         totals,
         models,
         token_buckets,
+        comparison: None,
+        projected_cost: None,
     })
 }
 
@@ -408,6 +454,7 @@ fn load_token_buckets(
                 start_millis: start,
                 end_millis: (start + span).min(range_end),
                 tokens: 0,
+                cost: 0.0,
             }
         })
         .collect::<Vec<_>>();
@@ -421,7 +468,8 @@ fn load_token_buckets(
                 + COALESCE(json_extract(data, '$.tokens.output'), 0)
                 + COALESCE(json_extract(data, '$.tokens.cache.read'), 0)
                 + COALESCE(json_extract(data, '$.tokens.cache.write'), 0)
-            ), 0) AS tokens
+            ), 0) AS tokens,
+            COALESCE(SUM(COALESCE(json_extract(data, '$.cost'), 0)), 0) AS cost
         FROM message
         WHERE json_extract(data, '$.role') = 'assistant'
             AND (?1 IS NULL OR time_created >= ?1)
@@ -450,17 +498,19 @@ fn load_token_buckets(
         |row| {
             let bucket_idx: i64 = row.get("bucket_idx")?;
             let tokens = read_u64(row, "tokens")?;
-            Ok((bucket_idx, tokens))
+            let cost: f64 = row.get("cost")?;
+            Ok((bucket_idx, tokens, cost))
         },
     )?;
 
     for row in rows {
-        let (bucket_idx, tokens) = row?;
+        let (bucket_idx, tokens, cost) = row?;
         if bucket_idx < 0 {
             continue;
         }
         if let Some(bucket) = buckets.get_mut(bucket_idx as usize) {
             bucket.tokens = tokens;
+            bucket.cost = cost;
         }
     }
 
@@ -1131,6 +1181,7 @@ mod tests {
         assert_eq!(stats.models[1].display_name, "provider/gpt-test");
         assert_eq!(stats.token_buckets.len(), 1);
         assert_eq!(stats.token_buckets[0].tokens, 110);
+        assert!((stats.token_buckets[0].cost - 3.75).abs() < f64::EPSILON);
     }
 
     #[test]
