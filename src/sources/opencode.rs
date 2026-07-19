@@ -247,6 +247,7 @@ fn database_artifact(path: &Path, watermark: i64) -> Result<ArtifactRecord> {
         parsed_offset: watermark.max(0),
         boundary_hash: None,
         full_hash: None,
+        cursor: None,
         parser_version: PARSER_VERSION,
         scanned_at_ms: Utc::now().timestamp_millis(),
     })

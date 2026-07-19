@@ -4,7 +4,10 @@ use anyhow::Result;
 
 use crate::index::{IndexChange, SourceRegistration, UsageIndex};
 
+pub mod codex;
+mod jsonl;
 pub mod opencode;
+pub mod pi;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SyncMode {
@@ -19,6 +22,27 @@ pub struct SyncReport {
     pub imported: usize,
     pub removed: usize,
     pub skipped: usize,
+}
+
+impl SyncReport {
+    pub(crate) fn record_change(&mut self, change: IndexChange) {
+        self.change = Some(match self.change.take() {
+            Some(previous) => IndexChange {
+                generation: previous.generation.max(change.generation),
+                source_id: change.source_id,
+                start_ms: match (previous.start_ms, change.start_ms) {
+                    (Some(left), Some(right)) => Some(left.min(right)),
+                    (left, right) => left.or(right),
+                },
+                end_ms: match (previous.end_ms, change.end_ms) {
+                    (Some(left), Some(right)) => Some(left.max(right)),
+                    (left, right) => left.or(right),
+                },
+                event_count: previous.event_count + change.event_count,
+            },
+            None => change,
+        });
+    }
 }
 
 pub trait UsageSource {

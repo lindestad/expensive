@@ -12,7 +12,7 @@ use std::{
 use anyhow::{anyhow, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SourceKind {
@@ -79,6 +79,9 @@ pub struct ArtifactRecord {
     pub parsed_offset: i64,
     pub boundary_hash: Option<Vec<u8>>,
     pub full_hash: Option<Vec<u8>>,
+    /// Adapter-owned summary state required to continue parsing at
+    /// `parsed_offset`. It must never contain conversation content.
+    pub cursor: Option<String>,
     pub parser_version: i64,
     pub scanned_at_ms: i64,
 }
@@ -92,6 +95,7 @@ pub struct ArtifactCheckpoint {
     pub parsed_offset: i64,
     pub boundary_hash: Option<Vec<u8>>,
     pub full_hash: Option<Vec<u8>>,
+    pub cursor: Option<String>,
     pub parser_version: i64,
 }
 
@@ -219,7 +223,7 @@ impl UsageIndex {
         self.connection
             .query_row(
                 "SELECT device, inode, size, modified_ns, parsed_offset,
-                        boundary_hash, full_hash, parser_version
+                        boundary_hash, full_hash, cursor, parser_version
                  FROM artifacts
                  WHERE source_id = ?1 AND artifact_key = ?2",
                 params![source_id, artifact_key],
@@ -232,7 +236,8 @@ impl UsageIndex {
                         parsed_offset: row.get(4)?,
                         boundary_hash: row.get(5)?,
                         full_hash: row.get(6)?,
-                        parser_version: row.get(7)?,
+                        cursor: row.get(7)?,
+                        parser_version: row.get(8)?,
                     })
                 },
             )
@@ -393,6 +398,68 @@ impl UsageIndex {
         Ok(())
     }
 
+    pub fn artifact_keys(&self, source_id: i64) -> Result<Vec<String>> {
+        let mut statement = self.connection.prepare(
+            "SELECT artifact_key FROM artifacts WHERE source_id = ?1 ORDER BY artifact_key",
+        )?;
+        let rows = statement.query_map([source_id], |row| row.get(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("listing source artifacts")
+    }
+
+    pub fn remove_artifact(
+        &mut self,
+        source_id: i64,
+        artifact_key: &str,
+    ) -> Result<Option<IndexChange>> {
+        let transaction = self.connection.transaction()?;
+        let artifact_id = transaction
+            .query_row(
+                "SELECT id FROM artifacts WHERE source_id = ?1 AND artifact_key = ?2",
+                params![source_id, artifact_key],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        let Some(artifact_id) = artifact_id else {
+            return Ok(None);
+        };
+        let old_bounds = artifact_event_bounds(&transaction, artifact_id)?;
+        transaction.execute("DELETE FROM artifacts WHERE id = ?1", [artifact_id])?;
+        let removed_events = transaction.execute(
+            "DELETE FROM usage_events
+             WHERE source_id = ?1
+               AND NOT EXISTS (
+                   SELECT 1 FROM artifact_events
+                   WHERE artifact_events.event_id = usage_events.id
+               )",
+            [source_id],
+        )?;
+        if removed_events > 0 {
+            transaction.execute(
+                "UPDATE index_state SET generation = generation + 1 WHERE id = 1",
+                [],
+            )?;
+        }
+        let generation = transaction.query_row(
+            "SELECT generation FROM index_state WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        transaction.commit()?;
+        let (start_ms, end_ms) = if removed_events > 0 {
+            merge_bounds(old_bounds, None)
+        } else {
+            (None, None)
+        };
+        Ok(Some(IndexChange {
+            generation,
+            source_id,
+            start_ms,
+            end_ms,
+            event_count: 0,
+        }))
+    }
+
     pub fn diagnostics(&self) -> Result<IndexDiagnostics> {
         Ok(IndexDiagnostics {
             path: self.path.clone(),
@@ -475,6 +542,7 @@ fn migrate(connection: &Connection) -> Result<()> {
                 parsed_offset INTEGER NOT NULL DEFAULT 0 CHECK (parsed_offset >= 0),
                 boundary_hash BLOB,
                 full_hash BLOB,
+                cursor TEXT,
                 parser_version INTEGER NOT NULL CHECK (parser_version >= 0),
                 last_scanned_ms INTEGER NOT NULL,
                 UNIQUE (source_id, artifact_key)
@@ -540,9 +608,16 @@ fn migrate(connection: &Connection) -> Result<()> {
             ) STRICT;
             CREATE INDEX usage_buckets_range ON usage_buckets(start_ms, end_ms);
 
-            PRAGMA user_version = 1;
+            PRAGMA user_version = 2;
             COMMIT;
             "#,
+        )?;
+    } else if version == 1 {
+        connection.execute_batch(
+            "BEGIN IMMEDIATE;
+             ALTER TABLE artifacts ADD COLUMN cursor TEXT;
+             PRAGMA user_version = 2;
+             COMMIT;",
         )?;
     }
     Ok(())
@@ -563,8 +638,8 @@ fn upsert_artifact(
         .query_row(
             "INSERT INTO artifacts (
                 source_id, artifact_key, path, device, inode, size, modified_ns,
-                parsed_offset, boundary_hash, full_hash, parser_version, last_scanned_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                parsed_offset, boundary_hash, full_hash, cursor, parser_version, last_scanned_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
              ON CONFLICT(source_id, artifact_key) DO UPDATE SET
                 path = excluded.path,
                 device = excluded.device,
@@ -574,6 +649,7 @@ fn upsert_artifact(
                 parsed_offset = excluded.parsed_offset,
                 boundary_hash = excluded.boundary_hash,
                 full_hash = excluded.full_hash,
+                cursor = excluded.cursor,
                 parser_version = excluded.parser_version,
                 last_scanned_ms = excluded.last_scanned_ms
              RETURNING id",
@@ -588,6 +664,7 @@ fn upsert_artifact(
                 artifact.parsed_offset,
                 artifact.boundary_hash,
                 artifact.full_hash,
+                artifact.cursor,
                 artifact.parser_version,
                 artifact.scanned_at_ms,
             ],
@@ -821,6 +898,7 @@ mod tests {
             parsed_offset: 100,
             boundary_hash: Some(vec![1, 2, 3]),
             full_hash: None,
+            cursor: None,
             parser_version: 1,
             scanned_at_ms: 1_000,
         }
@@ -851,7 +929,7 @@ mod tests {
         let (_directory, index) = index();
         let diagnostics = index.diagnostics().unwrap();
 
-        assert_eq!(diagnostics.schema_version, 1);
+        assert_eq!(diagnostics.schema_version, 2);
         assert_eq!(diagnostics.generation, 0);
         assert_eq!(diagnostics.events, 0);
         let journal_mode: String = index
