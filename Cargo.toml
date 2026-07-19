@@ -3,6 +3,7 @@ name = "expensive"
 version = "0.4.0"
 edition = "2021"
 rust-version = "1.88"
+resolver = "3"
 license = "MIT"
 description = "Terminal dashboard for OpenCode token usage and spend"
 repository = "https://github.com/lindestad/expensive"
@@ -16,13 +17,13 @@ categories = ["command-line-utilities"]
 anyhow = "1"
 chrono = { version = "0.4", features = ["clock"] }
 clap = { version = "4", features = ["derive"] }
-crossterm = "0.28"
-dirs = "5"
-ratatui = "0.29"
-rusqlite = { version = "0.32", features = ["bundled"] }
+crossterm = "0.29"
+dirs = "6"
+ratatui = "0.30"
+rusqlite = { version = "0.39", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.8"
+toml = "1.1"
 
 [dev-dependencies]
 tempfile = "3"
