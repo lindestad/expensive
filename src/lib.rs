@@ -1,16 +1,13 @@
-//! Terminal dashboard for OpenCode token usage and spend.
+//! Terminal dashboard for AI coding harness token usage and spend.
 //!
 //! `expensive` is primarily a binary crate. It provides a Ratatui-based TUI
-//! that reads OpenCode's local SQLite database directly and aggregates assistant
-//! message usage into daily, weekly, monthly, all-time, and calendar views.
+//! that normalizes OpenCode, Codex, and Pi accounting into a privacy-preserving
+//! local index and aggregates it into daily, weekly, monthly, all-time, and
+//! calendar views.
 //!
 //! The public modules are exposed to keep the binary small and testable. They
-//! cover configuration, OpenCode database aggregation, time-window calculation,
-//! formatting, application state, and terminal rendering.
-//!
-//! The usage data comes from OpenCode's stored assistant message fields such as
-//! `cost`, `tokens.input`, `tokens.output`, `tokens.cache.read`,
-//! `tokens.cache.write`, `providerID`, `modelID`, and `variant`.
+//! cover configuration, source adapters, local indexing, time-window
+//! calculation, formatting, application state, and terminal rendering.
 //!
 //! For normal use, install and run the `expensive` binary:
 //!

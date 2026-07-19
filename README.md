@@ -1,31 +1,31 @@
 # expensive
 
-A small terminal dashboard for OpenCode spend.
+A local terminal dashboard for AI coding harness usage.
 
 <img width="1324" height="958" alt="image" src="https://github.com/user-attachments/assets/027ae18e-7e22-437b-a58c-5a4cc3acf60d" />
 
+`expensive` combines usage from OpenCode, Codex, and Pi into a small local
+SQLite index, then serves a live dashboard without repeatedly parsing session
+history. Source scans run in the background, so an existing dashboard remains
+usable while new accounting data is imported.
 
-
-`expensive` reads OpenCode's local SQLite database directly and turns the same
-kind of accounting you get from `opencode stats` into a live, fast dashboard you
-can keep open while you work.
+The index contains normalized accounting facts and scan checkpoints, not cloned
+session histories. Prompts, responses, reasoning text, and tool calls are never
+stored by `expensive`.
 
 ## What It Shows
 
-- total cost
-- total tokens
-- input and output tokens
-- cache read and cache write tokens
-- model-level breakdown with message counts, cost, tokens, and share of spend
-- daily, weekly, monthly, and all-time views
-- calendar view for day, week, and month spend
-- previous-period cost and token deltas, biggest model increase, and active-period projection
-- token or cost history graphs without reloading data
+- known cost, with unpriced messages called out explicitly
+- total, input, output, cache-read, and cache-write tokens
+- model-level message, cost, token, and spend-share breakdowns
+- daily, weekly, monthly, all-time, and calendar views
+- optional previous-period deltas, biggest model increase, and cost projection
+- token or known-cost history graphs
 - all-project, current-directory, and individual-project scopes
 - configurable compact names for providers and models
 
-Daily usage defaults to "since 04:00" in your local timezone, which fits the
-usual late-night coding accounting better than a strict midnight cutoff.
+Daily usage defaults to "since 04:00" in your local timezone, which fits
+late-night coding accounting better than a strict midnight cutoff.
 
 ## Install
 
@@ -35,17 +35,10 @@ Install the published crate:
 cargo install --locked expensive
 ```
 
-## Development
-
-Install from a local checkout:
+For development, install from a local checkout or run it directly:
 
 ```bash
 cargo install --locked --path .
-```
-
-Or run without installing:
-
-```bash
 cargo run
 ```
 
@@ -68,17 +61,25 @@ Controls:
 | `h` / `k` | Previous period from Calendar detail |
 | `j` / `l` | Next period from Calendar detail |
 | `?` | Open or close Help |
-| `r` | Refresh now |
+| `r` | Refresh the view and incrementally scan sources |
+| `R` | Fully rescan sources and rebuild index facts |
 | `g` | Toggle the graph between tokens and cost |
 | `p` | Choose all, current-directory, or individual-project scope |
 | `Esc` | Back one level; quit from the dashboard |
 | `q` | Quit |
 
-By default, `expensive` refreshes every 60 seconds. The database query is cheap;
-on the machine this was built on, direct SQLite aggregation was roughly two
-orders of magnitude faster than parsing `opencode stats`.
+By default, `expensive` refreshes every 60 seconds. It queries the local index
+immediately, then checks sources in a background thread. Unchanged graphs stay
+on screen and are only redrawn when their data changes. Day rollover is handled
+separately even when automatic refresh is disabled.
 
-## Options
+The first run may take a little while if there is substantial Codex or Pi
+history. Later scans use file identity, size, timestamps, boundary hashes, and
+parser checkpoints to read only safe appends. OpenCode rechecks a rolling
+48-hour mutable window. Press `R` if source history was rewritten or you want a
+complete reconciliation.
+
+## Options and Reports
 
 ```bash
 expensive --daily-start 05:00
@@ -89,9 +90,11 @@ expensive --refresh 10
 expensive --no-refresh
 expensive --scope current
 expensive --db ~/.local/share/opencode/opencode.db
+expensive --index ~/.local/share/expensive/usage.sqlite3
 ```
 
-Check database access and schema compatibility without opening the TUI:
+Check the index, discovered sources, and OpenCode schema compatibility without
+opening the TUI:
 
 ```bash
 expensive doctor
@@ -106,8 +109,18 @@ expensive report --from 2026-07-01 --to 2026-08-01 --pretty
 ```
 
 `--from` is inclusive and `--to` is exclusive. Bounds accept `YYYY-MM-DD`, a
-local `YYYY-MM-DDTHH:MM[:SS]`, or RFC 3339. Reports include totals, models,
-comparison data, projections, and token/cost buckets.
+local `YYYY-MM-DDTHH:MM[:SS]`, or RFC 3339. Reports use schema version 2 and
+include totals, models, comparison data, projections, token/cost buckets, and
+the index path. The `unpriced_messages` fields distinguish known spend from
+messages whose source does not provide a cost.
+
+## Sources and Index
+
+Available sources are discovered automatically:
+
+- OpenCode: local SQLite assistant-message accounting
+- Codex: `sessions` and `archived_sessions` rollout JSONL files
+- Pi: version 3 session JSONL files
 
 `expensive` finds the OpenCode database in this order:
 
@@ -115,6 +128,24 @@ comparison data, projections, and token/cost buckets.
 2. `OPENCODE_DB_PATH`
 3. `opencode db path`
 4. `~/.local/share/opencode/opencode.db`
+
+Codex uses `CODEX_HOME`, falling back to `~/.codex`. Pi uses
+`PI_CODING_AGENT_SESSION_DIR`, then `PI_CODING_AGENT_DIR/sessions`, then
+`~/.pi/agent/sessions`. Point an environment variable at a nonexistent
+directory to exclude that source.
+
+The normalized index is selected in this order:
+
+1. `--index <path>`
+2. `EXPENSIVE_INDEX_PATH`
+3. the platform local-data directory, normally
+   `~/.local/share/expensive/usage.sqlite3` on Linux
+
+The index uses SQLite WAL mode. It stores timestamps, project/worktree metadata,
+provider and model IDs, token categories, known costs, stable event hashes, and
+content-free parser cursors. Pi clone/fork copies are deduplicated by stable
+entry identity. Removing or rewriting an original artifact is reconciled
+without dropping an event still referenced by another artifact.
 
 ## Config
 
@@ -145,13 +176,13 @@ github-copilot = "gc"
 
 `scope` can be `all`, `current`, or `project:<id>`. Press `p` in the TUI to
 choose a project and persist its ID without editing TOML. `current` selects the
-deepest OpenCode worktree containing the directory where `expensive` started.
+deepest indexed worktree containing the directory where `expensive` started.
 
 Provider aliases replace only the provider prefix, so `github-copilot/model`
 becomes `gc/model`. Model aliases replace the complete displayed model name.
 Model keys may be a full `provider/model` (preferred) or a bare model ID. All
-matches are exact and aliases affect labels only; raw database IDs remain in
-JSON reports.
+matches are exact and aliases affect labels only; raw indexed IDs remain in JSON
+reports.
 
 Press `?` to edit the regular settings and both alias maps from the TUI. Alias
 editors support add/edit with `Enter`, delete with `d`, and field switching with
@@ -159,33 +190,34 @@ editors support add/edit with `Enter`, delete with `d`, and field switching with
 
 `week_start` can be `monday` or `sunday`. `auto_refresh` and
 `show_comparison` can be `true` or `false`; the previous-period panel is hidden
-by default. Themes are `aurora`, `ember`,
-`ocean`, `forest`, and `graphite`. `theme_scope = "calendar"` applies the
-theme to the Calendar heatmap only; `theme_scope = "all"` applies it to the
-entire TUI.
+by default. Themes are `aurora`, `ember`, `ocean`, `forest`, and `graphite`.
+`theme_scope = "calendar"` applies the theme to the Calendar heatmap only;
+`theme_scope = "all"` applies it to the entire TUI.
 
 CLI flags override file values. Settings changed in the TUI are written back to
 this file, including the last selected project scope.
 
-## Notes
+## Accounting Notes
 
-The app uses OpenCode's stored assistant message usage fields:
+OpenCode usage comes from its stored assistant message fields: `cost`, token
+categories, `providerID`, `modelID`, and `variant`. Totals should therefore track
+OpenCode's own stored accounting without rerunning its slower stats command.
 
-- `cost`
-- `tokens.input`
-- `tokens.output`
-- `tokens.cache.read`
-- `tokens.cache.write`
-- `providerID`
-- `modelID`
-- `variant`
+Codex usage comes from per-request `last_token_usage` facts in rollout logs.
+Cached input is treated as a subset of input to avoid double-counting, and
+source-reported total tokens remain authoritative. Codex rollouts do not provide
+a dollar cost, so those messages are marked unpriced and the summary changes
+from `Cost` to `Known Cost`.
 
-That means totals should track OpenCode's own cost and token accounting without
-rerunning the slower stats command.
+Pi usage comes from assistant entries in version 3 session files. Token
+categories and Pi's supplied cost total are indexed; supplied Pi costs are
+classified as estimates.
 
 `expensive` validates the required OpenCode tables, columns, and SQLite JSON
-support before querying. `expensive doctor` also reports optional project-scope
-support, detected OpenCode versions, and malformed message JSON.
+support before importing them. `expensive doctor` also reports index schema and
+generation, indexed source/artifact/event counts, source locations, optional
+OpenCode project-scope support, detected OpenCode versions, and malformed
+message JSON.
 
 ## Compatibility and Releases
 
