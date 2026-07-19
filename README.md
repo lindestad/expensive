@@ -131,8 +131,8 @@ Available sources are discovered automatically:
 
 Codex uses `CODEX_HOME`, falling back to `~/.codex`. Pi uses
 `PI_CODING_AGENT_SESSION_DIR`, then `PI_CODING_AGENT_DIR/sessions`, then
-`~/.pi/agent/sessions`. Point an environment variable at a nonexistent
-directory to exclude that source.
+`~/.pi/agent/sessions`. These environment variables can also select custom
+source locations.
 
 The normalized index is selected in this order:
 
