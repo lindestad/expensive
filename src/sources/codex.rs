@@ -3,7 +3,6 @@ use std::{collections::HashMap, path::PathBuf};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use crate::{
     index::{
@@ -160,57 +159,90 @@ fn consume_line(
     state: &mut Cursor,
     projects: &mut HashMap<String, ProjectRecord>,
 ) -> Result<Option<UsageEvent>> {
-    let value: Value = serde_json::from_slice(line)?;
-    match value.get("type").and_then(Value::as_str) {
+    let prefix = &line[..line.len().min(1_024)];
+    if !contains(prefix, b"\"type\":\"session_meta\"")
+        && !contains(prefix, b"\"type\":\"turn_context\"")
+        && !(contains(prefix, b"\"type\":\"event_msg\"")
+            && contains(prefix, b"\"type\":\"token_count\""))
+    {
+        return Ok(None);
+    }
+    let line: CodexLine = serde_json::from_slice(line)?;
+    let payload = line.payload.as_ref();
+    match line.kind.as_deref() {
         Some("session_meta") => {
-            let payload = value.get("payload").unwrap_or(&Value::Null);
             state.session_id = text_or(
-                payload.get("id").or_else(|| payload.get("session_id")),
+                payload
+                    .and_then(|payload| payload.id.as_deref())
+                    .or_else(|| payload.and_then(|payload| payload.session_id.as_deref())),
                 &state.session_id,
             );
-            state.provider = text_or(payload.get("model_provider"), "openai");
-            update_cwd(state, projects, payload.get("cwd"));
+            state.provider = text_or(
+                payload.and_then(|payload| payload.model_provider.as_deref()),
+                "openai",
+            );
+            update_cwd(
+                state,
+                projects,
+                payload.and_then(|payload| payload.cwd.as_deref()),
+            );
             Ok(None)
         }
         Some("turn_context") => {
-            let payload = value.get("payload").unwrap_or(&Value::Null);
-            state.model = text_or(payload.get("model"), "unknown");
-            state.variant = text_or(payload.get("effort"), "default");
-            update_cwd(state, projects, payload.get("cwd"));
+            state.model = text_or(
+                payload.and_then(|payload| payload.model.as_deref()),
+                "unknown",
+            );
+            state.variant = text_or(
+                payload.and_then(|payload| payload.effort.as_deref()),
+                "default",
+            );
+            update_cwd(
+                state,
+                projects,
+                payload.and_then(|payload| payload.cwd.as_deref()),
+            );
             Ok(None)
         }
         Some("event_msg")
-            if value.pointer("/payload/type").and_then(Value::as_str) == Some("token_count") =>
+            if payload.and_then(|payload| payload.kind.as_deref()) == Some("token_count") =>
         {
             state.token_sequence = state.token_sequence.saturating_add(1);
-            parse_token_event(&value, state, projects)
+            let Some(usage) = payload
+                .and_then(|payload| payload.info.as_ref())
+                .and_then(|info| info.last_token_usage.as_ref())
+            else {
+                return Ok(None);
+            };
+            parse_token_event(line.timestamp.as_deref(), usage, state, projects)
         }
         _ => Ok(None),
     }
 }
 
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
 fn parse_token_event(
-    value: &Value,
+    timestamp: Option<&str>,
+    usage: &TokenUsage,
     state: &Cursor,
     projects: &mut HashMap<String, ProjectRecord>,
 ) -> Result<Option<UsageEvent>> {
-    let Some(usage) = value.pointer("/payload/info/last_token_usage") else {
-        return Ok(None);
-    };
-    let timestamp = value
-        .get("timestamp")
-        .and_then(Value::as_str)
+    let timestamp = timestamp
         .and_then(|timestamp| DateTime::parse_from_rfc3339(timestamp).ok())
         .map(|timestamp| timestamp.timestamp_millis())
         .ok_or_else(|| anyhow::anyhow!("Codex token event has an invalid timestamp"))?;
-    let input_total = nonnegative(usage.get("input_tokens"));
-    let cache_read_tokens = nonnegative(usage.get("cached_input_tokens"));
+    let input_total = nonnegative(usage.input_tokens);
+    let cache_read_tokens = nonnegative(usage.cached_input_tokens);
     let input_tokens = input_total.saturating_sub(cache_read_tokens);
-    let output_tokens = nonnegative(usage.get("output_tokens"));
-    let reasoning_tokens = nonnegative(usage.get("reasoning_output_tokens"));
+    let output_tokens = nonnegative(usage.output_tokens);
+    let reasoning_tokens = nonnegative(usage.reasoning_output_tokens);
     let total_tokens = usage
-        .get("total_tokens")
-        .and_then(json_i64)
+        .total_tokens
         .unwrap_or_else(|| input_total.saturating_add(output_tokens))
         .max(0);
     let project = project_from_cwd(&state.cwd);
@@ -241,7 +273,7 @@ fn parse_token_event(
 fn update_cwd(
     state: &mut Cursor,
     projects: &mut HashMap<String, ProjectRecord>,
-    value: Option<&Value>,
+    value: Option<&str>,
 ) {
     let cwd = text_or(value, &state.cwd);
     if !cwd.is_empty() {
@@ -271,9 +303,8 @@ fn project_from_cwd(cwd: &str) -> Option<ProjectRecord> {
     })
 }
 
-fn text_or(value: Option<&Value>, fallback: &str) -> String {
+fn text_or(value: Option<&str>, fallback: &str) -> String {
     value
-        .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or(fallback)
@@ -289,14 +320,43 @@ fn nonempty_or<'a>(value: &'a str, fallback: &'a str) -> &'a str {
     }
 }
 
-fn json_i64(value: &Value) -> Option<i64> {
-    value
-        .as_i64()
-        .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))
+fn nonnegative(value: Option<i64>) -> i64 {
+    value.unwrap_or(0).max(0)
 }
 
-fn nonnegative(value: Option<&Value>) -> i64 {
-    value.and_then(json_i64).unwrap_or(0).max(0)
+#[derive(Deserialize)]
+struct CodexLine {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    timestamp: Option<String>,
+    payload: Option<CodexPayload>,
+}
+
+#[derive(Deserialize)]
+struct CodexPayload {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    id: Option<String>,
+    session_id: Option<String>,
+    model_provider: Option<String>,
+    cwd: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
+    info: Option<TokenInfo>,
+}
+
+#[derive(Deserialize)]
+struct TokenInfo {
+    last_token_usage: Option<TokenUsage>,
+}
+
+#[derive(Deserialize)]
+struct TokenUsage {
+    input_tokens: Option<i64>,
+    cached_input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    reasoning_output_tokens: Option<i64>,
+    total_tokens: Option<i64>,
 }
 
 #[cfg(test)]
