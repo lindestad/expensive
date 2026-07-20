@@ -13,14 +13,13 @@ use crate::{
 pub fn load_dashboard(config: &Config, mode: Mode) -> Result<UsageStats> {
     let cutoff_millis =
         time_window::cutoff_millis(mode, Local::now(), config.daily_start, config.week_start)?;
-    let mut stats = index::load_usage_range_scoped(
+    let mut stats = index::load_usage_range_scoped_with_options(
         &config.index_path,
         mode,
         cutoff_millis,
         None,
         false,
-        &config.scope,
-        &config.current_directory,
+        query_options(config),
     )?;
     apply_model_aliases(config, &mut stats);
     if let Some(scale) = CalendarScale::from_mode(mode) {
@@ -41,14 +40,13 @@ pub fn load_period_with_buckets(
     period: PeriodKey,
     include_buckets: bool,
 ) -> Result<UsageStats> {
-    let mut stats = index::load_usage_range_scoped(
+    let mut stats = index::load_usage_range_scoped_with_options(
         &config.index_path,
         period.mode(),
         Some(period.start_millis),
         Some(period.end_millis),
         include_buckets,
-        &config.scope,
-        &config.current_directory,
+        query_options(config),
     )?;
     apply_model_aliases(config, &mut stats);
     attach_period_comparison(config, &mut stats, period)?;
@@ -62,14 +60,13 @@ pub fn load_range(
     end_millis: Option<i64>,
     include_buckets: bool,
 ) -> Result<UsageStats> {
-    let mut stats = index::load_usage_range_scoped(
+    let mut stats = index::load_usage_range_scoped_with_options(
         &config.index_path,
         mode,
         start_millis,
         end_millis,
         include_buckets,
-        &config.scope,
-        &config.current_directory,
+        query_options(config),
     )?;
     apply_model_aliases(config, &mut stats);
     if let (Some(start_millis), Some(end_millis)) = (start_millis, end_millis) {
@@ -133,14 +130,13 @@ fn attach_comparison(
     start_millis: i64,
     end_millis: i64,
 ) -> Result<()> {
-    let mut previous = index::load_usage_range_scoped(
+    let mut previous = index::load_usage_range_scoped_with_options(
         &config.index_path,
         stats.mode,
         Some(start_millis),
         Some(end_millis),
         false,
-        &config.scope,
-        &config.current_directory,
+        query_options(config),
     )?;
     apply_model_aliases(config, &mut previous);
     stats.comparison = Some(UsageComparison {
@@ -150,6 +146,15 @@ fn attach_comparison(
         models: previous.models,
     });
     Ok(())
+}
+
+fn query_options(config: &Config) -> index::UsageQueryOptions<'_> {
+    index::UsageQueryOptions {
+        scope: &config.scope,
+        current_directory: &config.current_directory,
+        hidden_providers: &config.hidden_providers,
+        estimate_api_cost: config.estimate_api_cost,
+    }
 }
 
 fn projected_cost_for_range(stats: &UsageStats, start_millis: i64, end_millis: i64) -> Option<f64> {

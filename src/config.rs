@@ -5,7 +5,7 @@
 //! command-line arguments, config file values, then built-in defaults.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env, fmt, fs,
     path::{Path, PathBuf},
     process::Command as ProcessCommand,
@@ -310,6 +310,8 @@ pub struct Config {
     pub refresh_interval: Duration,
     pub auto_refresh: bool,
     pub show_comparison: bool,
+    pub estimate_api_cost: bool,
+    pub hidden_providers: BTreeSet<String>,
     pub scope: Scope,
     pub color_theme: ColorTheme,
     pub theme_scope: ThemeScope,
@@ -323,6 +325,9 @@ struct FileConfig {
     refresh_seconds: Option<u64>,
     auto_refresh: Option<bool>,
     show_comparison: Option<bool>,
+    estimate_api_cost: Option<bool>,
+    #[serde(default)]
+    hidden_providers: BTreeSet<String>,
     scope: Option<String>,
     color_theme: Option<String>,
     theme_scope: Option<String>,
@@ -377,6 +382,7 @@ fn resolve_config(
         file_config.auto_refresh.unwrap_or(true)
     };
     let show_comparison = file_config.show_comparison.unwrap_or(false);
+    let estimate_api_cost = file_config.estimate_api_cost.unwrap_or(false);
 
     let scope = match (cli.scope, file_config.scope.as_deref()) {
         (Some(value), _) => value,
@@ -408,6 +414,8 @@ fn resolve_config(
         refresh_interval: Duration::from_secs(refresh_seconds),
         auto_refresh,
         show_comparison,
+        estimate_api_cost,
+        hidden_providers: file_config.hidden_providers,
         scope,
         color_theme,
         theme_scope,
@@ -456,6 +464,8 @@ fn format_config(config: &Config) -> String {
             "refresh_seconds = {}\n",
             "auto_refresh = {}\n",
             "show_comparison = {}\n",
+            "estimate_api_cost = {}\n",
+            "hidden_providers = {}\n",
             "color_theme = \"{}\"\n",
             "theme_scope = \"{}\"\n",
             "scope = \"{}\"\n",
@@ -465,6 +475,15 @@ fn format_config(config: &Config) -> String {
         config.refresh_interval.as_secs(),
         config.auto_refresh,
         config.show_comparison,
+        config.estimate_api_cost,
+        toml::Value::Array(
+            config
+                .hidden_providers
+                .iter()
+                .cloned()
+                .map(toml::Value::String)
+                .collect()
+        ),
         config.color_theme,
         config.theme_scope,
         config.scope,
@@ -612,6 +631,8 @@ mod tests {
         assert_eq!(config.refresh_interval, Duration::from_secs(60));
         assert!(config.auto_refresh);
         assert!(!config.show_comparison);
+        assert!(!config.estimate_api_cost);
+        assert!(config.hidden_providers.is_empty());
         assert_eq!(config.scope, Scope::All);
         assert_eq!(config.color_theme, ColorTheme::Aurora);
         assert_eq!(config.theme_scope, ThemeScope::Calendar);
@@ -634,6 +655,8 @@ mod tests {
             refresh_seconds: Some(60),
             auto_refresh: Some(true),
             show_comparison: Some(true),
+            estimate_api_cost: Some(true),
+            hidden_providers: BTreeSet::from(["openrouter".to_string()]),
             scope: Some("all".to_string()),
             color_theme: Some("ember".to_string()),
             theme_scope: Some("calendar".to_string()),
@@ -662,6 +685,8 @@ mod tests {
         assert_eq!(config.refresh_interval, Duration::from_secs(10));
         assert!(!config.auto_refresh);
         assert!(config.show_comparison);
+        assert!(config.estimate_api_cost);
+        assert!(config.hidden_providers.contains("openrouter"));
         assert_eq!(config.scope, Scope::All);
         assert_eq!(config.color_theme, ColorTheme::Ocean);
         assert_eq!(config.theme_scope, ThemeScope::All);
@@ -673,6 +698,8 @@ mod tests {
             week_start: Some("sunday".to_string()),
             auto_refresh: Some(false),
             show_comparison: Some(true),
+            estimate_api_cost: Some(true),
+            hidden_providers: BTreeSet::from(["llama.cpp".to_string()]),
             color_theme: Some("forest".to_string()),
             theme_scope: Some("all".to_string()),
             ..FileConfig::default()
@@ -691,6 +718,8 @@ mod tests {
         assert_eq!(config.week_start, WeekStart::Sunday);
         assert!(!config.auto_refresh);
         assert!(config.show_comparison);
+        assert!(config.estimate_api_cost);
+        assert!(config.hidden_providers.contains("llama.cpp"));
         assert_eq!(config.color_theme, ColorTheme::Forest);
         assert_eq!(config.theme_scope, ThemeScope::All);
     }
@@ -711,6 +740,8 @@ mod tests {
             refresh_interval: Duration::from_secs(15),
             auto_refresh: false,
             show_comparison: true,
+            estimate_api_cost: true,
+            hidden_providers: BTreeSet::from(["llama.cpp".to_string(), "openrouter".to_string()]),
             scope: Scope::All,
             color_theme: ColorTheme::Forest,
             theme_scope: ThemeScope::All,
@@ -728,10 +759,15 @@ mod tests {
         assert!(content.contains("refresh_seconds = 15"));
         assert!(content.contains("auto_refresh = false"));
         assert!(content.contains("show_comparison = true"));
+        assert!(content.contains("estimate_api_cost = true"));
         assert!(content.contains(r#"color_theme = "forest""#));
         assert!(content.contains(r#"theme_scope = "all""#));
         assert!(content.contains(r#"scope = "all""#));
         let parsed: FileConfig = toml::from_str(&content).unwrap();
+        assert_eq!(
+            parsed.hidden_providers,
+            BTreeSet::from(["llama.cpp".to_string(), "openrouter".to_string()])
+        );
         assert_eq!(parsed.provider_aliases["github-copilot"], "gc");
         assert_eq!(parsed.model_aliases["github-copilot/gpt-test"], "gt");
     }

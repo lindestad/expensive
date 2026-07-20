@@ -296,6 +296,9 @@ pub fn draw(frame: &mut Frame<'_>, app: &AppState) {
     if app.scope_picker.is_some() {
         draw_scope_picker(frame, area, app, palette);
     }
+    if app.provider_picker.is_some() {
+        draw_provider_picker(frame, area, app, palette);
+    }
     if app.alias_editor.is_some() {
         draw_alias_editor(frame, area, app, palette);
     }
@@ -629,6 +632,88 @@ fn draw_alias_editor(frame: &mut Frame<'_>, area: Rect, app: &AppState, palette:
         key_span(" Esc ", palette),
         Span::styled(" close", Style::default().fg(palette.muted)),
     ]));
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_provider_picker(frame: &mut Frame<'_>, area: Rect, app: &AppState, palette: Palette) {
+    let Some(picker) = &app.provider_picker else {
+        return;
+    };
+    let modal = centered_rect(area, 76, 22);
+    frame.render_widget(Clear, modal);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Provider visibility ")
+        .title_alignment(Alignment::Center)
+        .title_style(
+            Style::default()
+                .fg(palette.title)
+                .add_modifier(Modifier::BOLD),
+        )
+        .border_style(Style::default().fg(palette.border));
+    let inner = modal.inner(Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    frame.render_widget(block, modal);
+
+    let entries = app.provider_entries();
+    let list_height = inner.height.saturating_sub(4) as usize;
+    let scroll = picker
+        .selection
+        .saturating_add(1)
+        .saturating_sub(list_height)
+        .min(entries.len().saturating_sub(list_height));
+    let mut lines = vec![Line::from(Span::styled(
+        "Checked providers are included in every view and report.",
+        Style::default().fg(palette.muted),
+    ))];
+    if entries.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "No providers have been indexed yet.",
+            Style::default().fg(palette.muted),
+        )));
+    } else {
+        lines.extend(
+            entries
+                .iter()
+                .enumerate()
+                .skip(scroll)
+                .take(list_height)
+                .map(|(index, provider)| {
+                    let selected = index == picker.selection;
+                    let visible = !app.config.hidden_providers.contains(provider);
+                    let style = if selected {
+                        Style::default()
+                            .fg(palette.calendar_accent)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(palette.text)
+                    };
+                    Line::from(Span::styled(
+                        format!(
+                            "{} [{}] {provider}",
+                            if selected { ">" } else { " " },
+                            if visible { "x" } else { " " }
+                        ),
+                        style,
+                    ))
+                }),
+        );
+    }
+    while lines.len() < inner.height.saturating_sub(1) as usize {
+        lines.push(Line::from(""));
+    }
+    lines.push(
+        Line::from(vec![
+            key_span(" Space ", palette),
+            Span::styled(" toggle  ", Style::default().fg(palette.muted)),
+            key_span(" Esc ", palette),
+            Span::styled(" done", Style::default().fg(palette.muted)),
+        ])
+        .alignment(Alignment::Center),
+    );
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -1237,6 +1322,17 @@ fn config_value_width(item: ConfigEditorItem, app: &AppState) -> usize {
                 text_width(" [ ]  hidden")
             }
         }
+        ConfigEditorItem::EstimateApiCost => {
+            if app.config.estimate_api_cost {
+                text_width(" [x]  include API estimates")
+            } else {
+                text_width(" [ ]  actual costs only")
+            }
+        }
+        ConfigEditorItem::HiddenProviders => text_width(&format!(
+            " {} hidden  edit ",
+            app.config.hidden_providers.len()
+        )),
         ConfigEditorItem::ProviderAliases => text_width(&format!(
             " {} aliases  edit ",
             app.config.aliases.providers.len()
@@ -1387,6 +1483,34 @@ fn config_value_tokens(
                     "hidden".to_string()
                 },
                 style: Style::default().fg(palette.muted),
+            },
+        ],
+        ConfigEditorItem::EstimateApiCost => vec![
+            ValueToken {
+                text: if app.config.estimate_api_cost {
+                    " [x] ".to_string()
+                } else {
+                    " [ ] ".to_string()
+                },
+                style: checkbox_style(app.config.estimate_api_cost, palette),
+            },
+            ValueToken {
+                text: if app.config.estimate_api_cost {
+                    "include API estimates".to_string()
+                } else {
+                    "actual costs only".to_string()
+                },
+                style: Style::default().fg(palette.muted),
+            },
+        ],
+        ConfigEditorItem::HiddenProviders => vec![
+            ValueToken {
+                text: format!(" {} hidden ", app.config.hidden_providers.len()),
+                style: Style::default().fg(palette.text),
+            },
+            ValueToken {
+                text: " edit ".to_string(),
+                style: selected_value_style(palette),
             },
         ],
         ConfigEditorItem::ProviderAliases => {
@@ -2319,7 +2443,20 @@ fn draw_summary(
         .unwrap_or_else(|| "--".to_string());
     let messages = totals
         .map(|totals| {
-            if totals.unpriced_messages > 0 {
+            if totals.api_estimated_messages > 0 && totals.unpriced_messages > 0 {
+                format!(
+                    "{} msgs | {} est. | {} unpriced",
+                    format::integer(totals.messages),
+                    format::integer(totals.api_estimated_messages),
+                    format::integer(totals.unpriced_messages)
+                )
+            } else if totals.api_estimated_messages > 0 {
+                format!(
+                    "{} msgs | {} estimated",
+                    format::integer(totals.messages),
+                    format::integer(totals.api_estimated_messages)
+                )
+            } else if totals.unpriced_messages > 0 {
                 format!(
                     "{} msgs | {} unpriced",
                     format::integer(totals.messages),
@@ -2330,7 +2467,9 @@ fn draw_summary(
             }
         })
         .unwrap_or_else(|| metric_sub("messages", loading));
-    let cost_title = if totals.is_some_and(|totals| totals.unpriced_messages > 0) {
+    let cost_title = if totals.is_some_and(|totals| totals.api_estimated_messages > 0) {
+        "Cost incl. API Est."
+    } else if totals.is_some_and(|totals| totals.unpriced_messages > 0) {
         "Known Cost"
     } else {
         "Cost"
@@ -2616,7 +2755,7 @@ fn wide_row(
     Row::new([
         styled_cell(model.display_name.clone(), palette.accent, true),
         styled_cell(format::integer(model.totals.messages), palette.muted, false),
-        styled_cell(format::precise_cost(model.totals.cost), palette.cost, true),
+        styled_cell(model_cost_label(model), palette.cost, true),
         styled_cell(
             format::tokens(model.totals.total_tokens()),
             palette.tokens,
@@ -2652,7 +2791,7 @@ fn compact_row(
     Row::new([
         styled_cell(model.display_name.clone(), palette.accent, true),
         styled_cell(format::integer(model.totals.messages), palette.muted, false),
-        styled_cell(format::precise_cost(model.totals.cost), palette.cost, true),
+        styled_cell(model_cost_label(model), palette.cost, true),
         styled_cell(
             format::tokens(model.totals.total_tokens()),
             palette.tokens,
@@ -2693,6 +2832,15 @@ fn braille_bar(value: f64, max: f64, width: usize) -> String {
 
 fn model_cost(model: &ModelUsage) -> f64 {
     model.totals.cost
+}
+
+fn model_cost_label(model: &ModelUsage) -> String {
+    let cost = format::precise_cost(model.totals.cost);
+    if model.totals.api_estimated_cost > 0.0 {
+        format!("~{cost}")
+    } else {
+        cost
+    }
 }
 
 fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &AppState, palette: Palette) {
@@ -3146,7 +3294,9 @@ mod tests {
             totals: UsageTotals {
                 messages: 1,
                 unpriced_messages: 0,
+                api_estimated_messages: 0,
                 cost: 1.0,
+                api_estimated_cost: 0.0,
                 total: 10,
                 input: 1,
                 output: 2,
@@ -3161,7 +3311,9 @@ mod tests {
                 totals: UsageTotals {
                     messages: 1,
                     unpriced_messages: 0,
+                    api_estimated_messages: 0,
                     cost: 0.5,
+                    api_estimated_cost: 0.0,
                     total: 10,
                     input: 1,
                     output: 2,
@@ -3298,6 +3450,22 @@ mod tests {
     }
 
     #[test]
+    fn labels_api_estimated_costs_and_model_rows() {
+        let mut stats = sample_stats(Mode::Daily, None);
+        stats.totals.api_estimated_messages = 2;
+        stats.totals.api_estimated_cost = stats.totals.cost;
+        stats.models[0].totals.api_estimated_messages = 1;
+        stats.models[0].totals.api_estimated_cost = stats.models[0].totals.cost;
+        let app = app_with_stats(Mode::Daily, stats);
+
+        let output = render(&app, 120, 24);
+
+        assert!(output.contains("Cost incl. API Est."));
+        assert!(output.contains("2 estimated"));
+        assert!(output.contains("~$2.5000"));
+    }
+
+    #[test]
     fn renders_error_footer() {
         let mut app = app_loading(Mode::Monthly);
         app.loading.clear();
@@ -3415,7 +3583,7 @@ mod tests {
         let mut app = app_loading(Mode::Daily);
         app.show_help = true;
 
-        let output = render(&app, 120, 34);
+        let output = render(&app, 120, 40);
 
         assert!(output.contains("Help"));
         assert!(output.contains("Config"));
@@ -3423,10 +3591,11 @@ mod tests {
         assert!(output.contains("refresh_seconds"));
         assert!(output.contains("week_start"));
         assert!(output.contains("show_comparison"));
+        assert!(output.contains("estimate_api_cost"));
+        assert!(output.contains("hidden_providers"));
         assert!(output.contains("hidden"));
         assert!(output.contains("[x]"));
         assert!(output.contains("Space / Enter"));
-        assert!(output.contains("/tmp/expensive/config.toml"));
     }
 
     #[test]
@@ -3446,6 +3615,21 @@ mod tests {
         assert!(output.contains("Current directory"));
         assert!(output.contains("Project A"));
         assert!(output.contains("/work/project-a"));
+    }
+
+    #[test]
+    fn renders_provider_visibility_picker() {
+        let mut app = app_loading(Mode::Daily);
+        app.providers = vec!["openai".to_string(), "openrouter".to_string()];
+        app.config.hidden_providers.insert("openrouter".to_string());
+        app.provider_picker = Some(crate::app::ProviderPickerState { selection: 1 });
+
+        let output = render(&app, 100, 24);
+
+        assert!(output.contains("Provider visibility"));
+        assert!(output.contains("[x] openai"));
+        assert!(output.contains("[ ] openrouter"));
+        assert!(output.contains("toggle"));
     }
 
     #[test]
@@ -3661,8 +3845,10 @@ mod tests {
             view: View::Dashboard,
             show_help: false,
             scope_picker: None,
+            provider_picker: None,
             alias_editor: None,
             projects: Vec::new(),
+            providers: Vec::new(),
             help_scroll: 0,
             dashboard_model_scroll: 0,
             history_model_scroll: 0,
@@ -3700,8 +3886,10 @@ mod tests {
             view: View::Dashboard,
             show_help: false,
             scope_picker: None,
+            provider_picker: None,
             alias_editor: None,
             projects: Vec::new(),
+            providers: Vec::new(),
             help_scroll: 0,
             dashboard_model_scroll: 0,
             history_model_scroll: 0,
@@ -3739,8 +3927,10 @@ mod tests {
             view: View::CalendarOverview,
             show_help: false,
             scope_picker: None,
+            provider_picker: None,
             alias_editor: None,
             projects: Vec::new(),
+            providers: Vec::new(),
             help_scroll: 0,
             dashboard_model_scroll: 0,
             history_model_scroll: 0,
@@ -3815,6 +4005,8 @@ mod tests {
             refresh_interval: Duration::from_secs(60),
             auto_refresh: true,
             show_comparison: false,
+            estimate_api_cost: false,
+            hidden_providers: std::collections::BTreeSet::new(),
             scope: Scope::All,
             color_theme: ColorTheme::Aurora,
             theme_scope: ThemeScope::Calendar,
@@ -3831,7 +4023,9 @@ mod tests {
             totals: UsageTotals {
                 messages: 1,
                 unpriced_messages: 0,
+                api_estimated_messages: 0,
                 cost: 2.5,
+                api_estimated_cost: 0.0,
                 total: 10,
                 input: 1,
                 output: 2,
@@ -3847,7 +4041,9 @@ mod tests {
             totals: UsageTotals {
                 messages: 1,
                 unpriced_messages: 0,
+                api_estimated_messages: 0,
                 cost: 1.25,
+                api_estimated_cost: 0.0,
                 total: 100,
                 input: 10,
                 output: 20,
@@ -3865,7 +4061,9 @@ mod tests {
             totals: UsageTotals {
                 messages: 2,
                 unpriced_messages: 0,
+                api_estimated_messages: 0,
                 cost: 3.75,
+                api_estimated_cost: 0.0,
                 total: 110,
                 input: 11,
                 output: 22,
@@ -3889,7 +4087,9 @@ mod tests {
                 totals: UsageTotals {
                     messages: 1,
                     unpriced_messages: 0,
+                    api_estimated_messages: 0,
                     cost: (count - idx) as f64,
+                    api_estimated_cost: 0.0,
                     total: 100,
                     input: 10,
                     output: 20,
@@ -3901,7 +4101,9 @@ mod tests {
         let totals = UsageTotals {
             messages: count as u64,
             unpriced_messages: 0,
+            api_estimated_messages: 0,
             cost: models.iter().map(|model| model.totals.cost).sum(),
+            api_estimated_cost: 0.0,
             total: count as u64 * 100,
             input: models.iter().map(|model| model.totals.input).sum(),
             output: models.iter().map(|model| model.totals.output).sum(),
@@ -3936,6 +4138,7 @@ mod tests {
             end_millis: (idx as i64 + 1) * 2 * HOUR,
             tokens,
             cost: tokens as f64 / 100.0,
+            api_estimated_cost: 0.0,
         }
     }
 

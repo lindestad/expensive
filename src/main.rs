@@ -28,6 +28,27 @@ fn run_doctor(config: &Config) -> Result<()> {
     println!("indexed sources: {}", index_diagnostics.sources);
     println!("indexed artifacts: {}", index_diagnostics.artifacts);
     println!("indexed events: {}", index_diagnostics.events);
+    println!(
+        "hidden providers: {}",
+        if config.hidden_providers.is_empty() {
+            "none".to_string()
+        } else {
+            config
+                .hidden_providers
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    );
+    println!(
+        "API cost estimates: {}",
+        if config.estimate_api_cost {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
 
     let opencode_available = config.db_path.is_file();
     println!(

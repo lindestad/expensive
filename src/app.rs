@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     hash::Hash,
     io,
     sync::mpsc::{self, Receiver, Sender},
@@ -65,6 +65,10 @@ pub struct ScopePickerState {
     pub selection: usize,
 }
 
+pub struct ProviderPickerState {
+    pub selection: usize,
+}
+
 pub struct DeferredLoadState<K> {
     pub loading: HashSet<K>,
     pub pending: HashSet<K>,
@@ -122,12 +126,14 @@ pub enum ConfigEditorItem {
     ColorTheme,
     ThemeScope,
     ShowComparison,
+    EstimateApiCost,
+    HiddenProviders,
     ProviderAliases,
     ModelAliases,
 }
 
 impl ConfigEditorItem {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 11] = [
         Self::AutoRefresh,
         Self::DailyStart,
         Self::RefreshSeconds,
@@ -135,6 +141,8 @@ impl ConfigEditorItem {
         Self::ColorTheme,
         Self::ThemeScope,
         Self::ShowComparison,
+        Self::EstimateApiCost,
+        Self::HiddenProviders,
         Self::ProviderAliases,
         Self::ModelAliases,
     ];
@@ -148,6 +156,8 @@ impl ConfigEditorItem {
             Self::ColorTheme => "color_theme",
             Self::ThemeScope => "theme_scope",
             Self::ShowComparison => "show_comparison",
+            Self::EstimateApiCost => "estimate_api_cost",
+            Self::HiddenProviders => "hidden_providers",
             Self::ProviderAliases => "provider_aliases",
             Self::ModelAliases => "model_aliases",
         }
@@ -200,8 +210,10 @@ pub struct AppState {
     pub view: View,
     pub show_help: bool,
     pub scope_picker: Option<ScopePickerState>,
+    pub provider_picker: Option<ProviderPickerState>,
     pub alias_editor: Option<AliasEditorState>,
     pub projects: Vec<db::ProjectInfo>,
+    pub providers: Vec<String>,
     pub help_scroll: usize,
     pub dashboard_model_scroll: usize,
     pub history_model_scroll: usize,
@@ -244,14 +256,17 @@ impl AppState {
         let visible_periods =
             time_window::visible_periods(selected, config.daily_start, config.week_start)?;
         let projects = index::list_projects(&config.index_path).unwrap_or_default();
+        let providers = index::list_providers(&config.index_path).unwrap_or_default();
 
         Ok(Self {
             config,
             view: View::Dashboard,
             show_help: false,
             scope_picker: None,
+            provider_picker: None,
             alias_editor: None,
             projects,
+            providers,
             help_scroll: 0,
             dashboard_model_scroll: 0,
             history_model_scroll: 0,
@@ -324,6 +339,7 @@ impl AppState {
     fn toggle_help(&mut self) {
         self.show_help = !self.show_help;
         self.scope_picker = None;
+        self.provider_picker = None;
         self.alias_editor = None;
         if self.show_help {
             self.help_scroll = 0;
@@ -344,11 +360,59 @@ impl AppState {
 
     fn open_alias_editor(&mut self, kind: AliasKind) {
         self.scope_picker = None;
+        self.provider_picker = None;
         self.alias_editor = Some(AliasEditorState {
             kind,
             selection: 0,
             input: None,
         });
+    }
+
+    pub fn provider_entries(&self) -> Vec<String> {
+        self.providers
+            .iter()
+            .cloned()
+            .chain(self.config.hidden_providers.iter().cloned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    fn open_provider_picker(&mut self) {
+        if let Ok(providers) = index::list_providers(&self.config.index_path) {
+            if !providers.is_empty() || self.providers.is_empty() {
+                self.providers = providers;
+            }
+        }
+        self.scope_picker = None;
+        self.alias_editor = None;
+        self.provider_picker = Some(ProviderPickerState { selection: 0 });
+    }
+
+    fn move_provider_selection(&mut self, direction: i32) {
+        let option_count = self.provider_entries().len();
+        let Some(picker) = self.provider_picker.as_mut() else {
+            return;
+        };
+        if direction > 0 {
+            picker.selection = (picker.selection + 1).min(option_count.saturating_sub(1));
+        } else {
+            picker.selection = picker.selection.saturating_sub(1);
+        }
+    }
+
+    fn toggle_selected_provider(&mut self, tx: &Sender<RefreshMessage>) {
+        let Some(selection) = self.provider_picker.as_ref().map(|picker| picker.selection) else {
+            return;
+        };
+        let Some(provider) = self.provider_entries().get(selection).cloned() else {
+            return;
+        };
+        if !self.config.hidden_providers.remove(&provider) {
+            self.config.hidden_providers.insert(provider);
+        }
+        self.invalidate_usage_config(tx);
+        self.save_config_notice();
     }
 
     fn move_alias_selection(&mut self, direction: i32) {
@@ -493,6 +557,8 @@ impl AppState {
                 .unwrap_or(0),
         };
         self.show_help = false;
+        self.provider_picker = None;
+        self.alias_editor = None;
         self.scope_picker = Some(ScopePickerState { selection });
     }
 
@@ -525,6 +591,11 @@ impl AppState {
         }
 
         self.config.scope = scope;
+        self.invalidate_usage_config(tx);
+        self.save_config_notice();
+    }
+
+    fn invalidate_usage_config(&mut self, tx: &Sender<RefreshMessage>) {
         self.request_generation = self.request_generation.wrapping_add(1);
         self.stats.clear();
         self.loading.clear();
@@ -538,7 +609,6 @@ impl AppState {
         self.dashboard_token_bucket = None;
         self.history_token_bucket = None;
         self.error = None;
-        self.save_config_notice();
         self.trigger_current_refresh(tx);
     }
 
@@ -585,6 +655,9 @@ impl AppState {
                     (!summary.errors.is_empty()).then(|| summary.errors.join("; "));
                 if let Ok(projects) = index::list_projects(&self.config.index_path) {
                     self.projects = projects;
+                }
+                if let Ok(providers) = index::list_providers(&self.config.index_path) {
+                    self.providers = providers;
                 }
                 if summary.changed() {
                     self.invalidate_after_source_change(tx);
@@ -690,14 +763,18 @@ impl AppState {
         let config = self.config.clone();
         let generation = self.request_generation;
         thread::spawn(move || {
-            let result = index::load_usage_token_buckets_at_scoped(
+            let result = index::load_usage_token_buckets_at_scoped_with_options(
                 &config.index_path,
                 mode,
                 cutoff_millis,
                 end_millis,
                 snapshot_millis,
-                &config.scope,
-                &config.current_directory,
+                index::UsageQueryOptions {
+                    scope: &config.scope,
+                    current_directory: &config.current_directory,
+                    hidden_providers: &config.hidden_providers,
+                    estimate_api_cost: config.estimate_api_cost,
+                },
             )
             .map_err(|error| format!("{error:#}"));
             let _ = tx.send(RefreshMessage::DashboardGraph {
@@ -813,11 +890,15 @@ impl AppState {
         let config = self.config.clone();
         let generation = self.request_generation;
         thread::spawn(move || {
-            let result = index::load_period_costs_scoped(
+            let result = index::load_period_costs_scoped_with_options(
                 &config.index_path,
                 &periods,
-                &config.scope,
-                &config.current_directory,
+                index::UsageQueryOptions {
+                    scope: &config.scope,
+                    current_directory: &config.current_directory,
+                    hidden_providers: &config.hidden_providers,
+                    estimate_api_cost: config.estimate_api_cost,
+                },
             )
             .map_err(|error| format!("{error:#}"));
             let _ = tx.send(RefreshMessage::Calendar { generation, result });
@@ -868,14 +949,18 @@ impl AppState {
         let config = self.config.clone();
         let generation = self.request_generation;
         thread::spawn(move || {
-            let result = index::load_usage_token_buckets_at_scoped(
+            let result = index::load_usage_token_buckets_at_scoped_with_options(
                 &config.index_path,
                 period.mode(),
                 Some(period.start_millis),
                 Some(period.end_millis),
                 snapshot_millis,
-                &config.scope,
-                &config.current_directory,
+                index::UsageQueryOptions {
+                    scope: &config.scope,
+                    current_directory: &config.current_directory,
+                    hidden_providers: &config.hidden_providers,
+                    estimate_api_cost: config.estimate_api_cost,
+                },
             )
             .map_err(|error| format!("{error:#}"));
             let _ = tx.send(RefreshMessage::HistoryGraph {
@@ -1293,6 +1378,14 @@ impl AppState {
             ConfigEditorItem::ShowComparison => {
                 self.config.show_comparison = !self.config.show_comparison;
             }
+            ConfigEditorItem::EstimateApiCost => {
+                self.config.estimate_api_cost = !self.config.estimate_api_cost;
+                self.invalidate_usage_config(tx);
+            }
+            ConfigEditorItem::HiddenProviders => {
+                self.open_provider_picker();
+                return Ok(());
+            }
             ConfigEditorItem::ProviderAliases => {
                 self.open_alias_editor(AliasKind::Provider);
                 return Ok(());
@@ -1479,6 +1572,19 @@ fn handle_key(
     app: &mut AppState,
     tx: &Sender<RefreshMessage>,
 ) -> bool {
+    if app.provider_picker.is_some() {
+        match code {
+            KeyCode::Char('q') => return true,
+            KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => return true,
+            KeyCode::Esc => app.provider_picker = None,
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => app.move_provider_selection(-1),
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => app.move_provider_selection(1),
+            KeyCode::Enter | KeyCode::Char(' ') => app.toggle_selected_provider(tx),
+            _ => {}
+        }
+        return false;
+    }
+
     if app.alias_editor.is_some() {
         let editing = app
             .alias_editor
@@ -1708,7 +1814,7 @@ fn handle_mouse(
     app: &mut AppState,
     tx: &Sender<RefreshMessage>,
 ) -> bool {
-    if app.scope_picker.is_some() || app.alias_editor.is_some() {
+    if app.scope_picker.is_some() || app.provider_picker.is_some() || app.alias_editor.is_some() {
         return false;
     }
 
@@ -2086,6 +2192,54 @@ mod tests {
         assert!(fs::read_to_string(config_path)
             .unwrap()
             .contains("show_comparison = true"));
+    }
+
+    #[test]
+    fn help_space_enables_api_cost_estimates_and_invalidates_usage() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config_path = tempdir.path().join("config.toml");
+        let mut config = test_config(config_path.clone());
+        config.index_path = tempdir.path().join("usage.sqlite3");
+        let mut app = AppState::new(config).unwrap();
+        app.show_help = true;
+        app.stats
+            .insert(Mode::Daily, many_model_stats(Mode::Daily, 1));
+        app.config_selection = ConfigEditorItem::ALL
+            .iter()
+            .position(|item| *item == ConfigEditorItem::EstimateApiCost)
+            .unwrap();
+        let (tx, _rx) = mpsc::channel();
+        let area = Rect::new(0, 0, 120, 40);
+
+        handle_key(KeyCode::Char(' '), KeyModifiers::NONE, area, &mut app, &tx);
+
+        assert!(app.config.estimate_api_cost);
+        assert_eq!(app.request_generation, 1);
+        assert!(app.stats.is_empty());
+        assert!(fs::read_to_string(config_path)
+            .unwrap()
+            .contains("estimate_api_cost = true"));
+    }
+
+    #[test]
+    fn provider_picker_toggles_visibility_and_saves_config() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config_path = tempdir.path().join("config.toml");
+        let mut config = test_config(config_path.clone());
+        config.index_path = tempdir.path().join("usage.sqlite3");
+        let mut app = AppState::new(config).unwrap();
+        app.providers = vec!["openai".to_string(), "openrouter".to_string()];
+        app.open_provider_picker();
+        let (tx, _rx) = mpsc::channel();
+
+        app.move_provider_selection(1);
+        app.toggle_selected_provider(&tx);
+
+        assert!(app.config.hidden_providers.contains("openrouter"));
+        assert_eq!(app.request_generation, 1);
+        assert!(fs::read_to_string(config_path)
+            .unwrap()
+            .contains(r#"hidden_providers = ["openrouter"]"#));
     }
 
     #[test]
@@ -2509,6 +2663,7 @@ mod tests {
             end_millis: 1,
             tokens: 999,
             cost: 9.99,
+            api_estimated_cost: 0.0,
         }];
         let changed = app.apply_dashboard_graph_refresh(
             Mode::Daily,
@@ -2733,6 +2888,8 @@ mod tests {
             refresh_interval: Duration::from_secs(60),
             auto_refresh: true,
             show_comparison: false,
+            estimate_api_cost: false,
+            hidden_providers: std::collections::BTreeSet::new(),
             scope: Scope::All,
             color_theme: ColorTheme::Aurora,
             theme_scope: ThemeScope::Calendar,
@@ -2750,7 +2907,9 @@ mod tests {
                 totals: UsageTotals {
                     messages: 1,
                     unpriced_messages: 0,
+                    api_estimated_messages: 0,
                     cost: (count - idx) as f64,
+                    api_estimated_cost: 0.0,
                     total: 100,
                     input: 10,
                     output: 20,
@@ -2762,7 +2921,9 @@ mod tests {
         let totals = UsageTotals {
             messages: count as u64,
             unpriced_messages: 0,
+            api_estimated_messages: 0,
             cost: models.iter().map(|model| model.totals.cost).sum(),
+            api_estimated_cost: 0.0,
             total: count as u64 * 100,
             input: models.iter().map(|model| model.totals.input).sum(),
             output: models.iter().map(|model| model.totals.output).sum(),
@@ -2792,6 +2953,7 @@ mod tests {
                 end_millis: (idx as i64 + 1) * HOUR,
                 tokens: (idx as u64 + 1) * 10,
                 cost: (idx as f64 + 1.0) / 10.0,
+                api_estimated_cost: 0.0,
             })
             .collect()
     }

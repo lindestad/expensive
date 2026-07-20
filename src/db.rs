@@ -24,7 +24,11 @@ pub struct UsageTotals {
     pub messages: u64,
     /// Messages whose source did not provide a usable dollar cost.
     pub unpriced_messages: u64,
+    /// Unpriced messages covered by the optional API-equivalent estimate.
+    pub api_estimated_messages: u64,
     pub cost: f64,
+    /// Portion of `cost` inferred from current standard API token rates.
+    pub api_estimated_cost: f64,
     /// Canonical source-reported total. This avoids double-counting token
     /// categories such as Codex cached input, which is a subset of input.
     pub total: u64,
@@ -46,7 +50,9 @@ impl UsageTotals {
     pub(crate) fn add_model(&mut self, model: &ModelUsage) {
         self.messages += model.totals.messages;
         self.unpriced_messages += model.totals.unpriced_messages;
+        self.api_estimated_messages += model.totals.api_estimated_messages;
         self.cost += model.totals.cost;
+        self.api_estimated_cost += model.totals.api_estimated_cost;
         self.total += model.totals.total_tokens();
         self.input += model.totals.input;
         self.output += model.totals.output;
@@ -126,6 +132,7 @@ pub struct TokenBucket {
     pub end_millis: i64,
     pub tokens: u64,
     pub cost: f64,
+    pub api_estimated_cost: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -433,7 +440,9 @@ fn load_model_usage(
         let totals = UsageTotals {
             messages: read_u64(row, "messages")?,
             unpriced_messages: 0,
+            api_estimated_messages: 0,
             cost: row.get("cost")?,
+            api_estimated_cost: 0.0,
             total: input + output + cache_read + cache_write,
             input,
             output,
@@ -495,6 +504,7 @@ fn load_token_buckets(
                 end_millis: (start + span).min(range_end),
                 tokens: 0,
                 cost: 0.0,
+                api_estimated_cost: 0.0,
             }
         })
         .collect::<Vec<_>>();

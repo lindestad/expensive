@@ -15,8 +15,10 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction};
 mod query;
 
 pub use query::{
-    list_projects, load_period_costs_scoped, load_usage_range_scoped,
-    load_usage_token_buckets_at_scoped,
+    list_projects, list_providers, load_period_costs_scoped, load_period_costs_scoped_with_options,
+    load_usage_range_scoped, load_usage_range_scoped_with_options,
+    load_usage_token_buckets_at_scoped, load_usage_token_buckets_at_scoped_with_options,
+    UsageQueryOptions,
 };
 
 const SCHEMA_VERSION: i64 = 2;

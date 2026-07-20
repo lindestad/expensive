@@ -20,6 +20,8 @@ struct JsonReport {
     index: String,
     scope: String,
     current_directory: String,
+    estimate_api_cost: bool,
+    hidden_providers: Vec<String>,
     window: ReportWindow,
     totals: UsageTotals,
     comparison: Option<UsageComparison>,
@@ -98,12 +100,14 @@ fn json_report(config: &Config, stats: UsageStats) -> JsonReport {
                 cost_delta,
             });
     JsonReport {
-        schema_version: 2,
+        schema_version: 3,
         expensive_version: env!("CARGO_PKG_VERSION"),
         generated_at: stats.refreshed_at.to_rfc3339(),
         index: config.index_path.display().to_string(),
         scope: config.scope.key(),
         current_directory: config.current_directory.display().to_string(),
+        estimate_api_cost: config.estimate_api_cost,
+        hidden_providers: config.hidden_providers.iter().cloned().collect(),
         window: ReportWindow {
             mode: mode_key(stats.mode),
             start_millis: stats.cutoff_millis,
@@ -204,6 +208,8 @@ mod tests {
             refresh_interval: Duration::from_secs(60),
             auto_refresh: false,
             show_comparison: false,
+            estimate_api_cost: false,
+            hidden_providers: std::collections::BTreeSet::new(),
             scope: Scope::Project("project-a".to_string()),
             color_theme: ColorTheme::default(),
             theme_scope: ThemeScope::default(),
@@ -227,9 +233,11 @@ mod tests {
         let report = build_report(&config, &args).unwrap();
         let value = serde_json::to_value(report).unwrap();
 
-        assert_eq!(value["schema_version"], 2);
+        assert_eq!(value["schema_version"], 3);
         assert_eq!(value["index"], config.index_path.display().to_string());
         assert_eq!(value["scope"], "project:project-a");
+        assert_eq!(value["estimate_api_cost"], false);
+        assert_eq!(value["hidden_providers"], serde_json::json!([]));
         assert_eq!(value["totals"]["messages"], 1);
         assert_eq!(value["models"][0]["display_name"], "gc/gpt-test");
         assert_eq!(value["buckets"][0]["cost"], 1.25);

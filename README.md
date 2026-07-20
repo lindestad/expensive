@@ -15,7 +15,8 @@ stored by `expensive`.
 
 ## What It Shows
 
-- known cost, with unpriced messages called out explicitly
+- known cost, with unpriced messages called out explicitly and optional
+  API-equivalent estimates for supported subscription usage
 - total, input, output, cache-read, and cache-write tokens
 - model-level message, cost, token, and spend-share breakdowns
 - daily, weekly, monthly, all-time, and calendar views
@@ -23,6 +24,7 @@ stored by `expensive`.
 - token or known-cost history graphs
 - all-project, current-directory, and individual-project scopes
 - configurable compact names for providers and models
+- provider visibility filters shared by dashboards, calendars, and reports
 
 Daily usage defaults to "since 04:00" in your local timezone, which fits
 late-night coding accounting better than a strict midnight cutoff.
@@ -109,10 +111,11 @@ expensive report --from 2026-07-01 --to 2026-08-01 --pretty
 ```
 
 `--from` is inclusive and `--to` is exclusive. Bounds accept `YYYY-MM-DD`, a
-local `YYYY-MM-DDTHH:MM[:SS]`, or RFC 3339. Reports use schema version 2 and
-include totals, models, comparison data, projections, token/cost buckets, and
-the index path. The `unpriced_messages` fields distinguish known spend from
-messages whose source does not provide a cost.
+local `YYYY-MM-DDTHH:MM[:SS]`, or RFC 3339. Reports use schema version 3 and
+include totals, models, comparison data, projections, token/cost buckets,
+provider filters, the API-estimate setting, and the index path. The
+`unpriced_messages`, `api_estimated_messages`, and `api_estimated_cost` fields
+make the displayed cost basis explicit.
 
 ## Sources and Index
 
@@ -163,6 +166,8 @@ week_start = "monday"
 refresh_seconds = 60
 auto_refresh = true
 show_comparison = false
+estimate_api_cost = false
+hidden_providers = []
 color_theme = "aurora"
 theme_scope = "calendar"
 scope = "all"
@@ -184,13 +189,18 @@ Model keys may be a full `provider/model` (preferred) or a bare model ID. All
 matches are exact and aliases affect labels only; raw indexed IDs remain in JSON
 reports.
 
-Press `?` to edit the regular settings and both alias maps from the TUI. Alias
+Press `?` to edit the regular settings, provider visibility, and both alias maps
+from the TUI. The provider checklist controls every dashboard, graph, calendar,
+comparison, projection, and JSON report without deleting indexed data. Alias
 editors support add/edit with `Enter`, delete with `d`, and field switching with
 `Tab`.
 
 `week_start` can be `monday` or `sunday`. `auto_refresh` and
 `show_comparison` can be `true` or `false`; the previous-period panel is hidden
-by default. Themes are `aurora`, `ember`, `ocean`, `forest`, and `graphite`.
+by default. `estimate_api_cost` is also off by default. When enabled, supported
+otherwise-unpriced OpenAI usage is added at standard API text-token rates and
+marked as estimated; unknown model IDs remain unpriced. Themes are `aurora`,
+`ember`, `ocean`, `forest`, and `graphite`.
 `theme_scope = "calendar"` applies the theme to the Calendar heatmap only;
 `theme_scope = "all"` applies it to the entire TUI.
 
@@ -207,7 +217,18 @@ Codex usage comes from per-request `last_token_usage` facts in rollout logs.
 Cached input is treated as a subset of input to avoid double-counting, and
 source-reported total tokens remain authoritative. Codex rollouts do not provide
 a dollar cost, so those messages are marked unpriced and the summary changes
-from `Cost` to `Known Cost`.
+from `Cost` to `Known Cost`. With `estimate_api_cost = true`, `expensive`
+calculates a best-effort API equivalent for recognized OpenAI model IDs using
+[OpenAI's documented model rates](https://developers.openai.com/api/docs/models)
+as verified on 2026-07-21. Estimated model costs are prefixed with `~`.
+
+API equivalents use standard input, cached-input, output, and cache-write token
+rates. They do not reconstruct long-context multipliers, tool-call fees,
+regional processing uplifts, priority pricing, or other request-specific
+charges, so they should be read as comparisons rather than invoices. The
+built-in rate table is intentionally conservative: undocumented variants such
+as subscription-only model IDs stay unpriced instead of inheriting a guessed
+family rate.
 
 Pi usage comes from assistant entries in version 3 session files. Token
 categories and Pi's supplied cost total are indexed; supplied Pi costs are

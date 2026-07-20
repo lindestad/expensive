@@ -23,6 +23,8 @@ pub mod config;
 pub mod db;
 pub mod format;
 pub mod index;
+#[doc(hidden)]
+pub mod pricing;
 pub mod report;
 #[doc(hidden)]
 pub mod sources;
