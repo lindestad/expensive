@@ -75,11 +75,12 @@ immediately, then checks sources in a background thread. Unchanged graphs stay
 on screen and are only redrawn when their data changes. Day rollover is handled
 separately even when automatic refresh is disabled.
 
-The first run may take a little while if there is substantial Codex or Pi
-history. Later scans use file identity, size, timestamps, boundary hashes, and
-parser checkpoints to read only safe appends. OpenCode rechecks a rolling
-48-hour mutable window. Press `R` if source history was rewritten or you want a
-complete reconciliation.
+The first run publishes OpenCode data as soon as it is ready, then scans Codex
+and Pi concurrently while updating the dashboard as each source completes.
+Later scans use file identity, size, timestamps, boundary hashes, and parser
+checkpoints to read only safe appends. OpenCode fingerprints its database and
+WAL, and rechecks a rolling 24-hour mutable window when either changes. Press
+`R` if source history was rewritten or you want a complete reconciliation.
 
 ## Options and Reports
 

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.2
+
+- publish OpenCode data first during initial sync, then scan Codex and Pi concurrently while updating the dashboard as each source completes
+- add animated first-sync and per-source progress states while keeping partial model data visible and fitting sync status to the available terminal width
+- make OpenCode incremental refreshes fast with a 24-hour mutable window, database and WAL fingerprints, unchanged-event write avoidance, and indexed artifact cleanup
+
 ## 0.5.1
 
 - add a persisted provider-visibility checklist that filters dashboards, graphs, calendars, comparisons, projections, and JSON reports without deleting indexed data
