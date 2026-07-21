@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.3
+
+- reflow summaries and model usage into width-aware layouts so API estimates, large counts, and model details remain readable in narrow terminals
+- shorten tabs, controls, sync status, comparisons, help, and picker entries only as space requires, with explicit ellipses for omitted text
+- show compact calendar costs when they fit and omit them at very narrow widths instead of rendering ambiguous fragments
+
 ## 0.5.2
 
 - publish OpenCode data first during initial sync, then scan Codex and Pi concurrently while updating the dashboard as each source completes
