@@ -2936,7 +2936,7 @@ fn model_cost_label(model: &ModelUsage) -> String {
 }
 
 fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &AppState, palette: Palette) {
-    let (mut spans, status, status_color) = match app.view {
+    let (mut spans, status_color) = match app.view {
         View::Dashboard => (
             vec![
                 key_span(" Tab ", palette),
@@ -2952,7 +2952,6 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &AppState, palette: Palet
                 key_span(" q ", palette),
                 Span::styled(" quit | ", Style::default().fg(palette.muted)),
             ],
-            dashboard_status(app),
             dashboard_status_color(app, palette),
         ),
         View::CalendarOverview => (
@@ -2970,7 +2969,6 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &AppState, palette: Palet
                 key_span(" q ", palette),
                 Span::styled(" quit | ", Style::default().fg(palette.muted)),
             ],
-            calendar_status(app),
             calendar_status_color(app, palette),
         ),
         View::CalendarDetail => (
@@ -2988,9 +2986,18 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &AppState, palette: Palet
                 key_span(" q ", palette),
                 Span::styled(" quit | ", Style::default().fg(palette.muted)),
             ],
-            history_status(app),
             history_status_color(app, palette),
         ),
+    };
+    let controls_width = spans
+        .iter()
+        .map(|span| text_width(span.content.as_ref()))
+        .sum::<usize>();
+    let status_width = (area.width as usize).saturating_sub(controls_width);
+    let status = match app.view {
+        View::Dashboard => dashboard_status(app, status_width),
+        View::CalendarOverview => calendar_status(app, status_width),
+        View::CalendarDetail => history_status(app, status_width),
     };
     spans.push(Span::styled(status, Style::default().fg(status_color)));
 
@@ -3002,11 +3009,11 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &AppState, palette: Palet
     );
 }
 
-fn dashboard_status(app: &AppState) -> String {
+fn dashboard_status(app: &AppState, available_width: usize) -> String {
     if let Some(error) = &app.error {
         format!("error: {error}")
     } else if let Some(mode) = app.source_sync {
-        source_sync_status_label(app, mode)
+        source_sync_status_label(app, mode, available_width)
     } else if let Some(error) = &app.source_sync_error {
         format!("source warning: {error}")
     } else if let Some(stats) = app.current_stats() {
@@ -3033,11 +3040,11 @@ fn dashboard_status_color(app: &AppState, palette: Palette) -> Color {
     }
 }
 
-fn calendar_status(app: &AppState) -> String {
+fn calendar_status(app: &AppState, available_width: usize) -> String {
     if let Some(error) = &app.error {
         format!("error: {error}")
     } else if let Some(mode) = app.source_sync {
-        source_sync_status_label(app, mode)
+        source_sync_status_label(app, mode, available_width)
     } else if let Some(error) = &app.source_sync_error {
         format!("source warning: {error}")
     } else if app.calendar_loading {
@@ -3061,11 +3068,11 @@ fn calendar_status_color(app: &AppState, palette: Palette) -> Color {
     }
 }
 
-fn history_status(app: &AppState) -> String {
+fn history_status(app: &AppState, available_width: usize) -> String {
     if let Some(error) = &app.error {
         format!("error: {error}")
     } else if let Some(mode) = app.source_sync {
-        source_sync_status_label(app, mode)
+        source_sync_status_label(app, mode, available_width)
     } else if let Some(error) = &app.source_sync_error {
         format!("source warning: {error}")
     } else if let Some(stats) = app.selected_history_stats() {
@@ -3099,7 +3106,7 @@ fn source_sync_label(mode: SyncMode) -> &'static str {
     }
 }
 
-fn source_sync_status_label(app: &AppState, mode: SyncMode) -> String {
+fn source_sync_status_label(app: &AppState, mode: SyncMode, available_width: usize) -> String {
     let label = if app.first_sync {
         format!("{} performing first sync", sync_spinner())
     } else {
@@ -3110,19 +3117,37 @@ fn source_sync_status_label(app: &AppState, mode: SyncMode) -> String {
         .as_ref()
         .filter(|status| !status.sources.is_empty())
     else {
-        return label;
+        return fit_text(&label, available_width);
     };
     let active = status.active_names();
-    let activity = if active.is_empty() {
-        "finishing".to_string()
-    } else {
-        format!("syncing {}", active.join(" + "))
-    };
-    format!(
-        "{label} · {activity} · {}/{} complete",
+    let progress = format!(
+        "{label} · {}/{} complete",
         status.completed(),
         status.sources.len()
-    )
+    );
+    if active.is_empty() {
+        let finishing = format!(
+            "{label} · finishing · {}/{} complete",
+            status.completed(),
+            status.sources.len()
+        );
+        if text_width(&finishing) <= available_width {
+            return finishing;
+        }
+        return fit_text(&progress, available_width);
+    }
+
+    let with_sources = format!(
+        "{label} · syncing {} · {}/{} complete",
+        active.join(" + "),
+        status.completed(),
+        status.sources.len()
+    );
+    if text_width(&with_sources) <= available_width {
+        with_sources
+    } else {
+        fit_text(&progress, available_width)
+    }
 }
 
 fn key_span(label: &'static str, palette: Palette) -> Span<'static> {
@@ -3525,6 +3550,25 @@ mod tests {
         assert!(output.contains("first sync 1/2"));
         assert!(output.contains("provider/model-0"));
         assert!(output.contains("syncing Pi"));
+    }
+
+    #[test]
+    fn sync_status_only_names_active_sources_when_they_fit() {
+        let mut app = app_loading(Mode::Daily);
+        app.source_sync = Some(SyncMode::Incremental);
+        app.source_sync_status = Some(SourceSyncStatus {
+            sources: vec![crate::app::SourceSyncItem {
+                name: "OpenCode".to_string(),
+                stage: SourceSyncStage::Syncing,
+            }],
+        });
+
+        let wide = source_sync_status_label(&app, SyncMode::Incremental, 80);
+        let narrow = source_sync_status_label(&app, SyncMode::Incremental, 25);
+
+        assert!(wide.contains("OpenCode"));
+        assert!(!narrow.contains("OpenCode"));
+        assert!(text_width(&narrow) <= 25);
     }
 
     #[test]

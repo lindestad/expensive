@@ -21,7 +21,7 @@ pub use query::{
     UsageQueryOptions,
 };
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SourceKind {
@@ -351,8 +351,13 @@ impl UsageIndex {
         let mut upsert_changed = false;
         for event in upserts {
             validate_event(event)?;
-            upsert_changed |= !event_is_unchanged(&transaction, source_id, event)?;
-            let event_id = upsert_event(&transaction, source_id, event)?;
+            let event_id = match unchanged_event_id(&transaction, source_id, event)? {
+                Some(event_id) => event_id,
+                None => {
+                    upsert_changed = true;
+                    upsert_event(&transaction, source_id, event)?
+                }
+            };
             transaction.execute(
                 "INSERT OR IGNORE INTO artifact_events (artifact_id, event_id)
                  VALUES (?1, ?2)",
@@ -594,6 +599,7 @@ fn migrate(connection: &Connection) -> Result<()> {
                 event_id INTEGER NOT NULL REFERENCES usage_events(id) ON DELETE CASCADE,
                 PRIMARY KEY (artifact_id, event_id)
             ) STRICT, WITHOUT ROWID;
+            CREATE INDEX artifact_events_event_id ON artifact_events(event_id);
 
             CREATE TABLE usage_buckets (
                 id INTEGER PRIMARY KEY,
@@ -621,17 +627,28 @@ fn migrate(connection: &Connection) -> Result<()> {
             ) STRICT;
             CREATE INDEX usage_buckets_range ON usage_buckets(start_ms, end_ms);
 
-            PRAGMA user_version = 2;
+            PRAGMA user_version = 3;
             COMMIT;
             "#,
         )?;
-    } else if version == 1 {
-        connection.execute_batch(
-            "BEGIN IMMEDIATE;
-             ALTER TABLE artifacts ADD COLUMN cursor TEXT;
-             PRAGMA user_version = 2;
-             COMMIT;",
-        )?;
+    } else {
+        if version == 1 {
+            connection.execute_batch(
+                "BEGIN IMMEDIATE;
+                 ALTER TABLE artifacts ADD COLUMN cursor TEXT;
+                 PRAGMA user_version = 2;
+                 COMMIT;",
+            )?;
+        }
+        if schema_version(connection)? == 2 {
+            connection.execute_batch(
+                "BEGIN IMMEDIATE;
+                 CREATE INDEX IF NOT EXISTS artifact_events_event_id
+                     ON artifact_events(event_id);
+                 PRAGMA user_version = 3;
+                 COMMIT;",
+            )?;
+        }
     }
     Ok(())
 }
@@ -737,32 +754,30 @@ fn upsert_event(transaction: &Transaction<'_>, source_id: i64, event: &UsageEven
         .context("upserting usage event")
 }
 
-fn event_is_unchanged(
+fn unchanged_event_id(
     transaction: &Transaction<'_>,
     source_id: i64,
     event: &UsageEvent,
-) -> Result<bool> {
+) -> Result<Option<i64>> {
     transaction
         .query_row(
-            "SELECT EXISTS (
-                SELECT 1 FROM usage_events
-                WHERE source_id = ?1
-                  AND event_key = ?2
-                  AND occurred_at_ms = ?3
-                  AND project_id IS ?4
-                  AND provider = ?5
-                  AND model = ?6
-                  AND variant = ?7
-                  AND messages = ?8
-                  AND input_tokens = ?9
-                  AND output_tokens = ?10
-                  AND cache_read_tokens = ?11
-                  AND cache_write_tokens = ?12
-                  AND reasoning_tokens = ?13
-                  AND total_tokens = ?14
-                  AND cost_microusd IS ?15
-                  AND cost_kind = ?16
-             )",
+            "SELECT id FROM usage_events
+             WHERE source_id = ?1
+               AND event_key = ?2
+               AND occurred_at_ms = ?3
+               AND project_id IS ?4
+               AND provider = ?5
+               AND model = ?6
+               AND variant = ?7
+               AND messages = ?8
+               AND input_tokens = ?9
+               AND output_tokens = ?10
+               AND cache_read_tokens = ?11
+               AND cache_write_tokens = ?12
+               AND reasoning_tokens = ?13
+               AND total_tokens = ?14
+               AND cost_microusd IS ?15
+               AND cost_kind = ?16",
             params![
                 source_id,
                 event.event_key,
@@ -783,6 +798,7 @@ fn event_is_unchanged(
             ],
             |row| row.get(0),
         )
+        .optional()
         .context("comparing indexed usage event")
 }
 
@@ -942,7 +958,7 @@ mod tests {
         let (_directory, index) = index();
         let diagnostics = index.diagnostics().unwrap();
 
-        assert_eq!(diagnostics.schema_version, 2);
+        assert_eq!(diagnostics.schema_version, 3);
         assert_eq!(diagnostics.generation, 0);
         assert_eq!(diagnostics.events, 0);
         let journal_mode: String = index
@@ -950,6 +966,34 @@ mod tests {
             .pragma_query_value(None, "journal_mode", |row| row.get(0))
             .unwrap();
         assert_eq!(journal_mode, "wal");
+    }
+
+    #[test]
+    fn migrates_version_two_indexes_for_reverse_artifact_lookups() {
+        let (_directory, index) = index();
+        index
+            .connection
+            .execute_batch(
+                "DROP INDEX artifact_events_event_id;
+                 PRAGMA user_version = 2;",
+            )
+            .unwrap();
+
+        migrate(&index.connection).unwrap();
+
+        assert_eq!(schema_version(&index.connection).unwrap(), 3);
+        let index_exists: bool = index
+            .connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_master
+                    WHERE type = 'index' AND name = 'artifact_events_event_id'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(index_exists);
     }
 
     #[test]
@@ -971,6 +1015,39 @@ mod tests {
         assert_eq!(checkpoint.parsed_offset, 100);
         assert_eq!(checkpoint.boundary_hash, Some(vec![1, 2, 3]));
         assert_eq!(index.diagnostics().unwrap().events, 1);
+    }
+
+    #[test]
+    fn incremental_changes_do_not_rewrite_identical_events() {
+        let (_directory, mut index) = index();
+        let source_id = source(&index);
+        let existing = event(b"event-1", 50);
+        index
+            .replace_artifact_events(source_id, &artifact("one"), std::slice::from_ref(&existing))
+            .unwrap();
+        index
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER reject_usage_event_update
+                 BEFORE UPDATE ON usage_events
+                 BEGIN
+                     SELECT RAISE(FAIL, 'unexpected event rewrite');
+                 END;",
+            )
+            .unwrap();
+
+        let change = index
+            .apply_artifact_changes(
+                source_id,
+                &artifact("one"),
+                std::slice::from_ref(&existing),
+                &[],
+            )
+            .unwrap();
+
+        assert_eq!(change.generation, 1);
+        assert_eq!(change.start_ms, None);
+        assert_eq!(change.end_ms, None);
     }
 
     #[test]

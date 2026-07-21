@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
-    fs,
+    fs::{self, File},
+    io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     time::UNIX_EPOCH,
 };
@@ -20,7 +21,8 @@ use crate::{
 };
 
 const PARSER_VERSION: i64 = 1;
-const MUTABLE_WINDOW_MS: i64 = 48 * 60 * 60 * 1_000;
+const MUTABLE_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
+const FINGERPRINT_SAMPLE_BYTES: usize = 64 * 1_024;
 
 pub struct OpenCodeSource {
     path: PathBuf,
@@ -64,6 +66,15 @@ impl UsageSource for OpenCodeSource {
             .as_ref()
             .map(|checkpoint| checkpoint.parser_version != PARSER_VERSION)
             .unwrap_or(true);
+        let fingerprint_before = database_fingerprint(&self.path)?;
+        let fingerprint_matches = checkpoint
+            .as_ref()
+            .and_then(|checkpoint| checkpoint.boundary_hash.as_ref())
+            .zip(fingerprint_before.as_ref())
+            .is_some_and(|(previous, current)| previous == current);
+        if requested_mode == SyncMode::Incremental && !parser_changed && fingerprint_matches {
+            return Ok(SyncReport::default());
+        }
         let mode = if parser_changed { SyncMode::Full } else { mode };
         let watermark = checkpoint
             .as_ref()
@@ -127,7 +138,12 @@ impl UsageSource for OpenCodeSource {
             }
         }
 
-        let artifact = database_artifact(&self.path, max_updated)?;
+        let fingerprint_after = database_fingerprint(&self.path)?;
+        let stable_fingerprint = (fingerprint_before.is_some()
+            && fingerprint_before == fingerprint_after)
+            .then_some(fingerprint_after)
+            .flatten();
+        let artifact = database_artifact(&self.path, max_updated, stable_fingerprint)?;
         let removed = removals.len();
         let change = match mode {
             SyncMode::Full => index.replace_artifact_events(source_id, &artifact, &upserts)?,
@@ -234,7 +250,11 @@ fn cost_to_microusd(cost: f64) -> Option<i64> {
         .then(|| micros.round() as i64)
 }
 
-fn database_artifact(path: &Path, watermark: i64) -> Result<ArtifactRecord> {
+fn database_artifact(
+    path: &Path,
+    watermark: i64,
+    fingerprint: Option<Vec<u8>>,
+) -> Result<ArtifactRecord> {
     let metadata = fs::metadata(path).with_context(|| format!("reading {}", path.display()))?;
     let (device, inode) = file_identity(&metadata);
     Ok(ArtifactRecord {
@@ -245,12 +265,81 @@ fn database_artifact(path: &Path, watermark: i64) -> Result<ArtifactRecord> {
         size: i64::try_from(metadata.len()).ok(),
         modified_ns: modified_ns(&metadata),
         parsed_offset: watermark.max(0),
-        boundary_hash: None,
+        boundary_hash: fingerprint,
         full_hash: None,
         cursor: None,
         parser_version: PARSER_VERSION,
         scanned_at_ms: Utc::now().timestamp_millis(),
     })
+}
+
+fn database_fingerprint(path: &Path) -> Result<Option<Vec<u8>>> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"expensive-opencode-database-v1\0");
+    if !hash_file_snapshot(&mut hasher, b"database", path)? {
+        return Ok(None);
+    }
+
+    let mut wal_path = path.as_os_str().to_os_string();
+    wal_path.push("-wal");
+    if !hash_file_snapshot(&mut hasher, b"wal", Path::new(&wal_path))? {
+        return Ok(None);
+    }
+    Ok(Some(hasher.finalize().as_bytes().to_vec()))
+}
+
+fn hash_file_snapshot(hasher: &mut blake3::Hasher, label: &[u8], path: &Path) -> Result<bool> {
+    hasher.update(label);
+    hasher.update(&[0]);
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            hasher.update(b"missing");
+            return Ok(!path.exists());
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("opening {}", path.display()));
+        }
+    };
+    let before = file
+        .metadata()
+        .with_context(|| format!("reading metadata for {}", path.display()))?;
+    let signature = metadata_signature(&before);
+    hasher.update(format!("{signature:?}").as_bytes());
+
+    let sample_len = usize::try_from(before.len())
+        .unwrap_or(usize::MAX)
+        .min(FINGERPRINT_SAMPLE_BYTES);
+    let mut sample = vec![0; sample_len];
+    file.read_exact(&mut sample)
+        .with_context(|| format!("reading fingerprint head from {}", path.display()))?;
+    hasher.update(&sample);
+
+    if before.len() > FINGERPRINT_SAMPLE_BYTES as u64 {
+        file.seek(SeekFrom::End(-(FINGERPRINT_SAMPLE_BYTES as i64)))
+            .with_context(|| format!("seeking fingerprint tail in {}", path.display()))?;
+        sample.resize(FINGERPRINT_SAMPLE_BYTES, 0);
+        file.read_exact(&mut sample)
+            .with_context(|| format!("reading fingerprint tail from {}", path.display()))?;
+        hasher.update(&sample);
+    }
+
+    let after = file
+        .metadata()
+        .with_context(|| format!("re-reading metadata for {}", path.display()))?;
+    let current = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error).with_context(|| format!("re-reading {}", path.display()));
+        }
+    };
+    Ok(signature == metadata_signature(&after) && signature == metadata_signature(&current))
+}
+
+fn metadata_signature(metadata: &fs::Metadata) -> (Option<i64>, Option<i64>, u64, Option<i64>) {
+    let (device, inode) = file_identity(metadata);
+    (device, inode, metadata.len(), modified_ns(metadata))
 }
 
 fn modified_ns(metadata: &fs::Metadata) -> Option<i64> {
@@ -294,7 +383,10 @@ mod tests {
         assert_eq!(initial.imported, 1);
         assert_eq!(index.diagnostics().unwrap().events, 1);
 
-        source.sync(&mut index, SyncMode::Incremental).unwrap();
+        let unchanged = source.sync(&mut index, SyncMode::Incremental).unwrap();
+        assert_eq!(unchanged.scanned, 0);
+        assert_eq!(unchanged.imported, 0);
+        assert_eq!(unchanged.change, None);
         assert_eq!(index.diagnostics().unwrap().generation, 1);
 
         let connection = Connection::open(&source_path).unwrap();
@@ -325,6 +417,32 @@ mod tests {
 
         source.sync(&mut index, SyncMode::Incremental).unwrap();
         assert_eq!(index.diagnostics().unwrap().events, 1);
+    }
+
+    #[test]
+    fn database_fingerprint_tracks_main_database_and_wal_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("opencode.db");
+        fs::write(&database, b"database-a").unwrap();
+
+        let without_wal = database_fingerprint(&database).unwrap().unwrap();
+        let mut wal = database.as_os_str().to_os_string();
+        wal.push("-wal");
+        fs::write(Path::new(&wal), b"wal-a").unwrap();
+        let with_wal = database_fingerprint(&database).unwrap().unwrap();
+        fs::write(Path::new(&wal), b"wal-b").unwrap();
+        let changed_wal = database_fingerprint(&database).unwrap().unwrap();
+        fs::write(&database, b"database-b").unwrap();
+        let changed_database = database_fingerprint(&database).unwrap().unwrap();
+
+        assert_ne!(without_wal, with_wal);
+        assert_ne!(with_wal, changed_wal);
+        assert_ne!(changed_wal, changed_database);
+    }
+
+    #[test]
+    fn incremental_sync_reconciles_one_mutable_day() {
+        assert_eq!(MUTABLE_WINDOW_MS, 24 * 60 * 60 * 1_000);
     }
 
     #[test]
