@@ -199,6 +199,7 @@ mod tests {
         let config = Config {
             db_path: file.path().to_path_buf(),
             index_path: file.path().with_extension("index.sqlite3"),
+            copilot_home: PathBuf::from("/tmp/copilot"),
             codex_home: PathBuf::from("/tmp/codex"),
             pi_sessions_root: PathBuf::from("/tmp/pi/sessions"),
             current_directory: PathBuf::from("/work/project-a"),

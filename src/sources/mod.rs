@@ -10,6 +10,7 @@ use crate::{
 };
 
 pub mod codex;
+pub mod copilot;
 mod jsonl;
 pub mod opencode;
 pub mod pi;
@@ -102,6 +103,11 @@ pub fn sync_configured_with_progress(
     if opencode_available {
         sources.push(Box::new(opencode::OpenCodeSource::new(
             config.db_path.clone(),
+        )));
+    }
+    if config.copilot_home.join("session-store.db").is_file() {
+        sources.push(Box::new(copilot::CopilotSource::new(
+            config.copilot_home.clone(),
         )));
     }
     if config.pi_sessions_root.is_dir() {
@@ -248,12 +254,20 @@ mod tests {
             .unwrap();
         drop(connection);
         let codex_home = directory.path().join("codex");
+        let copilot_home = directory.path().join("copilot");
         let pi_sessions_root = directory.path().join("pi");
         fs::create_dir_all(codex_home.join("sessions")).unwrap();
+        fs::create_dir_all(&copilot_home).unwrap();
         fs::create_dir_all(&pi_sessions_root).unwrap();
+        let connection = Connection::open(copilot_home.join("session-store.db")).unwrap();
+        connection
+            .execute_batch(include_str!("../../tests/fixtures/copilot.sql"))
+            .unwrap();
+        drop(connection);
         let config = Config {
             db_path,
             index_path: directory.path().join("usage.sqlite3"),
+            copilot_home,
             codex_home,
             pi_sessions_root,
             current_directory: directory.path().to_path_buf(),
@@ -282,6 +296,7 @@ mod tests {
             Some(&SyncProgress::Planned {
                 sources: vec![
                     "OpenCode".to_string(),
+                    "Copilot".to_string(),
                     "Pi".to_string(),
                     "Codex".to_string()
                 ]
@@ -300,6 +315,12 @@ mod tests {
             .iter()
             .position(|event| matches!(event, SyncProgress::Started { source } if source == "Pi"))
             .unwrap();
+        let copilot_started = events
+            .iter()
+            .position(
+                |event| matches!(event, SyncProgress::Started { source } if source == "Copilot"),
+            )
+            .unwrap();
         let codex_started = events
             .iter()
             .position(
@@ -311,16 +332,19 @@ mod tests {
             .position(|event| {
                 matches!(
                     event,
-                    SyncProgress::Finished { source, .. } if source == "Pi" || source == "Codex"
+                    SyncProgress::Finished { source, .. }
+                        if source == "Copilot" || source == "Pi" || source == "Codex"
                 )
             })
             .unwrap();
 
         assert!(opencode_finished < pi_started);
+        assert!(opencode_finished < copilot_started);
         assert!(opencode_finished < codex_started);
+        assert!(copilot_started < first_secondary_finished);
         assert!(pi_started < first_secondary_finished);
         assert!(codex_started < first_secondary_finished);
-        assert_eq!(summary.reports.len(), 3);
+        assert_eq!(summary.reports.len(), 4);
         assert!(summary.errors.is_empty());
     }
 }

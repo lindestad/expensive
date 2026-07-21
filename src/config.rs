@@ -301,6 +301,7 @@ impl ReportPeriod {
 pub struct Config {
     pub db_path: PathBuf,
     pub index_path: PathBuf,
+    pub copilot_home: PathBuf,
     pub codex_home: PathBuf,
     pub pi_sessions_root: PathBuf,
     pub current_directory: PathBuf,
@@ -405,6 +406,7 @@ fn resolve_config(
     Ok(Config {
         db_path,
         index_path,
+        copilot_home: discover_copilot_home(),
         codex_home: discover_codex_home(),
         pi_sessions_root: discover_pi_sessions_root(),
         current_directory,
@@ -553,6 +555,15 @@ fn discover_codex_home() -> PathBuf {
         .map(PathBuf::from)
         .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))
         .unwrap_or_else(|| Path::new(".codex").to_path_buf())
+}
+
+fn discover_copilot_home() -> PathBuf {
+    env::var("COPILOT_HOME")
+        .ok()
+        .filter(|path| !path.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".copilot")))
+        .unwrap_or_else(|| Path::new(".copilot").to_path_buf())
 }
 
 fn discover_pi_sessions_root() -> PathBuf {
@@ -731,6 +742,7 @@ mod tests {
         let config = Config {
             db_path: PathBuf::from("/tmp/opencode.db"),
             index_path: PathBuf::from("/tmp/expensive.sqlite3"),
+            copilot_home: PathBuf::from("/tmp/copilot"),
             codex_home: PathBuf::from("/tmp/codex"),
             pi_sessions_root: PathBuf::from("/tmp/pi/sessions"),
             current_directory: PathBuf::from("/tmp/project"),

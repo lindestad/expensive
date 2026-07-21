@@ -3069,6 +3069,7 @@ mod tests {
         Config {
             db_path: PathBuf::from("/tmp/opencode.db"),
             index_path: PathBuf::from("/tmp/expensive.sqlite3"),
+            copilot_home: PathBuf::from("/tmp/copilot"),
             codex_home: PathBuf::from("/tmp/codex"),
             pi_sessions_root: PathBuf::from("/tmp/pi/sessions"),
             current_directory: PathBuf::from("/tmp/project"),

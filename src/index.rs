@@ -26,6 +26,7 @@ const SCHEMA_VERSION: i64 = 3;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SourceKind {
     OpenCode,
+    Copilot,
     Codex,
     Pi,
     Claude,
@@ -35,6 +36,7 @@ impl SourceKind {
     pub fn key(self) -> &'static str {
         match self {
             Self::OpenCode => "opencode",
+            Self::Copilot => "copilot",
             Self::Codex => "codex",
             Self::Pi => "pi",
             Self::Claude => "claude",

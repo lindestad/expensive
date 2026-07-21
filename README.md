@@ -4,10 +4,10 @@ A local terminal dashboard for AI coding harness usage.
 
 <img width="1324" height="958" alt="image" src="https://github.com/user-attachments/assets/027ae18e-7e22-437b-a58c-5a4cc3acf60d" />
 
-`expensive` combines usage from OpenCode, Codex, and Pi into a small local
-SQLite index, then serves a live dashboard without repeatedly parsing session
-history. Source scans run in the background, so an existing dashboard remains
-usable while new accounting data is imported.
+`expensive` combines usage from OpenCode, GitHub Copilot, Codex, and Pi into a
+small local SQLite index, then serves a live dashboard without repeatedly
+parsing session history. Source scans run in the background, so an existing
+dashboard remains usable while new accounting data is imported.
 
 The index contains normalized accounting facts and scan checkpoints, not cloned
 session histories. Prompts, responses, reasoning text, and tool calls are never
@@ -75,12 +75,14 @@ immediately, then checks sources in a background thread. Unchanged graphs stay
 on screen and are only redrawn when their data changes. Day rollover is handled
 separately even when automatic refresh is disabled.
 
-The first run publishes OpenCode data as soon as it is ready, then scans Codex
-and Pi concurrently while updating the dashboard as each source completes.
-Later scans use file identity, size, timestamps, boundary hashes, and parser
-checkpoints to read only safe appends. OpenCode fingerprints its database and
-WAL, and rechecks a rolling 24-hour mutable window when either changes. Press
-`R` if source history was rewritten or you want a complete reconciliation.
+The first run publishes OpenCode data as soon as it is ready, then scans
+Copilot, Codex, and Pi concurrently while updating the dashboard as each source
+completes. Later scans use file identity, size, timestamps, boundary hashes,
+and parser checkpoints to read only safe appends. OpenCode fingerprints its
+database and WAL, and rechecks a rolling 24-hour mutable window when either
+changes. Copilot reads only usage rows beyond its stored high-water mark after
+verifying that the already-indexed prefix is unchanged. Press `R` if source
+history was rewritten or you want a complete reconciliation.
 
 ## Options and Reports
 
@@ -123,6 +125,7 @@ make the displayed cost basis explicit.
 Available sources are discovered automatically:
 
 - OpenCode: local SQLite assistant-message accounting
+- GitHub Copilot CLI and app: local SQLite usage accounting
 - Codex: `sessions` and `archived_sessions` rollout JSONL files
 - Pi: version 3 session JSONL files
 
@@ -133,6 +136,12 @@ Available sources are discovered automatically:
 3. `opencode db path`
 4. `~/.local/share/opencode/opencode.db`
 
+Copilot uses `COPILOT_HOME/session-store.db`, falling back to
+`~/.copilot/session-store.db`. The GitHub Copilot app is built on Copilot CLI
+and uses its session storage, so locally persisted app sessions are covered by
+the same source. See GitHub's [Copilot configuration-directory
+reference](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-config-dir-reference)
+and [app session documentation](https://docs.github.com/en/copilot/how-tos/github-copilot-app/agent-sessions).
 Codex uses `CODEX_HOME`, falling back to `~/.codex`. Pi uses
 `PI_CODING_AGENT_SESSION_DIR`, then `PI_CODING_AGENT_DIR/sessions`, then
 `~/.pi/agent/sessions`. These environment variables can also select custom
@@ -214,6 +223,17 @@ OpenCode usage comes from its stored assistant message fields: `cost`, token
 categories, `providerID`, `modelID`, and `variant`. Totals should therefore track
 OpenCode's own stored accounting without rerunning its slower stats command.
 
+Copilot usage comes from the current version 6 `session-store.db` schema.
+Per-request token details preserve input, output, cache-read, cache-write, and
+reasoning counts without relying on the database's coarser normalized input
+column. Copilot's reported nano-AI-unit total is converted to AI credits and
+then to its USD usage value at GitHub's documented `1 AI credit = $0.01` rate.
+This represents consumed value, including usage covered by a plan allowance;
+it is not necessarily an out-of-pocket charge. Unknown Copilot database schema
+versions are rejected instead of being interpreted optimistically. See
+GitHub's [Copilot model and pricing
+reference](https://docs.github.com/en/copilot/reference/copilot-billing/models-and-pricing).
+
 Codex usage comes from per-request `last_token_usage` facts in rollout logs.
 Cached input is treated as a subset of input to avoid double-counting, and
 source-reported total tokens remain authoritative. Codex rollouts do not provide
@@ -235,11 +255,11 @@ Pi usage comes from assistant entries in version 3 session files. Token
 categories and Pi's supplied cost total are indexed; supplied Pi costs are
 classified as estimates.
 
-`expensive` validates the required OpenCode tables, columns, and SQLite JSON
-support before importing them. `expensive doctor` also reports index schema and
-generation, indexed source/artifact/event counts, source locations, optional
-OpenCode project-scope support, detected OpenCode versions, and malformed
-message JSON.
+`expensive` validates the required OpenCode and Copilot tables and columns, as
+well as OpenCode's SQLite JSON support, before importing them. `expensive
+doctor` also reports index schema and generation, indexed
+source/artifact/event counts, source locations, optional OpenCode project-scope
+support, detected OpenCode versions, and malformed message JSON.
 
 ## Compatibility and Releases
 

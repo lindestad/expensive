@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- import current-schema GitHub Copilot CLI and app usage from the shared local session-store database, including exact token classes and AI-credit usage value
+- incrementally scan only new Copilot usage rows while detecting source rewrites and rejecting unknown database schemas
+
 ## 0.5.3
 
 - reflow summaries and model usage into width-aware layouts so API estimates, large counts, and model details remain readable in narrow terminals

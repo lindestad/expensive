@@ -57,6 +57,11 @@ fn run_doctor(config: &Config) -> Result<()> {
         availability(opencode_available)
     );
     println!(
+        "copilot source: {} ({})",
+        config.copilot_home.display(),
+        availability(config.copilot_home.join("session-store.db").is_file())
+    );
+    println!(
         "codex source: {} ({})",
         config.codex_home.display(),
         availability(
