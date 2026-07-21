@@ -3,7 +3,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState},
+    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap},
     Frame,
 };
 
@@ -523,10 +523,15 @@ fn draw_scope_picker(frame: &mut Frame<'_>, area: Rect, app: &AppState, palette:
             } else {
                 Style::default().fg(palette.text)
             };
-            Line::from(vec![
-                Span::styled(format!("{marker} {label}"), style),
-                Span::styled(format!("  {detail}"), Style::default().fg(palette.muted)),
-            ])
+            two_column_picker_line(
+                marker,
+                &label,
+                &detail,
+                inner.width as usize,
+                style,
+                Style::default().fg(palette.muted),
+                "  ",
+            )
         })
         .collect::<Vec<_>>();
     lines.push(Line::from(""));
@@ -627,11 +632,15 @@ fn draw_alias_editor(frame: &mut Frame<'_>, area: Rect, app: &AppState, palette:
             if index == entry_count {
                 Line::from(Span::styled(format!("{marker} {source}"), style))
             } else {
-                Line::from(vec![
-                    Span::styled(format!("{marker} {source}"), style),
-                    Span::styled("  →  ", Style::default().fg(palette.muted)),
-                    Span::styled(alias, Style::default().fg(palette.accent)),
-                ])
+                two_column_picker_line(
+                    marker,
+                    &source,
+                    &alias,
+                    inner.width as usize,
+                    style,
+                    Style::default().fg(palette.accent),
+                    "  →  ",
+                )
             }
         })
         .collect::<Vec<_>>();
@@ -704,10 +713,13 @@ fn draw_provider_picker(frame: &mut Frame<'_>, area: Rect, app: &AppState, palet
                         Style::default().fg(palette.text)
                     };
                     Line::from(Span::styled(
-                        format!(
-                            "{} [{}] {provider}",
-                            if selected { ">" } else { " " },
-                            if visible { "x" } else { " " }
+                        fit_text_ellipsis(
+                            &format!(
+                                "{} [{}] {provider}",
+                                if selected { ">" } else { " " },
+                                if visible { "x" } else { " " }
+                            ),
+                            inner.width as usize,
                         ),
                         style,
                     ))
@@ -738,6 +750,48 @@ fn alias_input_style(active: bool, palette: Palette) -> Style {
     } else {
         Style::default().fg(palette.text).bg(Color::Rgb(35, 40, 48))
     }
+}
+
+fn two_column_picker_line(
+    marker: &str,
+    label: &str,
+    detail: &str,
+    width: usize,
+    label_style: Style,
+    detail_style: Style,
+    separator: &'static str,
+) -> Line<'static> {
+    let prefix = format!("{marker} ");
+    if detail.is_empty() {
+        return Line::from(Span::styled(
+            fit_text_ellipsis(&format!("{prefix}{label}"), width),
+            label_style,
+        ));
+    }
+
+    let full_width = text_width(&prefix)
+        .saturating_add(text_width(label))
+        .saturating_add(text_width(separator))
+        .saturating_add(text_width(detail));
+    if full_width <= width {
+        return Line::from(vec![
+            Span::styled(format!("{prefix}{label}"), label_style),
+            Span::styled(separator, Style::default()),
+            Span::styled(detail.to_string(), detail_style),
+        ]);
+    }
+
+    let content_width = width
+        .saturating_sub(text_width(&prefix))
+        .saturating_sub(text_width(separator));
+    let detail_width = text_width(detail).min(content_width / 2);
+    let label_width = content_width.saturating_sub(detail_width);
+    Line::from(vec![
+        Span::styled(prefix, label_style),
+        Span::styled(fit_text_ellipsis(label, label_width), label_style),
+        Span::styled(separator, Style::default()),
+        Span::styled(fit_text_ellipsis(detail, detail_width), detail_style),
+    ])
 }
 
 pub fn help_layout_state(area: Rect, app: &AppState) -> HelpLayoutState {
@@ -807,7 +861,7 @@ fn help_document(
     }
     lines.extend([
         Line::from(""),
-        config_line("file", content.config_path.to_string(), palette),
+        config_line("file", content.config_path.to_string(), width, palette),
         Line::from(""),
         help_footer_line(palette),
     ]);
@@ -1122,7 +1176,10 @@ fn help_binding_line(
                     Span::styled(
                         format!(
                             "{:>width$}",
-                            fit_text(binding.key, columns.key_width),
+                            fit_text_ellipsis(
+                                compact_help_key(binding.key, columns.key_width),
+                                columns.key_width,
+                            ),
                             width = columns.key_width
                         ),
                         Style::default()
@@ -1140,6 +1197,18 @@ fn help_binding_line(
             }
         })
         .collect()
+}
+
+fn compact_help_key(key: &'static str, available_width: usize) -> &'static str {
+    if text_width(key) <= available_width {
+        return key;
+    }
+    match key {
+        "Tab / Shift+Tab" => "Tab / S-Tab",
+        "hjkl / arrows" => "hjkl/arrows",
+        "Space / Enter" => "Space/Enter",
+        _ => key,
+    }
 }
 
 fn wrap_text(text: &str, width: usize) -> Vec<String> {
@@ -1198,12 +1267,18 @@ fn split_long_word(word: &str, width: usize) -> Vec<String> {
     lines
 }
 
-fn fit_text(text: &str, width: usize) -> String {
+fn fit_text_ellipsis(text: &str, width: usize) -> String {
     if text_width(text) <= width {
         return text.to_string();
     }
+    if width == 0 {
+        return String::new();
+    }
+    if width == 1 {
+        return "…".to_string();
+    }
 
-    text.chars().take(width).collect()
+    format!("{}…", text.chars().take(width - 1).collect::<String>())
 }
 
 fn text_width(text: &str) -> usize {
@@ -1220,15 +1295,25 @@ fn section_title(title: &'static str, palette: Palette) -> Line<'static> {
     .alignment(Alignment::Center)
 }
 
-fn config_line(label: &'static str, value: String, palette: Palette) -> Line<'static> {
+fn config_line(
+    label: &'static str,
+    value: String,
+    available_width: usize,
+    palette: Palette,
+) -> Line<'static> {
     const CONFIG_LABEL_WIDTH: usize = 17;
+    let label_width = CONFIG_LABEL_WIDTH.min(available_width / 2);
+    let prefix_width = label_width.saturating_add(2);
 
     Line::from(vec![
         Span::styled(
-            format!("{label:>CONFIG_LABEL_WIDTH$}  "),
+            format!("{label:>label_width$}  "),
             Style::default().fg(palette.muted),
         ),
-        Span::styled(value, Style::default().fg(palette.text)),
+        Span::styled(
+            fit_text_ellipsis(&value, available_width.saturating_sub(prefix_width)),
+            Style::default().fg(palette.text),
+        ),
     ])
     .alignment(Alignment::Center)
 }
@@ -1607,9 +1692,10 @@ pub fn tab_at_position(column: u16, row: u16, area: Rect) -> Option<TabTarget> {
         return None;
     }
 
+    let compact = compact_tabs(area.width);
     let mut x = area.x.saturating_add(1);
     for (idx, mode) in Mode::ALL.iter().enumerate() {
-        let title_width = tab_width(mode.title());
+        let title_width = tab_width(mode_tab_label(*mode, compact));
         let hit_start = x;
         let hit_end = x.saturating_add(title_width);
 
@@ -1624,7 +1710,7 @@ pub fn tab_at_position(column: u16, row: u16, area: Rect) -> Option<TabTarget> {
         x = hit_end.saturating_add(1);
     }
 
-    let calendar_width = tab_width(CALENDAR_TAB);
+    let calendar_width = tab_width(calendar_tab_label(compact));
     let hit_start = area
         .x
         .saturating_add(area.width)
@@ -1654,7 +1740,9 @@ fn draw_tabs(frame: &mut Frame<'_>, area: Rect, app: &AppState, palette: Palette
     });
     frame.render_widget(block, area);
 
-    let calendar_width = tab_width(CALENDAR_TAB);
+    let compact = compact_tabs(area.width);
+    let calendar_label = calendar_tab_label(compact);
+    let calendar_width = tab_width(calendar_label);
     let left_width = inner.width.saturating_sub(calendar_width.saturating_add(1));
     let left_area = Rect::new(inner.x, inner.y, left_width, 1);
     let calendar_area = Rect::new(
@@ -1669,13 +1757,17 @@ fn draw_tabs(frame: &mut Frame<'_>, area: Rect, app: &AppState, palette: Palette
         if idx > 0 {
             spans.push(Span::raw(" "));
         }
-        spans.push(tab_span(mode.title(), mode_tab_style(app, *mode), palette));
+        spans.push(tab_span(
+            mode_tab_label(*mode, compact),
+            mode_tab_style(app, *mode),
+            palette,
+        ));
     }
 
     frame.render_widget(Paragraph::new(Line::from(spans)), left_area);
     frame.render_widget(
         Paragraph::new(Line::from(tab_span(
-            CALENDAR_TAB,
+            calendar_label,
             if app.view == View::Dashboard {
                 TabStyle::Normal
             } else {
@@ -1689,6 +1781,30 @@ fn draw_tabs(frame: &mut Frame<'_>, area: Rect, app: &AppState, palette: Palette
 }
 
 const CALENDAR_TAB: &str = "Calendar";
+
+fn compact_tabs(width: u16) -> bool {
+    width < 52
+}
+
+fn mode_tab_label(mode: Mode, compact: bool) -> &'static str {
+    if !compact {
+        return mode.title();
+    }
+    match mode {
+        Mode::Daily => "Day",
+        Mode::Weekly => "Week",
+        Mode::Monthly => "Month",
+        Mode::AllTime => "All",
+    }
+}
+
+fn calendar_tab_label(compact: bool) -> &'static str {
+    if compact {
+        "Cal"
+    } else {
+        CALENDAR_TAB
+    }
+}
 
 fn tab_width(label: &str) -> u16 {
     label.chars().count() as u16 + 2
@@ -1771,15 +1887,18 @@ fn stats_view_layout(
     graph_available: bool,
     comparison_enabled: bool,
 ) -> StatsLayout {
+    let summary_height = summary_height(area.width);
     let show_comparison = comparison_enabled
         && stats
-            .map(|stats| stats.comparison.is_some() && area.height >= 18)
+            .map(|stats| {
+                stats.comparison.is_some() && area.height >= summary_height.saturating_add(13)
+            })
             .unwrap_or(false);
     let chunks = if show_comparison {
         Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(5),
+                Constraint::Length(summary_height),
                 Constraint::Length(4),
                 Constraint::Min(6),
             ])
@@ -1787,7 +1906,7 @@ fn stats_view_layout(
     } else {
         Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(5), Constraint::Min(6)])
+            .constraints([Constraint::Length(summary_height), Constraint::Min(6)])
             .split(area)
     };
     let lower = chunks[if show_comparison { 2 } else { 1 }];
@@ -1805,7 +1924,7 @@ fn stats_view_layout(
         return layout;
     }
 
-    let model_height = model_graph_model_height(lower.height, stats.models.len());
+    let model_height = model_graph_model_height(lower.height, lower.width, stats.models.len());
     let graph_height = lower.height.saturating_sub(model_height);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -1860,15 +1979,45 @@ fn draw_comparison(frame: &mut Frame<'_>, area: Rect, stats: &UsageStats, palett
             Span::styled(format::cost(projected), Style::default().fg(palette.cost)),
         ]);
     }
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let first_width = first
+        .iter()
+        .map(|span| text_width(span.content.as_ref()))
+        .sum::<usize>();
+    let first = if first_width <= inner_width {
+        Line::from(first)
+    } else {
+        let token_change = signed_tokens(token_delta);
+        let compact = format!(
+            "cost {} {} · tokens {} {}",
+            signed_cost(cost_delta),
+            percent_change(stats.totals.cost, previous.totals.cost),
+            token_change,
+            percent_change(
+                stats.totals.total_tokens() as f64,
+                previous.totals.total_tokens() as f64,
+            ),
+        );
+        Line::from(Span::styled(
+            fit_text_ellipsis(&compact, inner_width),
+            Style::default().fg(palette.muted),
+        ))
+    };
 
     let second = if let Some((model, delta)) = stats.biggest_cost_increase() {
+        let label = "biggest increase  ";
+        let delta = signed_cost(delta);
+        let model_width = inner_width
+            .saturating_sub(text_width(label))
+            .saturating_sub(text_width(&delta))
+            .saturating_sub(2);
         Line::from(vec![
-            Span::styled("biggest increase  ", Style::default().fg(palette.muted)),
-            Span::styled(model.to_string(), Style::default().fg(palette.accent)),
+            Span::styled(label, Style::default().fg(palette.muted)),
             Span::styled(
-                format!("  {}", signed_cost(delta)),
-                Style::default().fg(palette.cost),
+                fit_text_ellipsis(model, model_width),
+                Style::default().fg(palette.accent),
             ),
+            Span::styled(format!("  {delta}"), Style::default().fg(palette.cost)),
         ])
     } else {
         Line::from(Span::styled(
@@ -1881,10 +2030,7 @@ fn draw_comparison(frame: &mut Frame<'_>, area: Rect, stats: &UsageStats, palett
         .title(" Compared with previous period ")
         .title_style(Style::default().fg(palette.title))
         .border_style(Style::default().fg(palette.border));
-    frame.render_widget(
-        Paragraph::new(vec![Line::from(first), second]).block(block),
-        area,
-    );
+    frame.render_widget(Paragraph::new(vec![first, second]).block(block), area);
 }
 
 fn percent_change(current: f64, previous: f64) -> String {
@@ -1915,6 +2061,14 @@ fn signed_integer(value: i128) -> String {
     }
 }
 
+fn signed_tokens(value: i128) -> String {
+    if value >= 0 {
+        format!("+{}", format::tokens(value as u64))
+    } else {
+        format!("-{}", format::tokens(value.unsigned_abs() as u64))
+    }
+}
+
 fn delta_color(value: f64, palette: Palette) -> Color {
     if value > 0.0 {
         palette.cost
@@ -1936,13 +2090,17 @@ fn can_show_token_graph(lower_area: Rect) -> bool {
             .saturating_add(MIN_TOKEN_GRAPH_HEIGHT)
 }
 
-fn model_graph_model_height(lower_height: u16, model_count: usize) -> u16 {
+fn model_graph_model_height(lower_height: u16, lower_width: u16, model_count: usize) -> u16 {
     let model_min = MODEL_TABLE_OVERHEAD.saturating_add(MIN_MODEL_ROWS_WITH_GRAPH);
     let graph_min = MIN_TOKEN_GRAPH_HEIGHT;
     let available = lower_height;
     let base = model_min.min(available.saturating_sub(graph_min));
     let remaining = available.saturating_sub(base).saturating_sub(graph_min);
-    let full_model_height = MODEL_TABLE_OVERHEAD.saturating_add(model_count as u16);
+    let full_model_height = if lower_width < NARROW_MODEL_WIDTH {
+        2_u16.saturating_add((model_count as u16).saturating_mul(2))
+    } else {
+        MODEL_TABLE_OVERHEAD.saturating_add(model_count as u16)
+    };
     let model_extra = remaining.min(full_model_height.saturating_sub(base));
 
     base.saturating_add(model_extra)
@@ -1983,6 +2141,7 @@ fn draw_day_calendar(frame: &mut Frame<'_>, area: Rect, app: &AppState, palette:
         return;
     }
 
+    let cell_width = area.width.saturating_sub(6) / 7;
     let headers = Row::new(app.config.week_start.short_days()).style(
         Style::default()
             .fg(palette.title)
@@ -1997,7 +2156,7 @@ fn draw_day_calendar(frame: &mut Frame<'_>, area: Rect, app: &AppState, palette:
             let cost = app.calendar_cost(*period);
             period_cell(
                 *period,
-                day_cell_label(*period, cost),
+                day_cell_label(*period, cost, cell_width as usize),
                 cost,
                 max_cost,
                 app.calendar.selected == *period,
@@ -2034,6 +2193,7 @@ fn draw_period_grid(
 ) {
     let row_count = app.calendar.visible_periods.len().div_ceil(columns);
     let max_cost = calendar_max_cost(app);
+    let cell_width = area.width.saturating_sub(columns.saturating_sub(1) as u16) / columns as u16;
 
     if can_draw_framed_grid(area, row_count, columns, 0) {
         draw_framed_period_grid(frame, area, app, columns, row_count, max_cost, palette);
@@ -2048,7 +2208,7 @@ fn draw_period_grid(
             let cost = app.calendar_cost(*period);
             period_cell(
                 *period,
-                period_cell_label(*period, cost, app.config.week_start),
+                period_cell_label(*period, cost, app.config.week_start, cell_width as usize),
                 cost,
                 max_cost,
                 app.calendar.selected == *period,
@@ -2357,23 +2517,40 @@ fn heat_bucket(cost: f64, max_cost: f64) -> Option<usize> {
     Some(((ratio * 6.0).round() as usize).clamp(0, 6))
 }
 
-fn day_cell_label(period: PeriodKey, cost: Option<f64>) -> String {
+fn day_cell_label(period: PeriodKey, cost: Option<f64>, width: usize) -> String {
     let day = local_date(period.start_millis)
         .map(|date| date.day().to_string())
         .unwrap_or_else(|| "?".to_string());
-    format!("{day:>2} {}", cost_label(cost))
+    let day = format!("{day:>2}");
+    let cost_width = width.saturating_sub(text_width(&day).saturating_add(1));
+    calendar_cost_label(cost, cost_width)
+        .map(|cost| format!("{day} {cost}"))
+        .unwrap_or(day)
 }
 
 fn period_cell_label(
     period: PeriodKey,
     cost: Option<f64>,
     week_start: time_window::WeekStart,
+    width: usize,
 ) -> String {
-    format!(
-        "{} {}",
-        compact_period_label(period, week_start),
-        cost_label(cost)
-    )
+    let period = compact_period_label(period, week_start);
+    let cost_width = width.saturating_sub(text_width(&period).saturating_add(1));
+    calendar_cost_label(cost, cost_width)
+        .map(|cost| format!("{period} {cost}"))
+        .unwrap_or_else(|| fit_text_ellipsis(&period, width))
+}
+
+fn calendar_cost_label(cost: Option<f64>, width: usize) -> Option<String> {
+    let cost = cost?;
+    let candidates = [
+        format::cost(cost),
+        format!("${cost:.1}"),
+        format!("${cost:.0}"),
+    ];
+    candidates
+        .into_iter()
+        .find(|candidate| text_width(candidate) <= width)
 }
 
 fn cost_label(cost: Option<f64>) -> String {
@@ -2443,15 +2620,7 @@ fn draw_summary(
     palette: Palette,
 ) {
     let loading = loading && stats.is_none();
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(25),
-            Constraint::Percentage(25),
-            Constraint::Percentage(25),
-            Constraint::Percentage(25),
-        ])
-        .split(area);
+    let metric_areas = summary_metric_areas(area);
 
     let totals = stats.map(|stats| &stats.totals);
     let cost = totals
@@ -2459,32 +2628,57 @@ fn draw_summary(
         .unwrap_or_else(|| "--".to_string());
     let messages = totals
         .map(|totals| {
+            let inner_width = metric_areas[0].width.saturating_sub(2) as usize;
             if totals.api_estimated_messages > 0 && totals.unpriced_messages > 0 {
-                format!(
-                    "{} msgs | {} est. | {} unpriced",
-                    format::integer(totals.messages),
-                    format::integer(totals.api_estimated_messages),
-                    format::integer(totals.unpriced_messages)
-                )
+                if inner_width < 22 {
+                    format!("{} msgs", format::integer(totals.messages))
+                } else {
+                    format!(
+                        "{} msgs · {} est. · {} unpriced",
+                        format::integer(totals.messages),
+                        format::integer(totals.api_estimated_messages),
+                        format::integer(totals.unpriced_messages)
+                    )
+                }
             } else if totals.api_estimated_messages > 0 {
-                format!(
-                    "{} msgs | {} estimated",
-                    format::integer(totals.messages),
-                    format::integer(totals.api_estimated_messages)
-                )
+                if inner_width < 22 {
+                    format!(
+                        "{} msgs\n{} estimated",
+                        format::integer(totals.messages),
+                        format::integer(totals.api_estimated_messages)
+                    )
+                } else {
+                    format!(
+                        "{} msgs · {} estimated",
+                        format::integer(totals.messages),
+                        format::integer(totals.api_estimated_messages)
+                    )
+                }
             } else if totals.unpriced_messages > 0 {
-                format!(
-                    "{} msgs | {} unpriced",
-                    format::integer(totals.messages),
-                    format::integer(totals.unpriced_messages)
-                )
+                if inner_width < 22 {
+                    format!(
+                        "{} msgs\n{} unpriced",
+                        format::integer(totals.messages),
+                        format::integer(totals.unpriced_messages)
+                    )
+                } else {
+                    format!(
+                        "{} msgs · {} unpriced",
+                        format::integer(totals.messages),
+                        format::integer(totals.unpriced_messages)
+                    )
+                }
             } else {
                 format!("{} msgs", format::integer(totals.messages))
             }
         })
         .unwrap_or_else(|| metric_sub("messages", loading));
     let cost_title = if totals.is_some_and(|totals| totals.api_estimated_messages > 0) {
-        "Cost incl. API Est."
+        if metric_areas[0].width < 24 {
+            "Cost + API est."
+        } else {
+            "Cost incl. API Est."
+        }
     } else if totals.is_some_and(|totals| totals.unpriced_messages > 0) {
         "Known Cost"
     } else {
@@ -2517,7 +2711,7 @@ fn draw_summary(
 
     draw_metric(
         frame,
-        chunks[0],
+        metric_areas[0],
         cost_title,
         &cost,
         &messages,
@@ -2529,7 +2723,7 @@ fn draw_summary(
     );
     draw_metric(
         frame,
-        chunks[1],
+        metric_areas[1],
         "Total Tokens",
         &total_tokens,
         &token_sub,
@@ -2541,7 +2735,7 @@ fn draw_summary(
     );
     draw_metric(
         frame,
-        chunks[2],
+        metric_areas[2],
         "Input / Output",
         &input_output,
         &io_sub,
@@ -2553,7 +2747,7 @@ fn draw_summary(
     );
     draw_metric(
         frame,
-        chunks[3],
+        metric_areas[3],
         "Cache",
         &cache,
         &cache_sub,
@@ -2563,6 +2757,45 @@ fn draw_summary(
         },
         palette,
     );
+}
+
+const STACKED_SUMMARY_WIDTH: u16 = 78;
+
+fn summary_height(width: u16) -> u16 {
+    if width < STACKED_SUMMARY_WIDTH {
+        10
+    } else {
+        5
+    }
+}
+
+fn summary_metric_areas(area: Rect) -> Vec<Rect> {
+    if area.width >= STACKED_SUMMARY_WIDTH {
+        return Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(25),
+                Constraint::Percentage(25),
+                Constraint::Percentage(25),
+                Constraint::Percentage(25),
+            ])
+            .split(area)
+            .to_vec();
+    }
+
+    Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area)
+        .iter()
+        .flat_map(|row| {
+            Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(*row)
+                .to_vec()
+        })
+        .collect()
 }
 
 fn metric_sub(label: &str, loading: bool) -> String {
@@ -2582,26 +2815,29 @@ fn draw_metric(
     style: MetricStyle,
     palette: Palette,
 ) {
-    let paragraph = Paragraph::new(vec![
+    let title = fit_text_ellipsis(title, area.width.saturating_sub(4) as usize);
+    let mut lines = vec![Line::from(Span::styled(
+        value.to_string(),
+        Style::default()
+            .fg(style.value)
+            .add_modifier(Modifier::BOLD),
+    ))];
+    lines.extend(sub.lines().map(|line| {
         Line::from(Span::styled(
-            value.to_string(),
-            Style::default()
-                .fg(style.value)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(Span::styled(
-            sub.to_string(),
+            line.to_string(),
             Style::default().fg(style.label),
-        )),
-    ])
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(format!(" {title} "))
-            .title_style(Style::default().fg(style.value))
-            .border_style(Style::default().fg(palette.border)),
-    )
-    .alignment(Alignment::Center);
+        ))
+    }));
+    let paragraph = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" {title} "))
+                .title_style(Style::default().fg(style.value))
+                .border_style(Style::default().fg(palette.border)),
+        )
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: true });
 
     frame.render_widget(paragraph, area);
 }
@@ -2612,21 +2848,26 @@ fn draw_models(frame: &mut Frame<'_>, area: Rect, view: ModelViewState<'_>, pale
     } else {
         view.title.to_string()
     };
+    let title = fit_text_ellipsis(&title, area.width.saturating_sub(4) as usize);
     if view.first_sync
         && view
             .stats
             .map(|stats| stats.totals.messages == 0)
             .unwrap_or(true)
     {
-        let paragraph = Paragraph::new(first_sync_lines(view.source_sync_status, palette))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(format!(" {title} "))
-                    .title_style(Style::default().fg(palette.title))
-                    .border_style(Style::default().fg(palette.border)),
-            )
-            .alignment(Alignment::Center);
+        let paragraph = Paragraph::new(first_sync_lines(
+            view.source_sync_status,
+            area.width.saturating_sub(4) as usize,
+            palette,
+        ))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" {title} "))
+                .title_style(Style::default().fg(palette.title))
+                .border_style(Style::default().fg(palette.border)),
+        )
+        .alignment(Alignment::Center);
         frame.render_widget(paragraph, area);
         return;
     }
@@ -2656,8 +2897,10 @@ fn draw_models(frame: &mut Frame<'_>, area: Rect, view: ModelViewState<'_>, pale
 
     if area.width >= 112 {
         draw_wide_models(frame, area, stats, &title, view.scroll, palette);
-    } else {
+    } else if area.width >= NARROW_MODEL_WIDTH {
         draw_compact_models(frame, area, stats, &title, view.scroll, palette);
+    } else {
+        draw_narrow_models(frame, area, stats, &title, view.scroll, palette);
     }
 }
 
@@ -2673,7 +2916,11 @@ fn first_sync_title(title: &str, status: Option<&SourceSyncStatus>) -> String {
     }
 }
 
-fn first_sync_lines(status: Option<&SourceSyncStatus>, palette: Palette) -> Vec<Line<'static>> {
+fn first_sync_lines(
+    status: Option<&SourceSyncStatus>,
+    available_width: usize,
+    palette: Palette,
+) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::from(Span::styled(
             format!("{} Performing first sync…", sync_spinner()),
@@ -2702,13 +2949,14 @@ fn first_sync_lines(status: Option<&SourceSyncStatus>, palette: Palette) -> Vec<
             ),
             SourceSyncStage::Failed => ("!", "failed".to_string(), palette.error),
         };
-        Line::from(vec![
-            Span::styled(
-                format!("{marker} {:<10}", source.name),
-                Style::default().fg(color),
-            ),
-            Span::styled(detail, Style::default().fg(color)),
-        ])
+        let prefix = format!("{marker} {}", source.name);
+        let full = format!("{prefix}  {detail}");
+        let visible = if text_width(&full) <= available_width {
+            full
+        } else {
+            fit_text_ellipsis(&prefix, available_width)
+        };
+        Line::from(Span::styled(visible, Style::default().fg(color)))
     }));
     lines
 }
@@ -2834,8 +3082,71 @@ fn draw_compact_models(
     frame.render_stateful_widget(table, area, &mut state);
 }
 
+const NARROW_MODEL_WIDTH: u16 = 78;
+
+fn draw_narrow_models(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    stats: &UsageStats,
+    title: &str,
+    scroll: usize,
+    palette: Palette,
+) {
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let rows = stats
+        .models
+        .iter()
+        .map(|model| narrow_row(model, &stats.totals, inner_width, palette));
+    let table = Table::new(rows, [Constraint::Min(1)]).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" {title} "))
+            .title_style(Style::default().fg(palette.title))
+            .border_style(Style::default().fg(palette.border)),
+    );
+    let mut state = TableState::new()
+        .with_offset(scroll.min(model_breakdown_max_scroll(area, stats.models.len())));
+    frame.render_stateful_widget(table, area, &mut state);
+}
+
+fn narrow_row(
+    model: &ModelUsage,
+    totals: &UsageTotals,
+    width: usize,
+    palette: Palette,
+) -> Row<'static> {
+    let name = fit_text_ellipsis(&model.display_name, width);
+    let messages = format::integer(model.totals.messages);
+    let tokens = format::tokens(model.totals.total_tokens());
+    let cost = model_cost_label(model);
+    let share = format::percent(model.totals.cost, totals.cost);
+    let full = format!("{messages} msgs · {tokens} tokens · {cost} · {share}");
+    let compact = format!("{messages} · {tokens} · {cost} · {share}");
+    let detail = if text_width(&full) <= width {
+        full
+    } else {
+        compact
+    };
+    let detail = fit_text_ellipsis(&detail, width);
+
+    Row::new([Cell::from(vec![
+        Line::from(Span::styled(
+            name,
+            Style::default()
+                .fg(palette.accent)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(detail, Style::default().fg(palette.muted))),
+    ])])
+    .height(2)
+}
+
 fn model_breakdown_visible_rows(area: Rect) -> usize {
-    area.height.saturating_sub(3) as usize
+    if area.width < NARROW_MODEL_WIDTH {
+        area.height.saturating_sub(2) as usize / 2
+    } else {
+        area.height.saturating_sub(3) as usize
+    }
 }
 
 fn wide_row(
@@ -2936,59 +3247,14 @@ fn model_cost_label(model: &ModelUsage) -> String {
 }
 
 fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &AppState, palette: Palette) {
-    let (mut spans, status_color) = match app.view {
-        View::Dashboard => (
-            vec![
-                key_span(" Tab ", palette),
-                Span::styled(" mode ", Style::default().fg(palette.muted)),
-                key_span(" S-Tab ", palette),
-                Span::styled(" back ", Style::default().fg(palette.muted)),
-                key_span(" c ", palette),
-                Span::styled(" calendar ", Style::default().fg(palette.muted)),
-                key_span(" ? ", palette),
-                Span::styled(" help ", Style::default().fg(palette.muted)),
-                key_span(" r ", palette),
-                Span::styled(" refresh ", Style::default().fg(palette.muted)),
-                key_span(" q ", palette),
-                Span::styled(" quit | ", Style::default().fg(palette.muted)),
-            ],
-            dashboard_status_color(app, palette),
-        ),
-        View::CalendarOverview => (
-            vec![
-                key_span(" Tab ", palette),
-                Span::styled(" scale ", Style::default().fg(palette.muted)),
-                key_span(" hjkl ", palette),
-                Span::styled(" move ", Style::default().fg(palette.muted)),
-                key_span(" Enter ", palette),
-                Span::styled(" open ", Style::default().fg(palette.muted)),
-                key_span(" ? ", palette),
-                Span::styled(" help ", Style::default().fg(palette.muted)),
-                key_span(" Esc ", palette),
-                Span::styled(" back ", Style::default().fg(palette.muted)),
-                key_span(" q ", palette),
-                Span::styled(" quit | ", Style::default().fg(palette.muted)),
-            ],
-            calendar_status_color(app, palette),
-        ),
-        View::CalendarDetail => (
-            vec![
-                key_span(" h/k ", palette),
-                Span::styled(" prev ", Style::default().fg(palette.muted)),
-                key_span(" j/l ", palette),
-                Span::styled(" next ", Style::default().fg(palette.muted)),
-                key_span(" Tab ", palette),
-                Span::styled(" scale ", Style::default().fg(palette.muted)),
-                key_span(" ? ", palette),
-                Span::styled(" help ", Style::default().fg(palette.muted)),
-                key_span(" Esc ", palette),
-                Span::styled(" back ", Style::default().fg(palette.muted)),
-                key_span(" q ", palette),
-                Span::styled(" quit | ", Style::default().fg(palette.muted)),
-            ],
-            history_status_color(app, palette),
-        ),
-    };
+    let (mut spans, status_color) = (
+        footer_controls(app.view, area.width, palette),
+        match app.view {
+            View::Dashboard => dashboard_status_color(app, palette),
+            View::CalendarOverview => calendar_status_color(app, palette),
+            View::CalendarDetail => history_status_color(app, palette),
+        },
+    );
     let controls_width = spans
         .iter()
         .map(|span| text_width(span.content.as_ref()))
@@ -3009,8 +3275,76 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &AppState, palette: Palet
     );
 }
 
+fn footer_controls(view: View, width: u16, palette: Palette) -> Vec<Span<'static>> {
+    const DASHBOARD_TINY: &[(&str, &str)] = &[(" ? ", ""), (" q ", " | ")];
+    const CALENDAR_TINY: &[(&str, &str)] = &[(" Esc ", ""), (" q ", " | ")];
+    const DASHBOARD_SMALL: &[(&str, &str)] =
+        &[(" ? ", " help "), (" r ", " sync "), (" q ", " quit | ")];
+    const CALENDAR_SMALL: &[(&str, &str)] = &[(" Esc ", " back "), (" q ", " quit | ")];
+    const DASHBOARD_MEDIUM: &[(&str, &str)] = &[
+        (" Tab ", " mode "),
+        (" c ", " cal "),
+        (" ? ", " help "),
+        (" r ", " sync "),
+        (" q ", " quit | "),
+    ];
+    const CALENDAR_MEDIUM: &[(&str, &str)] = &[
+        (" Tab ", " scale "),
+        (" hjkl ", " move "),
+        (" Enter ", " open "),
+        (" Esc ", " back | "),
+    ];
+    const DETAIL_MEDIUM: &[(&str, &str)] = &[
+        (" hjkl ", " period "),
+        (" Tab ", " scale "),
+        (" Esc ", " back | "),
+    ];
+    const DASHBOARD_FULL: &[(&str, &str)] = &[
+        (" Tab ", " mode "),
+        (" S-Tab ", " back "),
+        (" c ", " calendar "),
+        (" ? ", " help "),
+        (" r ", " refresh "),
+        (" q ", " quit | "),
+    ];
+    const CALENDAR_FULL: &[(&str, &str)] = &[
+        (" Tab ", " scale "),
+        (" hjkl ", " move "),
+        (" Enter ", " open "),
+        (" ? ", " help "),
+        (" Esc ", " back "),
+        (" q ", " quit | "),
+    ];
+    const DETAIL_FULL: &[(&str, &str)] = &[
+        (" h/k ", " prev "),
+        (" j/l ", " next "),
+        (" Tab ", " scale "),
+        (" ? ", " help "),
+        (" Esc ", " back "),
+        (" q ", " quit | "),
+    ];
+
+    let hints = match (width, view) {
+        (0..44, View::Dashboard) => DASHBOARD_TINY,
+        (0..44, _) => CALENDAR_TINY,
+        (44..65, View::Dashboard) => DASHBOARD_SMALL,
+        (44..65, _) => CALENDAR_SMALL,
+        (65..105, View::Dashboard) => DASHBOARD_MEDIUM,
+        (65..105, View::CalendarOverview) => CALENDAR_MEDIUM,
+        (65..105, View::CalendarDetail) => DETAIL_MEDIUM,
+        (_, View::Dashboard) => DASHBOARD_FULL,
+        (_, View::CalendarOverview) => CALENDAR_FULL,
+        (_, View::CalendarDetail) => DETAIL_FULL,
+    };
+    let muted = Style::default().fg(palette.muted);
+    hints
+        .iter()
+        .flat_map(|(key, label)| [key_span(key, palette), Span::styled(*label, muted)])
+        .collect()
+}
+
 fn dashboard_status(app: &AppState, available_width: usize) -> String {
-    if let Some(error) = &app.error {
+    let status = if let Some(error) = &app.error {
         format!("error: {error}")
     } else if let Some(mode) = app.source_sync {
         source_sync_status_label(app, mode, available_width)
@@ -3027,7 +3361,8 @@ fn dashboard_status(app: &AppState, available_width: usize) -> String {
         "loading".to_string()
     } else {
         "idle".to_string()
-    }
+    };
+    fit_text_ellipsis(&status, available_width)
 }
 
 fn dashboard_status_color(app: &AppState, palette: Palette) -> Color {
@@ -3041,7 +3376,7 @@ fn dashboard_status_color(app: &AppState, palette: Palette) -> Color {
 }
 
 fn calendar_status(app: &AppState, available_width: usize) -> String {
-    if let Some(error) = &app.error {
+    let status = if let Some(error) = &app.error {
         format!("error: {error}")
     } else if let Some(mode) = app.source_sync {
         source_sync_status_label(app, mode, available_width)
@@ -3055,7 +3390,8 @@ fn calendar_status(app: &AppState, available_width: usize) -> String {
             detail_period_label(app.calendar.selected, app.config.week_start),
             app.scope_label()
         )
-    }
+    };
+    fit_text_ellipsis(&status, available_width)
 }
 
 fn calendar_status_color(app: &AppState, palette: Palette) -> Color {
@@ -3069,7 +3405,7 @@ fn calendar_status_color(app: &AppState, palette: Palette) -> Color {
 }
 
 fn history_status(app: &AppState, available_width: usize) -> String {
-    if let Some(error) = &app.error {
+    let status = if let Some(error) = &app.error {
         format!("error: {error}")
     } else if let Some(mode) = app.source_sync {
         source_sync_status_label(app, mode, available_width)
@@ -3086,7 +3422,8 @@ fn history_status(app: &AppState, available_width: usize) -> String {
         "loading".to_string()
     } else {
         "idle".to_string()
-    }
+    };
+    fit_text_ellipsis(&status, available_width)
 }
 
 fn history_status_color(app: &AppState, palette: Palette) -> Color {
@@ -3117,7 +3454,7 @@ fn source_sync_status_label(app: &AppState, mode: SyncMode, available_width: usi
         .as_ref()
         .filter(|status| !status.sources.is_empty())
     else {
-        return fit_text(&label, available_width);
+        return fit_text_ellipsis(&label, available_width);
     };
     let active = status.active_names();
     let progress = format!(
@@ -3134,7 +3471,7 @@ fn source_sync_status_label(app: &AppState, mode: SyncMode, available_width: usi
         if text_width(&finishing) <= available_width {
             return finishing;
         }
-        return fit_text(&progress, available_width);
+        return fit_text_ellipsis(&progress, available_width);
     }
 
     let with_sources = format!(
@@ -3146,7 +3483,7 @@ fn source_sync_status_label(app: &AppState, mode: SyncMode, available_width: usi
     if text_width(&with_sources) <= available_width {
         with_sources
     } else {
-        fit_text(&progress, available_width)
+        fit_text_ellipsis(&progress, available_width)
     }
 }
 
@@ -3290,6 +3627,29 @@ mod tests {
     }
 
     #[test]
+    fn maps_short_tab_labels_at_narrow_widths() {
+        let area = Rect::new(0, 0, 40, 20);
+
+        assert_eq!(
+            tab_at_position(2, 1, area),
+            Some(TabTarget::Mode(Mode::Daily))
+        );
+        assert_eq!(
+            tab_at_position(8, 1, area),
+            Some(TabTarget::Mode(Mode::Weekly))
+        );
+        assert_eq!(
+            tab_at_position(15, 1, area),
+            Some(TabTarget::Mode(Mode::Monthly))
+        );
+        assert_eq!(
+            tab_at_position(23, 1, area),
+            Some(TabTarget::Mode(Mode::AllTime))
+        );
+        assert_eq!(tab_at_position(35, 1, area), Some(TabTarget::Calendar));
+    }
+
+    #[test]
     fn ignores_clicks_outside_tab_labels() {
         let area = Rect::new(0, 0, 100, 24);
 
@@ -3377,6 +3737,47 @@ mod tests {
         assert!(output.contains("All Time"));
         assert!(output.contains("All Time by model"));
         assert!(output.contains("all time"));
+    }
+
+    #[test]
+    fn narrow_dashboard_reflows_large_estimates_and_model_rows() {
+        let mut stats = sample_stats(Mode::Daily, Some(local_millis(2026, 6, 15, 4, 0, 0)));
+        stats.totals.messages = 12_345_678;
+        stats.totals.api_estimated_messages = 12_345_678;
+        stats.totals.api_estimated_cost = stats.totals.cost;
+        stats.models[0].display_name =
+            "provider/a-model-name-that-would-crush-fixed-columns".to_string();
+        stats.models[0].totals.messages = 12_345_678;
+        stats.models[0].totals.api_estimated_messages = 12_345_678;
+        stats.models[0].totals.api_estimated_cost = stats.models[0].totals.cost;
+        let app = app_with_stats(Mode::Daily, stats);
+
+        let output = render(&app, 60, 30);
+
+        assert!(output.contains("Cost incl. API Est."));
+        assert!(output.contains("12,345,678 msgs"));
+        assert!(output.matches("12,345,678").count() >= 2);
+        assert!(output.contains("estimated"));
+        assert!(output.contains("provider/a-model-name-that-would-crush-fixed-columns"));
+        assert!(output.contains("12,345,678 msgs · 10 tokens · ~$2.5000"));
+    }
+
+    #[test]
+    fn very_narrow_dashboard_keeps_primary_values_and_all_tabs() {
+        let mut stats = sample_stats(Mode::Daily, None);
+        stats.totals.api_estimated_messages = 2;
+        stats.totals.api_estimated_cost = stats.totals.cost;
+        let app = app_with_stats(Mode::Daily, stats);
+
+        let output = render(&app, 40, 30);
+
+        assert!(output.contains("Day   Week   Month   All"));
+        assert!(output.contains("Cal"));
+        assert!(output.contains("Cost + API est."));
+        assert!(output.contains("2 msgs"));
+        assert!(output.contains("2 estimated"));
+        assert!(output.contains("provider/gpt-test (high)"));
+        assert!(output.contains("2.5000"));
     }
 
     #[test]
@@ -3479,6 +3880,12 @@ mod tests {
         assert!(output.contains("projected $6.00"));
         assert!(output.contains("biggest increase"));
         assert!(output.contains("provider/gpt-test (high)"));
+
+        let narrow = render(&app, 50, 30);
+        assert!(narrow.contains("cost +$2.7500"));
+        assert!(narrow.contains("tokens +100"));
+        assert!(narrow.contains("provider/gpt-test"));
+        assert!(narrow.contains("+$2.5000"));
     }
 
     #[test]
@@ -3715,6 +4122,25 @@ mod tests {
         assert!(output.contains("Mon"));
         assert!(output.contains("15 $4.25"));
         assert!(output.contains("selected Jun 15"));
+    }
+
+    #[test]
+    fn narrow_day_calendar_omits_costs_that_cannot_fit() {
+        let selected = time_window::current_period(
+            CalendarScale::Day,
+            Local.with_ymd_and_hms(2026, 6, 15, 10, 0, 0).unwrap(),
+            DailyStart::default(),
+            WeekStart::default(),
+        )
+        .unwrap();
+        let mut app = app_with_calendar(selected);
+        app.calendar_costs.insert(selected, 157.56);
+
+        let very_narrow = render(&app, 40, 20);
+        let readable = render(&app, 60, 24);
+
+        assert!(!very_narrow.contains('$'));
+        assert!(readable.contains("15 $158"));
     }
 
     #[test]
