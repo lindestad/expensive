@@ -8,7 +8,7 @@ use ratatui::{
 };
 
 use crate::{
-    app::{AppState, ConfigEditorItem, GraphMetric, View},
+    app::{AppState, ConfigEditorItem, GraphMetric, SourceSyncStage, SourceSyncStatus, View},
     config::{ColorTheme, ThemeScope},
     db::{ModelUsage, UsageStats, UsageTotals},
     format,
@@ -221,6 +221,17 @@ struct StatsViewState<'a> {
     selected_token_bucket: Option<usize>,
     graph_metric: GraphMetric,
     show_comparison: bool,
+    first_sync: bool,
+    source_sync_status: Option<&'a SourceSyncStatus>,
+}
+
+struct ModelViewState<'a> {
+    stats: Option<&'a UsageStats>,
+    loading: bool,
+    title: &'a str,
+    scroll: usize,
+    first_sync: bool,
+    source_sync_status: Option<&'a SourceSyncStatus>,
 }
 
 #[derive(Clone)]
@@ -257,14 +268,13 @@ pub fn draw(frame: &mut Frame<'_>, app: &AppState) {
                 stats: app.current_stats(),
                 loading: app.is_current_loading(),
                 graph_loading: app.is_current_graph_loading(),
-                model_title: app
-                    .current_stats()
-                    .map(|stats| format!("{} by model", stats.mode.title()))
-                    .unwrap_or_else(|| "Models".to_string()),
+                model_title: format!("{} by model", app.mode.title()),
                 model_scroll: app.dashboard_model_scroll,
                 selected_token_bucket: app.dashboard_token_bucket,
                 graph_metric: app.graph_metric,
                 show_comparison: app.config.show_comparison,
+                first_sync: app.first_sync && app.source_sync.is_some(),
+                source_sync_status: app.source_sync_status.as_ref(),
             },
             palette,
         ),
@@ -284,6 +294,8 @@ pub fn draw(frame: &mut Frame<'_>, app: &AppState) {
                 selected_token_bucket: app.history_token_bucket,
                 graph_metric: app.graph_metric,
                 show_comparison: app.config.show_comparison,
+                first_sync: false,
+                source_sync_status: None,
             },
             palette,
         ),
@@ -1726,10 +1738,14 @@ fn draw_stats_view(frame: &mut Frame<'_>, area: Rect, view: StatsViewState<'_>, 
     draw_models(
         frame,
         layout.models,
-        view.stats,
-        view.loading,
-        &view.model_title,
-        view.model_scroll,
+        ModelViewState {
+            stats: view.stats,
+            loading: view.loading,
+            title: &view.model_title,
+            scroll: view.model_scroll,
+            first_sync: view.first_sync,
+            source_sync_status: view.source_sync_status,
+        },
         palette,
     );
 
@@ -2590,22 +2606,19 @@ fn draw_metric(
     frame.render_widget(paragraph, area);
 }
 
-fn draw_models(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    stats: Option<&UsageStats>,
-    loading: bool,
-    title: &str,
-    scroll: usize,
-    palette: Palette,
-) {
-    let Some(stats) = stats else {
-        let message = if loading {
-            "Loading usage..."
-        } else {
-            "No usage loaded. Press r to refresh."
-        };
-        let paragraph = Paragraph::new(message)
+fn draw_models(frame: &mut Frame<'_>, area: Rect, view: ModelViewState<'_>, palette: Palette) {
+    let title = if view.first_sync {
+        first_sync_title(view.title, view.source_sync_status)
+    } else {
+        view.title.to_string()
+    };
+    if view.first_sync
+        && view
+            .stats
+            .map(|stats| stats.totals.messages == 0)
+            .unwrap_or(true)
+    {
+        let paragraph = Paragraph::new(first_sync_lines(view.source_sync_status, palette))
             .block(
                 Block::default()
                     .borders(Borders::ALL)
@@ -2613,7 +2626,25 @@ fn draw_models(
                     .title_style(Style::default().fg(palette.title))
                     .border_style(Style::default().fg(palette.border)),
             )
-            .style(Style::default().fg(if loading {
+            .alignment(Alignment::Center);
+        frame.render_widget(paragraph, area);
+        return;
+    }
+    let Some(stats) = view.stats else {
+        let content = if view.loading {
+            vec![Line::from("Loading usage...")]
+        } else {
+            vec![Line::from("No usage loaded. Press r to refresh.")]
+        };
+        let paragraph = Paragraph::new(content)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!(" {title} "))
+                    .title_style(Style::default().fg(palette.title))
+                    .border_style(Style::default().fg(palette.border)),
+            )
+            .style(Style::default().fg(if view.loading {
                 palette.tokens
             } else {
                 palette.muted
@@ -2624,10 +2655,71 @@ fn draw_models(
     };
 
     if area.width >= 112 {
-        draw_wide_models(frame, area, stats, title, scroll, palette);
+        draw_wide_models(frame, area, stats, &title, view.scroll, palette);
     } else {
-        draw_compact_models(frame, area, stats, title, scroll, palette);
+        draw_compact_models(frame, area, stats, &title, view.scroll, palette);
     }
+}
+
+fn first_sync_title(title: &str, status: Option<&SourceSyncStatus>) -> String {
+    let spinner = sync_spinner();
+    match status.filter(|status| !status.sources.is_empty()) {
+        Some(status) => format!(
+            "{title} · {spinner} first sync {}/{}",
+            status.completed(),
+            status.sources.len()
+        ),
+        None => format!("{title} · {spinner} first sync"),
+    }
+}
+
+fn first_sync_lines(status: Option<&SourceSyncStatus>, palette: Palette) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!("{} Performing first sync…", sync_spinner()),
+            Style::default()
+                .fg(palette.tokens)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+    let Some(status) = status.filter(|status| !status.sources.is_empty()) else {
+        lines.push(Line::from(Span::styled(
+            "Preparing sources",
+            Style::default().fg(palette.muted),
+        )));
+        return lines;
+    };
+
+    lines.extend(status.sources.iter().map(|source| {
+        let (marker, detail, color) = match source.stage {
+            SourceSyncStage::Pending => ("○", "waiting".to_string(), palette.muted),
+            SourceSyncStage::Syncing => ("◌", "syncing…".to_string(), palette.tokens),
+            SourceSyncStage::Ready { scanned, imported } => (
+                "✓",
+                format!("ready · {imported} indexed · {scanned} scanned"),
+                palette.cache,
+            ),
+            SourceSyncStage::Failed => ("!", "failed".to_string(), palette.error),
+        };
+        Line::from(vec![
+            Span::styled(
+                format!("{marker} {:<10}", source.name),
+                Style::default().fg(color),
+            ),
+            Span::styled(detail, Style::default().fg(color)),
+        ])
+    }));
+    lines
+}
+
+fn sync_spinner() -> &'static str {
+    const FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+    let frame = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| (duration.as_millis() / 120) as usize)
+        .unwrap_or(0);
+    FRAMES[frame % FRAMES.len()]
 }
 
 fn draw_wide_models(
@@ -2914,7 +3006,7 @@ fn dashboard_status(app: &AppState) -> String {
     if let Some(error) = &app.error {
         format!("error: {error}")
     } else if let Some(mode) = app.source_sync {
-        source_sync_label(mode).to_string()
+        source_sync_status_label(app, mode)
     } else if let Some(error) = &app.source_sync_error {
         format!("source warning: {error}")
     } else if let Some(stats) = app.current_stats() {
@@ -2945,7 +3037,7 @@ fn calendar_status(app: &AppState) -> String {
     if let Some(error) = &app.error {
         format!("error: {error}")
     } else if let Some(mode) = app.source_sync {
-        source_sync_label(mode).to_string()
+        source_sync_status_label(app, mode)
     } else if let Some(error) = &app.source_sync_error {
         format!("source warning: {error}")
     } else if app.calendar_loading {
@@ -2973,7 +3065,7 @@ fn history_status(app: &AppState) -> String {
     if let Some(error) = &app.error {
         format!("error: {error}")
     } else if let Some(mode) = app.source_sync {
-        source_sync_label(mode).to_string()
+        source_sync_status_label(app, mode)
     } else if let Some(error) = &app.source_sync_error {
         format!("source warning: {error}")
     } else if let Some(stats) = app.selected_history_stats() {
@@ -3005,6 +3097,32 @@ fn source_sync_label(mode: SyncMode) -> &'static str {
         SyncMode::Incremental => "syncing sources",
         SyncMode::Full => "rebuilding usage index",
     }
+}
+
+fn source_sync_status_label(app: &AppState, mode: SyncMode) -> String {
+    let label = if app.first_sync {
+        format!("{} performing first sync", sync_spinner())
+    } else {
+        source_sync_label(mode).to_string()
+    };
+    let Some(status) = app
+        .source_sync_status
+        .as_ref()
+        .filter(|status| !status.sources.is_empty())
+    else {
+        return label;
+    };
+    let active = status.active_names();
+    let activity = if active.is_empty() {
+        "finishing".to_string()
+    } else {
+        format!("syncing {}", active.join(" + "))
+    };
+    format!(
+        "{label} · {activity} · {}/{} complete",
+        status.completed(),
+        status.sources.len()
+    )
 }
 
 fn key_span(label: &'static str, palette: Palette) -> Span<'static> {
@@ -3350,6 +3468,63 @@ mod tests {
         assert!(output.contains("Daily by model"));
         assert!(output.contains("Token usage over time"));
         assert!(output.contains("Loading token graph"));
+    }
+
+    #[test]
+    fn renders_first_sync_source_progress_in_daily_models_area() {
+        let mut app = app_loading(Mode::Daily);
+        app.first_sync = true;
+        app.source_sync = Some(SyncMode::Incremental);
+        app.source_sync_status = Some(SourceSyncStatus {
+            sources: vec![
+                crate::app::SourceSyncItem {
+                    name: "OpenCode".to_string(),
+                    stage: SourceSyncStage::Syncing,
+                },
+                crate::app::SourceSyncItem {
+                    name: "Pi".to_string(),
+                    stage: SourceSyncStage::Pending,
+                },
+            ],
+        });
+
+        let output = render(&app, 100, 24);
+
+        assert!(output.contains("Daily by model"));
+        assert!(output.contains("Performing first sync"));
+        assert!(output.contains("OpenCode"));
+        assert!(output.contains("syncing"));
+        assert!(output.contains("Pi"));
+        assert!(output.contains("waiting"));
+    }
+
+    #[test]
+    fn keeps_partial_model_data_visible_during_first_sync() {
+        let stats = many_model_stats(Mode::Daily, 2);
+        let mut app = app_with_stats(Mode::Daily, stats);
+        app.first_sync = true;
+        app.source_sync = Some(SyncMode::Incremental);
+        app.source_sync_status = Some(SourceSyncStatus {
+            sources: vec![
+                crate::app::SourceSyncItem {
+                    name: "OpenCode".to_string(),
+                    stage: SourceSyncStage::Ready {
+                        scanned: 20,
+                        imported: 10,
+                    },
+                },
+                crate::app::SourceSyncItem {
+                    name: "Pi".to_string(),
+                    stage: SourceSyncStage::Syncing,
+                },
+            ],
+        });
+
+        let output = render(&app, 120, 24);
+
+        assert!(output.contains("first sync 1/2"));
+        assert!(output.contains("provider/model-0"));
+        assert!(output.contains("syncing Pi"));
     }
 
     #[test]
@@ -3871,7 +4046,9 @@ mod tests {
             history_graph_load: crate::app::DeferredLoadState::default(),
             error: None,
             source_sync: None,
+            source_sync_status: None,
             source_sync_error: None,
+            first_sync: false,
             logical_day: test_calendar().selected,
             pending_source_sync: None,
             last_refresh_started: None,
@@ -3912,7 +4089,9 @@ mod tests {
             history_graph_load: crate::app::DeferredLoadState::default(),
             error: None,
             source_sync: None,
+            source_sync_status: None,
             source_sync_error: None,
+            first_sync: false,
             logical_day: test_calendar().selected,
             pending_source_sync: None,
             last_refresh_started: None,
@@ -3962,7 +4141,9 @@ mod tests {
             history_graph_load: crate::app::DeferredLoadState::default(),
             error: None,
             source_sync: None,
+            source_sync_status: None,
             source_sync_error: None,
+            first_sync: false,
             logical_day: selected,
             pending_source_sync: None,
             last_refresh_started: None,

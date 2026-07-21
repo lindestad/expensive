@@ -168,9 +168,13 @@ impl UsageIndex {
 
         let connection = Connection::open(path)
             .with_context(|| format!("opening usage index {}", path.display()))?;
-        connection.busy_timeout(Duration::from_secs(2))?;
+        connection.busy_timeout(Duration::from_secs(30))?;
         connection.pragma_update(None, "foreign_keys", true)?;
-        connection.pragma_update(None, "journal_mode", "WAL")?;
+        let journal_mode: String =
+            connection.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+        if !journal_mode.eq_ignore_ascii_case("wal") {
+            connection.pragma_update(None, "journal_mode", "WAL")?;
+        }
         connection.pragma_update(None, "synchronous", "NORMAL")?;
         migrate(&connection)
             .with_context(|| format!("migrating usage index {}", path.display()))?;

@@ -24,7 +24,7 @@ use crate::{
     config::{self, ColorTheme, Config, Scope, ThemeScope},
     db::{self, UsageStats},
     index,
-    sources::{self, SyncMode, SyncSummary},
+    sources::{self, SyncMode, SyncProgress, SyncReport, SyncSummary},
     time_window::{self, CalendarScale, DailyStart, Mode, PeriodKey, WeekStart},
     tui,
 };
@@ -67,6 +67,47 @@ pub struct ScopePickerState {
 
 pub struct ProviderPickerState {
     pub selection: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SourceSyncStage {
+    Pending,
+    Syncing,
+    Ready { scanned: usize, imported: usize },
+    Failed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceSyncItem {
+    pub name: String,
+    pub stage: SourceSyncStage,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SourceSyncStatus {
+    pub sources: Vec<SourceSyncItem>,
+}
+
+impl SourceSyncStatus {
+    pub fn completed(&self) -> usize {
+        self.sources
+            .iter()
+            .filter(|source| {
+                matches!(
+                    source.stage,
+                    SourceSyncStage::Ready { .. } | SourceSyncStage::Failed
+                )
+            })
+            .count()
+    }
+
+    pub fn active_names(&self) -> Vec<&str> {
+        self.sources
+            .iter()
+            .filter(|source| source.stage == SourceSyncStage::Syncing)
+            .map(|source| source.name.as_str())
+            .collect()
+    }
 }
 
 pub struct DeferredLoadState<K> {
@@ -236,7 +277,9 @@ pub struct AppState {
     pub history_graph_load: DeferredLoadState<PeriodKey>,
     pub error: Option<String>,
     pub source_sync: Option<SyncMode>,
+    pub source_sync_status: Option<SourceSyncStatus>,
     pub source_sync_error: Option<String>,
+    pub first_sync: bool,
     pub last_refresh_started: Option<DateTime<Local>>,
     pub next_refresh_due: Instant,
     pub logical_day: PeriodKey,
@@ -255,6 +298,10 @@ impl AppState {
         )?;
         let visible_periods =
             time_window::visible_periods(selected, config.daily_start, config.week_start)?;
+        let first_sync = index::UsageIndex::open(&config.index_path)
+            .and_then(|index| index.diagnostics())
+            .map(|diagnostics| diagnostics.sources == 0 && diagnostics.artifacts == 0)
+            .unwrap_or(false);
         let projects = index::list_projects(&config.index_path).unwrap_or_default();
         let providers = index::list_providers(&config.index_path).unwrap_or_default();
 
@@ -293,7 +340,9 @@ impl AppState {
             history_graph_load: DeferredLoadState::default(),
             error: None,
             source_sync: None,
+            source_sync_status: None,
             source_sync_error: None,
+            first_sync,
             last_refresh_started: None,
             next_refresh_due,
             logical_day: selected,
@@ -633,14 +682,81 @@ impl AppState {
             return;
         }
         self.source_sync = Some(mode);
+        self.source_sync_status = Some(SourceSyncStatus::default());
         self.source_sync_error = None;
         let tx = tx.clone();
         let config = self.config.clone();
         thread::spawn(move || {
-            let result =
-                sources::sync_configured(&config, mode).map_err(|error| format!("{error:#}"));
+            let progress_tx = tx.clone();
+            let result = sources::sync_configured_with_progress(&config, mode, |progress| {
+                let _ = progress_tx.send(RefreshMessage::SourceSyncProgress { progress });
+            })
+            .map_err(|error| format!("{error:#}"));
             let _ = tx.send(RefreshMessage::SourceSync { result });
         });
+    }
+
+    fn apply_source_sync_progress(&mut self, progress: SyncProgress, tx: &Sender<RefreshMessage>) {
+        match progress {
+            SyncProgress::Planned { sources } => {
+                self.source_sync_status = Some(SourceSyncStatus {
+                    sources: sources
+                        .into_iter()
+                        .map(|name| SourceSyncItem {
+                            name,
+                            stage: SourceSyncStage::Pending,
+                        })
+                        .collect(),
+                });
+            }
+            SyncProgress::Started { source } => {
+                self.update_source_stage(&source, SourceSyncStage::Syncing);
+            }
+            SyncProgress::Finished {
+                source,
+                report,
+                error,
+                changed,
+            } => {
+                let stage = match (report, error) {
+                    (
+                        Some(SyncReport {
+                            scanned, imported, ..
+                        }),
+                        _,
+                    ) => SourceSyncStage::Ready { scanned, imported },
+                    (_, Some(_)) | (None, None) => SourceSyncStage::Failed,
+                };
+                self.update_source_stage(&source, stage);
+                if changed {
+                    if let Ok(projects) = index::list_projects(&self.config.index_path) {
+                        self.projects = projects;
+                    }
+                    if let Ok(providers) = index::list_providers(&self.config.index_path) {
+                        self.providers = providers;
+                    }
+                    self.invalidate_after_source_change(tx);
+                }
+            }
+        }
+    }
+
+    fn update_source_stage(&mut self, source_name: &str, stage: SourceSyncStage) {
+        let status = self
+            .source_sync_status
+            .get_or_insert_with(SourceSyncStatus::default);
+        if let Some(source) = status
+            .sources
+            .iter_mut()
+            .find(|source| source.name == source_name)
+        {
+            source.stage = stage;
+        } else {
+            status.sources.push(SourceSyncItem {
+                name: source_name.to_string(),
+                stage,
+            });
+        }
     }
 
     fn apply_source_sync(
@@ -649,6 +765,7 @@ impl AppState {
         tx: &Sender<RefreshMessage>,
     ) {
         self.source_sync = None;
+        self.first_sync = false;
         match result {
             Ok(summary) => {
                 self.source_sync_error =
@@ -659,12 +776,10 @@ impl AppState {
                 if let Ok(providers) = index::list_providers(&self.config.index_path) {
                     self.providers = providers;
                 }
-                if summary.changed() {
-                    self.invalidate_after_source_change(tx);
-                }
             }
             Err(error) => self.source_sync_error = Some(error),
         }
+        self.source_sync_status = None;
 
         if let Some(mode) = self.pending_source_sync.take() {
             self.trigger_source_sync(mode, tx);
@@ -1481,6 +1596,9 @@ enum RefreshMessage {
     SourceSync {
         result: std::result::Result<SyncSummary, String>,
     },
+    SourceSyncProgress {
+        progress: SyncProgress,
+    },
 }
 
 impl RefreshMessage {
@@ -1491,7 +1609,7 @@ impl RefreshMessage {
             | Self::Calendar { generation, .. }
             | Self::History { generation, .. }
             | Self::HistoryGraph { generation, .. } => Some(*generation),
-            Self::SourceSync { .. } => None,
+            Self::SourceSync { .. } | Self::SourceSyncProgress { .. } => None,
         }
     }
 }
@@ -1528,6 +1646,7 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Confi
         needs_draw |= drain_refreshes(&rx, &mut app, &tx);
         needs_draw |= maybe_day_rollover(&mut app, &tx);
         needs_draw |= maybe_auto_refresh(&mut app, &tx);
+        needs_draw |= app.first_sync && app.source_sync.is_some();
         let size = terminal.size()?;
         let current_size = (size.width, size.height);
         if last_size != Some(current_size) {
@@ -1989,6 +2108,10 @@ fn drain_refreshes(
             }
             RefreshMessage::SourceSync { result } => {
                 app.apply_source_sync(result, tx);
+                needs_draw = true;
+            }
+            RefreshMessage::SourceSyncProgress { progress } => {
+                app.apply_source_sync_progress(progress, tx);
                 needs_draw = true;
             }
         }
@@ -2793,6 +2916,73 @@ mod tests {
 
         app.trigger_source_sync(SyncMode::Incremental, &tx);
         assert_eq!(app.pending_source_sync, Some(SyncMode::Full));
+    }
+
+    #[test]
+    fn tracks_each_source_sync_stage_and_counts() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut config = test_config(tempdir.path().join("config.toml"));
+        config.index_path = tempdir.path().join("usage.sqlite3");
+        let mut app = AppState::new(config).unwrap();
+        let (tx, _rx) = mpsc::channel();
+
+        app.apply_source_sync_progress(
+            SyncProgress::Planned {
+                sources: vec!["OpenCode".to_string(), "Pi".to_string()],
+            },
+            &tx,
+        );
+        app.apply_source_sync_progress(
+            SyncProgress::Started {
+                source: "OpenCode".to_string(),
+            },
+            &tx,
+        );
+        app.apply_source_sync_progress(
+            SyncProgress::Finished {
+                source: "OpenCode".to_string(),
+                report: Some(SyncReport {
+                    scanned: 12,
+                    imported: 8,
+                    ..SyncReport::default()
+                }),
+                error: None,
+                changed: false,
+            },
+            &tx,
+        );
+        app.apply_source_sync_progress(
+            SyncProgress::Started {
+                source: "Pi".to_string(),
+            },
+            &tx,
+        );
+
+        let status = app.source_sync_status.unwrap();
+        assert_eq!(status.completed(), 1);
+        assert_eq!(status.active_names(), vec!["Pi"]);
+        assert_eq!(
+            status.sources[0].stage,
+            SourceSyncStage::Ready {
+                scanned: 12,
+                imported: 8
+            }
+        );
+    }
+
+    #[test]
+    fn fresh_index_is_marked_as_first_sync_until_sync_finishes() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut config = test_config(tempdir.path().join("config.toml"));
+        config.index_path = tempdir.path().join("usage.sqlite3");
+        let mut app = AppState::new(config).unwrap();
+        let (tx, _rx) = mpsc::channel();
+
+        assert!(app.first_sync);
+
+        app.apply_source_sync(Ok(SyncSummary::default()), &tx);
+
+        assert!(!app.first_sync);
     }
 
     #[test]
