@@ -42,11 +42,11 @@ fn run_doctor(config: &Config) -> Result<()> {
         }
     );
     println!(
-        "API cost estimates: {}",
+        "subscription API estimates: {}",
         if config.estimate_api_cost {
             "enabled"
         } else {
-            "disabled"
+            "disabled (Bedrock retail estimates remain active)"
         }
     );
 
@@ -73,6 +73,11 @@ fn run_doctor(config: &Config) -> Result<()> {
         "pi source: {} ({})",
         config.pi_sessions_root.display(),
         availability(config.pi_sessions_root.is_dir())
+    );
+    println!(
+        "claude source: {} ({})",
+        config.claude_home.display(),
+        availability(config.claude_home.join("projects").is_dir())
     );
 
     if !opencode_available {

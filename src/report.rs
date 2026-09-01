@@ -201,6 +201,7 @@ mod tests {
             index_path: file.path().with_extension("index.sqlite3"),
             copilot_home: PathBuf::from("/tmp/copilot"),
             codex_home: PathBuf::from("/tmp/codex"),
+            claude_home: PathBuf::from("/tmp/claude"),
             pi_sessions_root: PathBuf::from("/tmp/pi/sessions"),
             current_directory: PathBuf::from("/work/project-a"),
             config_path: None,

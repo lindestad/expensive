@@ -213,6 +213,7 @@ fn parse_event(
         output_tokens,
         cache_read_tokens,
         cache_write_tokens,
+        cache_write_1h_tokens: 0,
         reasoning_tokens: 0,
         total_tokens,
         cost_microusd,
@@ -221,6 +222,8 @@ fn parse_event(
         } else {
             CostKind::Unavailable
         },
+        is_sidechain: false,
+        has_detailed_cache: false,
     }))
 }
 

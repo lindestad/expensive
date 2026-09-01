@@ -263,10 +263,13 @@ fn parse_token_event(
         output_tokens,
         cache_read_tokens,
         cache_write_tokens: 0,
+        cache_write_1h_tokens: 0,
         reasoning_tokens,
         total_tokens,
         cost_microusd: None,
         cost_kind: CostKind::Unavailable,
+        is_sidechain: false,
+        has_detailed_cache: false,
     }))
 }
 
