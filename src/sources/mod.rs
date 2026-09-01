@@ -6,9 +6,10 @@ use anyhow::Result;
 
 use crate::{
     config::Config,
-    index::{IndexChange, SourceRegistration, UsageIndex},
+    index::{IndexChange, SourceKind, SourceRegistration, UsageIndex},
 };
 
+pub mod claude;
 pub mod codex;
 pub mod copilot;
 mod jsonl;
@@ -97,6 +98,10 @@ pub fn sync_configured_with_progress(
 ) -> Result<SyncSummary> {
     let index = UsageIndex::open(&config.index_path)?;
     let generation_before = index.diagnostics()?.generation;
+    let claude_available = config.claude_home.join("projects").is_dir()
+        || index
+            .has_artifacts_for_kind(SourceKind::Claude)
+            .unwrap_or(false);
     drop(index);
     let mut sources: Vec<Box<dyn UsageSource>> = Vec::new();
     let opencode_available = config.db_path.is_file();
@@ -117,6 +122,11 @@ pub fn sync_configured_with_progress(
         || config.codex_home.join("archived_sessions").is_dir()
     {
         sources.push(Box::new(codex::CodexSource::new(config.codex_home.clone())));
+    }
+    if claude_available {
+        sources.push(Box::new(claude::ClaudeSource::new(
+            config.claude_home.clone(),
+        )));
     }
 
     progress(SyncProgress::Planned {
@@ -254,9 +264,11 @@ mod tests {
             .unwrap();
         drop(connection);
         let codex_home = directory.path().join("codex");
+        let claude_home = directory.path().join("claude");
         let copilot_home = directory.path().join("copilot");
         let pi_sessions_root = directory.path().join("pi");
         fs::create_dir_all(codex_home.join("sessions")).unwrap();
+        fs::create_dir_all(claude_home.join("projects")).unwrap();
         fs::create_dir_all(&copilot_home).unwrap();
         fs::create_dir_all(&pi_sessions_root).unwrap();
         let connection = Connection::open(copilot_home.join("session-store.db")).unwrap();
@@ -269,6 +281,7 @@ mod tests {
             index_path: directory.path().join("usage.sqlite3"),
             copilot_home,
             codex_home,
+            claude_home,
             pi_sessions_root,
             current_directory: directory.path().to_path_buf(),
             config_path: None,
@@ -298,7 +311,8 @@ mod tests {
                     "OpenCode".to_string(),
                     "Copilot".to_string(),
                     "Pi".to_string(),
-                    "Codex".to_string()
+                    "Codex".to_string(),
+                    "Claude Code".to_string(),
                 ]
             })
         );
@@ -327,13 +341,19 @@ mod tests {
                 |event| matches!(event, SyncProgress::Started { source } if source == "Codex"),
             )
             .unwrap();
+        let claude_started = events
+            .iter()
+            .position(
+                |event| matches!(event, SyncProgress::Started { source } if source == "Claude Code"),
+            )
+            .unwrap();
         let first_secondary_finished = events
             .iter()
             .position(|event| {
                 matches!(
                     event,
                     SyncProgress::Finished { source, .. }
-                        if source == "Copilot" || source == "Pi" || source == "Codex"
+                        if source == "Copilot" || source == "Pi" || source == "Codex" || source == "Claude Code"
                 )
             })
             .unwrap();
@@ -341,10 +361,12 @@ mod tests {
         assert!(opencode_finished < pi_started);
         assert!(opencode_finished < copilot_started);
         assert!(opencode_finished < codex_started);
+        assert!(opencode_finished < claude_started);
         assert!(copilot_started < first_secondary_finished);
         assert!(pi_started < first_secondary_finished);
         assert!(codex_started < first_secondary_finished);
-        assert_eq!(summary.reports.len(), 4);
+        assert!(claude_started < first_secondary_finished);
+        assert_eq!(summary.reports.len(), 5);
         assert!(summary.errors.is_empty());
     }
 }

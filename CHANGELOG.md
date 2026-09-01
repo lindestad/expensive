@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- import Claude Code project session usage with incremental JSONL scanning, streaming turn deduplication, thinking token accounting, and 5-minute vs 1-hour cache write distinction
+- automatically estimate unpriced Amazon Bedrock Claude usage while gating Anthropic API estimates behind the existing API cost flag
+- migrate local usage index to schema version 4 to record 1-hour cache write tokens and support duration-aware prompt caching pricing
+- add Claude Code source availability and diagnostics to `expensive doctor`
 - import current-schema GitHub Copilot CLI and app usage from the shared local session-store database, including exact token classes and AI-credit usage value
 - incrementally scan only new Copilot usage rows while detecting source rewrites and rejecting unknown database schemas
 

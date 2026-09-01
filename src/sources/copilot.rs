@@ -246,6 +246,7 @@ fn usage_event(raw: &RawUsageRow) -> Result<UsageEvent> {
         output_tokens: tokens.output,
         cache_read_tokens: tokens.cache_read,
         cache_write_tokens: tokens.cache_write,
+        cache_write_1h_tokens: 0,
         reasoning_tokens: tokens.reasoning,
         total_tokens,
         cost_microusd,
@@ -254,6 +255,8 @@ fn usage_event(raw: &RawUsageRow) -> Result<UsageEvent> {
         } else {
             CostKind::Unavailable
         },
+        is_sidechain: false,
+        has_detailed_cache: false,
     })
 }
 

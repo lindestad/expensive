@@ -1421,9 +1421,9 @@ fn config_value_width(item: ConfigEditorItem, app: &AppState) -> usize {
         }
         ConfigEditorItem::EstimateApiCost => {
             if app.config.estimate_api_cost {
-                text_width(" [x]  include API estimates")
+                text_width(" [x]  estimate subscription APIs")
             } else {
-                text_width(" [ ]  actual costs only")
+                text_width(" [ ]  subscription estimates off")
             }
         }
         ConfigEditorItem::HiddenProviders => text_width(&format!(
@@ -1593,9 +1593,9 @@ fn config_value_tokens(
             },
             ValueToken {
                 text: if app.config.estimate_api_cost {
-                    "include API estimates".to_string()
+                    "estimate subscription APIs".to_string()
                 } else {
-                    "actual costs only".to_string()
+                    "subscription estimates off".to_string()
                 },
                 style: Style::default().fg(palette.muted),
             },
@@ -4649,6 +4649,7 @@ mod tests {
             index_path: PathBuf::from("/tmp/expensive.sqlite3"),
             copilot_home: PathBuf::from("/tmp/copilot"),
             codex_home: PathBuf::from("/tmp/codex"),
+            claude_home: PathBuf::from("/tmp/claude"),
             pi_sessions_root: PathBuf::from("/tmp/pi/sessions"),
             current_directory: PathBuf::from("/tmp/project"),
             config_path: Some(PathBuf::from("/tmp/expensive/config.toml")),

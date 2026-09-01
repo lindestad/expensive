@@ -303,6 +303,7 @@ pub struct Config {
     pub index_path: PathBuf,
     pub copilot_home: PathBuf,
     pub codex_home: PathBuf,
+    pub claude_home: PathBuf,
     pub pi_sessions_root: PathBuf,
     pub current_directory: PathBuf,
     pub config_path: Option<PathBuf>,
@@ -408,6 +409,7 @@ fn resolve_config(
         index_path,
         copilot_home: discover_copilot_home(),
         codex_home: discover_codex_home(),
+        claude_home: discover_claude_home(),
         pi_sessions_root: discover_pi_sessions_root(),
         current_directory,
         config_path,
@@ -555,6 +557,15 @@ fn discover_codex_home() -> PathBuf {
         .map(PathBuf::from)
         .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))
         .unwrap_or_else(|| Path::new(".codex").to_path_buf())
+}
+
+fn discover_claude_home() -> PathBuf {
+    env::var("CLAUDE_CONFIG_DIR")
+        .ok()
+        .filter(|path| !path.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".claude")))
+        .unwrap_or_else(|| Path::new(".claude").to_path_buf())
 }
 
 fn discover_copilot_home() -> PathBuf {
@@ -744,6 +755,7 @@ mod tests {
             index_path: PathBuf::from("/tmp/expensive.sqlite3"),
             copilot_home: PathBuf::from("/tmp/copilot"),
             codex_home: PathBuf::from("/tmp/codex"),
+            claude_home: PathBuf::from("/tmp/claude"),
             pi_sessions_root: PathBuf::from("/tmp/pi/sessions"),
             current_directory: PathBuf::from("/tmp/project"),
             config_path: Some(path.clone()),
@@ -866,5 +878,11 @@ mod tests {
         .to_string();
 
         assert!(error.contains("unsupported color theme"));
+    }
+
+    #[test]
+    fn discovers_claude_home_from_env_or_default() {
+        let home = discover_claude_home();
+        assert!(!home.as_os_str().is_empty());
     }
 }

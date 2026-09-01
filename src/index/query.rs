@@ -184,13 +184,17 @@ pub fn load_period_costs_scoped_with_options(
     let project_id = resolve_scope(&index.connection, options.scope, options.current_directory)?;
     let mut statement = index.connection.prepare(
         "SELECT occurred_at_ms, provider, model, cost_microusd,
-                input_tokens, output_tokens, cache_read_tokens, cache_write_tokens
+                input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                cache_write_1h_tokens
          FROM usage_events
          WHERE occurred_at_ms >= ?1
            AND occurred_at_ms < ?2
            AND (?3 IS NULL OR project_id = ?3)",
     )?;
     let rows = statement.query_map(params![start_millis, end_millis, project_id], |row| {
+        let write_total = nonnegative(row.get(7)?);
+        let write_1h = nonnegative(row.get(8)?);
+        let write_5m = write_total.saturating_sub(write_1h);
         Ok((
             row.get::<_, i64>(0)?,
             row.get::<_, String>(1)?,
@@ -200,7 +204,8 @@ pub fn load_period_costs_scoped_with_options(
                 input: nonnegative(row.get(4)?),
                 output: nonnegative(row.get(5)?),
                 cache_read: nonnegative(row.get(6)?),
-                cache_write: nonnegative(row.get(7)?),
+                cache_write_5m: write_5m,
+                cache_write_1h: write_1h,
             },
         ))
     })?;
@@ -215,9 +220,8 @@ pub fn load_period_costs_scoped_with_options(
             continue;
         }
         let cost = cost_microusd.map(micros_to_usd).or_else(|| {
-            options
-                .estimate_api_cost
-                .then(|| pricing::estimate_api_cost(&provider, &model, tokens))
+            pricing::should_estimate(&provider, options.estimate_api_cost)
+                .then(|| pricing::estimate_cost(&provider, &model, tokens))
                 .flatten()
         });
         if let Some(period) = periods
@@ -272,6 +276,7 @@ fn load_model_usage(
                 COALESCE(SUM(output_tokens), 0) AS output_tokens,
                 COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
                 COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,
+                COALESCE(SUM(cache_write_1h_tokens), 0) AS cache_write_1h_tokens,
                 COALESCE(SUM(CASE WHEN cost_microusd IS NULL THEN input_tokens ELSE 0 END), 0)
                     AS unpriced_input_tokens,
                 COALESCE(SUM(CASE WHEN cost_microusd IS NULL THEN output_tokens ELSE 0 END), 0)
@@ -279,7 +284,9 @@ fn load_model_usage(
                 COALESCE(SUM(CASE WHEN cost_microusd IS NULL THEN cache_read_tokens ELSE 0 END), 0)
                     AS unpriced_cache_read_tokens,
                 COALESCE(SUM(CASE WHEN cost_microusd IS NULL THEN cache_write_tokens ELSE 0 END), 0)
-                    AS unpriced_cache_write_tokens
+                    AS unpriced_cache_write_tokens,
+                COALESCE(SUM(CASE WHEN cost_microusd IS NULL THEN cache_write_1h_tokens ELSE 0 END), 0)
+                    AS unpriced_cache_write_1h_tokens
          FROM usage_events
          WHERE (?1 IS NULL OR occurred_at_ms >= ?1)
            AND (?2 IS NULL OR occurred_at_ms < ?2)
@@ -292,15 +299,18 @@ fn load_model_usage(
         let model_id: String = row.get("model")?;
         let variant: String = row.get("variant")?;
         let unpriced_messages = nonnegative(row.get("unpriced_messages")?);
+        let unpriced_write_total = nonnegative(row.get("unpriced_cache_write_tokens")?);
+        let unpriced_write_1h = nonnegative(row.get("unpriced_cache_write_1h_tokens")?);
+        let unpriced_write_5m = unpriced_write_total.saturating_sub(unpriced_write_1h);
         let unpriced_tokens = TokenCounts {
             input: nonnegative(row.get("unpriced_input_tokens")?),
             output: nonnegative(row.get("unpriced_output_tokens")?),
             cache_read: nonnegative(row.get("unpriced_cache_read_tokens")?),
-            cache_write: nonnegative(row.get("unpriced_cache_write_tokens")?),
+            cache_write_5m: unpriced_write_5m,
+            cache_write_1h: unpriced_write_1h,
         };
-        let api_estimated_cost = options
-            .estimate_api_cost
-            .then(|| pricing::estimate_api_cost(&provider, &model_id, unpriced_tokens))
+        let api_estimated_cost = pricing::should_estimate(&provider, options.estimate_api_cost)
+            .then(|| pricing::estimate_cost(&provider, &model_id, unpriced_tokens))
             .flatten();
         Ok(ModelUsage {
             display_name: display_name(&provider, &model_id, &variant),
@@ -399,7 +409,9 @@ fn load_token_buckets(
                 COALESCE(SUM(CASE WHEN cost_microusd IS NULL THEN cache_read_tokens ELSE 0 END), 0)
                     AS unpriced_cache_read_tokens,
                 COALESCE(SUM(CASE WHEN cost_microusd IS NULL THEN cache_write_tokens ELSE 0 END), 0)
-                    AS unpriced_cache_write_tokens
+                    AS unpriced_cache_write_tokens,
+                COALESCE(SUM(CASE WHEN cost_microusd IS NULL THEN cache_write_1h_tokens ELSE 0 END), 0)
+                    AS unpriced_cache_write_1h_tokens
          FROM usage_events
          WHERE (?1 IS NULL OR occurred_at_ms >= ?1)
            AND (?2 IS NULL OR occurred_at_ms < ?2)
@@ -419,6 +431,9 @@ fn load_token_buckets(
             range_end
         ],
         |row| {
+            let unpriced_write_total = nonnegative(row.get("unpriced_cache_write_tokens")?);
+            let unpriced_write_1h = nonnegative(row.get("unpriced_cache_write_1h_tokens")?);
+            let unpriced_write_5m = unpriced_write_total.saturating_sub(unpriced_write_1h);
             Ok((
                 row.get::<_, i64>("bucket_idx")?,
                 row.get::<_, String>("provider")?,
@@ -429,7 +444,8 @@ fn load_token_buckets(
                     input: nonnegative(row.get("unpriced_input_tokens")?),
                     output: nonnegative(row.get("unpriced_output_tokens")?),
                     cache_read: nonnegative(row.get("unpriced_cache_read_tokens")?),
-                    cache_write: nonnegative(row.get("unpriced_cache_write_tokens")?),
+                    cache_write_5m: unpriced_write_5m,
+                    cache_write_1h: unpriced_write_1h,
                 },
             ))
         },
@@ -443,9 +459,8 @@ fn load_token_buckets(
             .ok()
             .and_then(|idx| buckets.get_mut(idx))
         {
-            let estimate = options
-                .estimate_api_cost
-                .then(|| pricing::estimate_api_cost(&provider, &model, unpriced_tokens))
+            let estimate = pricing::should_estimate(&provider, options.estimate_api_cost)
+                .then(|| pricing::estimate_cost(&provider, &model, unpriced_tokens))
                 .flatten()
                 .unwrap_or(0.0);
             bucket.tokens += nonnegative(tokens);
@@ -726,10 +741,13 @@ mod tests {
                     output_tokens: 2,
                     cache_read_tokens: 4,
                     cache_write_tokens: 0,
+                    cache_write_1h_tokens: 0,
                     reasoning_tokens: 1,
                     total_tokens: 12,
                     cost_microusd: None,
                     cost_kind: CostKind::Unavailable,
+                    is_sidechain: false,
+                    has_detailed_cache: false,
                 }],
             )
             .unwrap();
@@ -799,10 +817,13 @@ mod tests {
                         output_tokens: 1_000_000,
                         cache_read_tokens: 1_000_000,
                         cache_write_tokens: 0,
+                        cache_write_1h_tokens: 0,
                         reasoning_tokens: 0,
                         total_tokens: 3_000_000,
                         cost_microusd: None,
                         cost_kind: CostKind::Unavailable,
+                        is_sidechain: false,
+                        has_detailed_cache: false,
                     },
                     UsageEvent {
                         event_key: vec![2],
@@ -816,10 +837,13 @@ mod tests {
                         output_tokens: 0,
                         cache_read_tokens: 0,
                         cache_write_tokens: 0,
+                        cache_write_1h_tokens: 0,
                         reasoning_tokens: 0,
                         total_tokens: 10,
                         cost_microusd: Some(2_000_000),
                         cost_kind: CostKind::Reported,
+                        is_sidechain: false,
+                        has_detailed_cache: false,
                     },
                     UsageEvent {
                         event_key: vec![3],
@@ -833,10 +857,13 @@ mod tests {
                         output_tokens: 0,
                         cache_read_tokens: 0,
                         cache_write_tokens: 0,
+                        cache_write_1h_tokens: 0,
                         reasoning_tokens: 0,
                         total_tokens: 100,
                         cost_microusd: None,
                         cost_kind: CostKind::Unavailable,
+                        is_sidechain: false,
+                        has_detailed_cache: false,
                     },
                 ],
             )
@@ -872,5 +899,111 @@ mod tests {
         let costs = load_period_costs_scoped_with_options(&path, &[period], options).unwrap();
         assert_eq!(costs[0].cost, 11.375);
         assert_eq!(list_providers(&path).unwrap(), vec!["llama.cpp", "openai"]);
+    }
+
+    #[test]
+    fn estimates_bedrock_automatically_and_anthropic_only_when_enabled() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("usage.sqlite3");
+        let mut index = UsageIndex::open(&path).unwrap();
+        let source_id = index
+            .register_source(&SourceRegistration {
+                kind: SourceKind::Claude,
+                source_key: "default".to_string(),
+                display_name: "Claude Code".to_string(),
+            })
+            .unwrap();
+        index
+            .replace_artifact_events(
+                source_id,
+                &ArtifactRecord {
+                    key: "session".to_string(),
+                    path: None,
+                    device: None,
+                    inode: None,
+                    size: None,
+                    modified_ns: None,
+                    parsed_offset: 0,
+                    boundary_hash: None,
+                    full_hash: None,
+                    cursor: None,
+                    parser_version: 1,
+                    scanned_at_ms: 1,
+                },
+                &[
+                    UsageEvent {
+                        event_key: vec![1],
+                        occurred_at_ms: 1_500,
+                        project_id: None,
+                        provider: "amazon-bedrock".to_string(),
+                        model: "anthropic.claude-sonnet-5".to_string(),
+                        variant: "default".to_string(),
+                        messages: 1,
+                        input_tokens: 1_000_000,
+                        output_tokens: 0,
+                        cache_read_tokens: 0,
+                        cache_write_tokens: 0,
+                        cache_write_1h_tokens: 0,
+                        reasoning_tokens: 0,
+                        total_tokens: 1_000_000,
+                        cost_microusd: None,
+                        cost_kind: CostKind::Unavailable,
+                        is_sidechain: false,
+                        has_detailed_cache: false,
+                    },
+                    UsageEvent {
+                        event_key: vec![2],
+                        occurred_at_ms: 1_600,
+                        project_id: None,
+                        provider: "anthropic".to_string(),
+                        model: "claude-sonnet-5".to_string(),
+                        variant: "default".to_string(),
+                        messages: 1,
+                        input_tokens: 1_000_000,
+                        output_tokens: 0,
+                        cache_read_tokens: 0,
+                        cache_write_tokens: 0,
+                        cache_write_1h_tokens: 0,
+                        reasoning_tokens: 0,
+                        total_tokens: 1_000_000,
+                        cost_microusd: None,
+                        cost_kind: CostKind::Unavailable,
+                        is_sidechain: false,
+                        has_detailed_cache: false,
+                    },
+                ],
+            )
+            .unwrap();
+
+        let hidden = BTreeSet::new();
+        // With estimate_api_cost = false: Bedrock is estimated (3.0), Anthropic is unpriced
+        let options_no_est = query_options(&hidden, false);
+        let stats_no_est = load_usage_range_scoped_with_options(
+            &path,
+            Mode::Daily,
+            Some(1_000),
+            Some(2_000),
+            true,
+            options_no_est,
+        )
+        .unwrap();
+        assert_eq!(stats_no_est.totals.api_estimated_messages, 1);
+        assert_eq!(stats_no_est.totals.unpriced_messages, 1);
+        assert!((stats_no_est.totals.cost - 3.0).abs() < 1e-6);
+
+        // With estimate_api_cost = true: Both Bedrock and Anthropic are estimated (3.0 + 3.0 = 6.0)
+        let options_est = query_options(&hidden, true);
+        let stats_est = load_usage_range_scoped_with_options(
+            &path,
+            Mode::Daily,
+            Some(1_000),
+            Some(2_000),
+            true,
+            options_est,
+        )
+        .unwrap();
+        assert_eq!(stats_est.totals.api_estimated_messages, 2);
+        assert_eq!(stats_est.totals.unpriced_messages, 0);
+        assert!((stats_est.totals.cost - 6.0).abs() < 1e-6);
     }
 }

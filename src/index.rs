@@ -21,7 +21,7 @@ pub use query::{
     UsageQueryOptions,
 };
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SourceKind {
@@ -125,12 +125,15 @@ pub struct UsageEvent {
     pub output_tokens: i64,
     pub cache_read_tokens: i64,
     pub cache_write_tokens: i64,
+    pub cache_write_1h_tokens: i64,
     pub reasoning_tokens: i64,
     /// Source-reported total when available, otherwise the adapter's canonical
     /// non-overlapping total.
     pub total_tokens: i64,
     pub cost_microusd: Option<i64>,
     pub cost_kind: CostKind,
+    pub is_sidechain: bool,
+    pub has_detailed_cache: bool,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -189,6 +192,17 @@ impl UsageIndex {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn has_artifacts_for_kind(&self, kind: SourceKind) -> Result<bool> {
+        let count: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM artifacts
+             JOIN sources ON sources.id = artifacts.source_id
+             WHERE sources.kind = ?1",
+            [kind.key()],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
     }
 
     pub fn register_source(&self, source: &SourceRegistration) -> Result<i64> {
@@ -272,30 +286,24 @@ impl UsageIndex {
         let transaction = self.connection.transaction()?;
         let artifact_id = upsert_artifact(&transaction, source_id, artifact)?;
         let old_bounds = artifact_event_bounds(&transaction, artifact_id)?;
+        let old_keys = artifact_event_keys(&transaction, artifact_id)?;
 
         transaction.execute(
             "DELETE FROM artifact_events WHERE artifact_id = ?1",
             [artifact_id],
         )?;
+
+        let mut affected_keys: std::collections::HashSet<Vec<u8>> = old_keys.into_iter().collect();
         for event in events {
             validate_event(event)?;
-            let event_id = upsert_event(&transaction, source_id, event)?;
-            transaction.execute(
-                "INSERT OR IGNORE INTO artifact_events (artifact_id, event_id)
-                 VALUES (?1, ?2)",
-                params![artifact_id, event_id],
-            )?;
+            insert_artifact_event(&transaction, artifact_id, event, false)?;
+            affected_keys.insert(event.event_key.clone());
         }
 
-        transaction.execute(
-            "DELETE FROM usage_events
-             WHERE source_id = ?1
-               AND NOT EXISTS (
-                   SELECT 1 FROM artifact_events
-                   WHERE artifact_events.event_id = usage_events.id
-               )",
-            [source_id],
-        )?;
+        for event_key in &affected_keys {
+            recalculate_canonical_event(&transaction, source_id, event_key)?;
+        }
+
         transaction.execute(
             "UPDATE sources
              SET last_sync_ms = ?2, last_error = NULL
@@ -339,42 +347,38 @@ impl UsageIndex {
         let artifact_id = upsert_artifact(&transaction, source_id, artifact)?;
         let old_bounds = removed_event_bounds(&transaction, artifact_id, removals)?;
 
+        let is_claude: bool = transaction.query_row(
+            "SELECT kind = 'claude' FROM sources WHERE id = ?1",
+            [source_id],
+            |row| row.get(0),
+        )?;
+
+        let mut affected_keys: std::collections::HashSet<Vec<u8>> =
+            std::collections::HashSet::new();
+
         for event_key in removals {
-            transaction.execute(
+            let deleted = transaction.execute(
                 "DELETE FROM artifact_events
-                 WHERE artifact_id = ?1
-                   AND event_id IN (
-                       SELECT id FROM usage_events
-                       WHERE source_id = ?2 AND event_key = ?3
-                   )",
-                params![artifact_id, source_id, event_key],
+                 WHERE artifact_id = ?1 AND event_key = ?2",
+                params![artifact_id, event_key],
             )?;
+            if deleted > 0 {
+                affected_keys.insert(event_key.clone());
+            }
         }
-        let mut upsert_changed = false;
+
         for event in upserts {
             validate_event(event)?;
-            let event_id = match unchanged_event_id(&transaction, source_id, event)? {
-                Some(event_id) => event_id,
-                None => {
-                    upsert_changed = true;
-                    upsert_event(&transaction, source_id, event)?
-                }
-            };
-            transaction.execute(
-                "INSERT OR IGNORE INTO artifact_events (artifact_id, event_id)
-                 VALUES (?1, ?2)",
-                params![artifact_id, event_id],
-            )?;
+            let updated = insert_artifact_event(&transaction, artifact_id, event, is_claude)?;
+            if updated {
+                affected_keys.insert(event.event_key.clone());
+            }
         }
-        let removed_events = transaction.execute(
-            "DELETE FROM usage_events
-             WHERE source_id = ?1
-               AND NOT EXISTS (
-                   SELECT 1 FROM artifact_events
-                   WHERE artifact_events.event_id = usage_events.id
-               )",
-            [source_id],
-        )?;
+
+        for event_key in &affected_keys {
+            recalculate_canonical_event(&transaction, source_id, event_key)?;
+        }
+
         transaction.execute(
             "UPDATE sources
              SET last_sync_ms = ?2, last_error = NULL
@@ -382,7 +386,7 @@ impl UsageIndex {
             params![source_id, artifact.scanned_at_ms],
         )?;
 
-        let changed = upsert_changed || removed_events > 0;
+        let changed = !affected_keys.is_empty();
         if changed {
             transaction.execute(
                 "UPDATE index_state SET generation = generation + 1 WHERE id = 1",
@@ -444,17 +448,16 @@ impl UsageIndex {
             return Ok(None);
         };
         let old_bounds = artifact_event_bounds(&transaction, artifact_id)?;
+        let old_keys = artifact_event_keys(&transaction, artifact_id)?;
+
         transaction.execute("DELETE FROM artifacts WHERE id = ?1", [artifact_id])?;
-        let removed_events = transaction.execute(
-            "DELETE FROM usage_events
-             WHERE source_id = ?1
-               AND NOT EXISTS (
-                   SELECT 1 FROM artifact_events
-                   WHERE artifact_events.event_id = usage_events.id
-               )",
-            [source_id],
-        )?;
-        if removed_events > 0 {
+
+        for event_key in &old_keys {
+            recalculate_canonical_event(&transaction, source_id, event_key)?;
+        }
+
+        let changed = !old_keys.is_empty();
+        if changed {
             transaction.execute(
                 "UPDATE index_state SET generation = generation + 1 WHERE id = 1",
                 [],
@@ -466,7 +469,7 @@ impl UsageIndex {
             |row| row.get(0),
         )?;
         transaction.commit()?;
-        let (start_ms, end_ms) = if removed_events > 0 {
+        let (start_ms, end_ms) = if changed {
             merge_bounds(old_bounds, None)
         } else {
             (None, None)
@@ -481,22 +484,35 @@ impl UsageIndex {
     }
 
     pub fn diagnostics(&self) -> Result<IndexDiagnostics> {
+        let sources = table_count(&self.connection, "sources")?;
+        let artifacts = table_count(&self.connection, "artifacts")?;
+        let events = table_count(&self.connection, "usage_events")?;
+        let schema_version = schema_version(&self.connection)?;
+        let generation = self.connection.query_row(
+            "SELECT generation FROM index_state WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        let sqlite_version = self
+            .connection
+            .query_row("SELECT sqlite_version()", [], |row| row.get(0))?;
         Ok(IndexDiagnostics {
             path: self.path.clone(),
-            sqlite_version: self
-                .connection
-                .query_row("SELECT sqlite_version()", [], |row| row.get(0))?,
-            schema_version: schema_version(&self.connection)?,
-            generation: self.connection.query_row(
-                "SELECT generation FROM index_state WHERE id = 1",
-                [],
-                |row| row.get(0),
-            )?,
-            sources: table_count(&self.connection, "sources")?,
-            artifacts: table_count(&self.connection, "artifacts")?,
-            events: table_count(&self.connection, "usage_events")?,
+            sqlite_version,
+            schema_version,
+            generation,
+            sources,
+            artifacts,
+            events,
         })
     }
+}
+
+fn table_count(connection: &Connection, table: &str) -> Result<i64> {
+    let sql = format!("SELECT COUNT(*) FROM {table}");
+    connection
+        .query_row(&sql, [], |row| row.get(0))
+        .with_context(|| format!("counting {table}"))
 }
 
 pub fn project_id_for_worktree(worktree: &Path) -> String {
@@ -513,9 +529,12 @@ fn migrate(connection: &Connection) -> Result<()> {
     let version = schema_version(connection)?;
     if version > SCHEMA_VERSION {
         return Err(anyhow!(
-            "usage index schema {version} is newer than supported schema {SCHEMA_VERSION}"
+            "usage index schema version {} is newer than supported version {}",
+            version,
+            SCHEMA_VERSION
         ));
     }
+
     if version == 0 {
         connection.execute_batch(
             r#"
@@ -582,6 +601,9 @@ fn migrate(connection: &Connection) -> Result<()> {
                 output_tokens INTEGER NOT NULL CHECK (output_tokens >= 0),
                 cache_read_tokens INTEGER NOT NULL CHECK (cache_read_tokens >= 0),
                 cache_write_tokens INTEGER NOT NULL CHECK (cache_write_tokens >= 0),
+                cache_write_1h_tokens INTEGER NOT NULL DEFAULT 0 CHECK (
+                    cache_write_1h_tokens >= 0 AND cache_write_1h_tokens <= cache_write_tokens
+                ),
                 reasoning_tokens INTEGER NOT NULL CHECK (reasoning_tokens >= 0),
                 total_tokens INTEGER NOT NULL CHECK (total_tokens >= 0),
                 cost_microusd INTEGER,
@@ -598,10 +620,31 @@ fn migrate(connection: &Connection) -> Result<()> {
 
             CREATE TABLE artifact_events (
                 artifact_id INTEGER NOT NULL REFERENCES artifacts(id) ON DELETE CASCADE,
-                event_id INTEGER NOT NULL REFERENCES usage_events(id) ON DELETE CASCADE,
-                PRIMARY KEY (artifact_id, event_id)
+                event_key BLOB NOT NULL,
+                occurred_at_ms INTEGER NOT NULL,
+                project_id TEXT REFERENCES projects(id) ON DELETE SET NULL,
+                provider TEXT NOT NULL,
+                model TEXT NOT NULL,
+                variant TEXT NOT NULL,
+                messages INTEGER NOT NULL CHECK (messages >= 0),
+                input_tokens INTEGER NOT NULL CHECK (input_tokens >= 0),
+                output_tokens INTEGER NOT NULL CHECK (output_tokens >= 0),
+                cache_read_tokens INTEGER NOT NULL CHECK (cache_read_tokens >= 0),
+                cache_write_tokens INTEGER NOT NULL CHECK (cache_write_tokens >= 0),
+                cache_write_1h_tokens INTEGER NOT NULL DEFAULT 0 CHECK (
+                    cache_write_1h_tokens >= 0 AND cache_write_1h_tokens <= cache_write_tokens
+                ),
+                reasoning_tokens INTEGER NOT NULL CHECK (reasoning_tokens >= 0),
+                total_tokens INTEGER NOT NULL CHECK (total_tokens >= 0),
+                cost_microusd INTEGER,
+                cost_kind TEXT NOT NULL CHECK (
+                    cost_kind IN ('reported', 'estimated', 'unavailable')
+                ),
+                is_sidechain INTEGER NOT NULL DEFAULT 0 CHECK (is_sidechain IN (0, 1)),
+                has_detailed_cache INTEGER NOT NULL DEFAULT 0 CHECK (has_detailed_cache IN (0, 1)),
+                PRIMARY KEY (artifact_id, event_key)
             ) STRICT, WITHOUT ROWID;
-            CREATE INDEX artifact_events_event_id ON artifact_events(event_id);
+            CREATE INDEX artifact_events_key ON artifact_events(event_key);
 
             CREATE TABLE usage_buckets (
                 id INTEGER PRIMARY KEY,
@@ -619,6 +662,9 @@ fn migrate(connection: &Connection) -> Result<()> {
                 output_tokens INTEGER NOT NULL DEFAULT 0 CHECK (output_tokens >= 0),
                 cache_read_tokens INTEGER NOT NULL DEFAULT 0 CHECK (cache_read_tokens >= 0),
                 cache_write_tokens INTEGER NOT NULL DEFAULT 0 CHECK (cache_write_tokens >= 0),
+                cache_write_1h_tokens INTEGER NOT NULL DEFAULT 0 CHECK (
+                    cache_write_1h_tokens >= 0 AND cache_write_1h_tokens <= cache_write_tokens
+                ),
                 reasoning_tokens INTEGER NOT NULL DEFAULT 0 CHECK (reasoning_tokens >= 0),
                 total_tokens INTEGER NOT NULL DEFAULT 0 CHECK (total_tokens >= 0),
                 cost_microusd INTEGER,
@@ -629,7 +675,7 @@ fn migrate(connection: &Connection) -> Result<()> {
             ) STRICT;
             CREATE INDEX usage_buckets_range ON usage_buckets(start_ms, end_ms);
 
-            PRAGMA user_version = 3;
+            PRAGMA user_version = 4;
             COMMIT;
             "#,
         )?;
@@ -648,6 +694,64 @@ fn migrate(connection: &Connection) -> Result<()> {
                  CREATE INDEX IF NOT EXISTS artifact_events_event_id
                      ON artifact_events(event_id);
                  PRAGMA user_version = 3;
+                 COMMIT;",
+            )?;
+        }
+        if schema_version(connection)? == 3 {
+            connection.execute_batch(
+                "BEGIN IMMEDIATE;
+                 CREATE TABLE artifact_events_new (
+                     artifact_id INTEGER NOT NULL REFERENCES artifacts(id) ON DELETE CASCADE,
+                     event_key BLOB NOT NULL,
+                     occurred_at_ms INTEGER NOT NULL,
+                     project_id TEXT REFERENCES projects(id) ON DELETE SET NULL,
+                     provider TEXT NOT NULL,
+                     model TEXT NOT NULL,
+                     variant TEXT NOT NULL,
+                     messages INTEGER NOT NULL CHECK (messages >= 0),
+                     input_tokens INTEGER NOT NULL CHECK (input_tokens >= 0),
+                     output_tokens INTEGER NOT NULL CHECK (output_tokens >= 0),
+                     cache_read_tokens INTEGER NOT NULL CHECK (cache_read_tokens >= 0),
+                     cache_write_tokens INTEGER NOT NULL CHECK (cache_write_tokens >= 0),
+                     cache_write_1h_tokens INTEGER NOT NULL DEFAULT 0 CHECK (
+                         cache_write_1h_tokens >= 0 AND cache_write_1h_tokens <= cache_write_tokens
+                     ),
+                     reasoning_tokens INTEGER NOT NULL CHECK (reasoning_tokens >= 0),
+                     total_tokens INTEGER NOT NULL CHECK (total_tokens >= 0),
+                     cost_microusd INTEGER,
+                     cost_kind TEXT NOT NULL CHECK (
+                         cost_kind IN ('reported', 'estimated', 'unavailable')
+                     ),
+                     is_sidechain INTEGER NOT NULL DEFAULT 0 CHECK (is_sidechain IN (0, 1)),
+                     has_detailed_cache INTEGER NOT NULL DEFAULT 0 CHECK (has_detailed_cache IN (0, 1)),
+                     PRIMARY KEY (artifact_id, event_key)
+                 ) STRICT, WITHOUT ROWID;
+
+                 INSERT INTO artifact_events_new (
+                     artifact_id, event_key, occurred_at_ms, project_id, provider, model,
+                     variant, messages, input_tokens, output_tokens, cache_read_tokens,
+                     cache_write_tokens, cache_write_1h_tokens, reasoning_tokens, total_tokens,
+                     cost_microusd, cost_kind, is_sidechain, has_detailed_cache
+                 )
+                 SELECT
+                     ae.artifact_id, ue.event_key, ue.occurred_at_ms, ue.project_id, ue.provider, ue.model,
+                     ue.variant, ue.messages, ue.input_tokens, ue.output_tokens, ue.cache_read_tokens,
+                     ue.cache_write_tokens, 0, ue.reasoning_tokens, ue.total_tokens,
+                     ue.cost_microusd, ue.cost_kind, 0, 0
+                 FROM artifact_events ae
+                 JOIN usage_events ue ON ue.id = ae.event_id;
+
+                 DROP TABLE artifact_events;
+                 ALTER TABLE artifact_events_new RENAME TO artifact_events;
+                 CREATE INDEX artifact_events_key ON artifact_events(event_key);
+
+                 ALTER TABLE usage_events ADD COLUMN cache_write_1h_tokens INTEGER NOT NULL DEFAULT 0 CHECK (
+                     cache_write_1h_tokens >= 0 AND cache_write_1h_tokens <= cache_write_tokens
+                 );
+                 ALTER TABLE usage_buckets ADD COLUMN cache_write_1h_tokens INTEGER NOT NULL DEFAULT 0 CHECK (
+                     cache_write_1h_tokens >= 0 AND cache_write_1h_tokens <= cache_write_tokens
+                 );
+                 PRAGMA user_version = 4;
                  COMMIT;",
             )?;
         }
@@ -705,17 +809,344 @@ fn upsert_artifact(
         .context("upserting source artifact")
 }
 
-fn upsert_event(transaction: &Transaction<'_>, source_id: i64, event: &UsageEvent) -> Result<i64> {
+fn insert_artifact_event(
+    transaction: &Transaction<'_>,
+    artifact_id: i64,
+    event: &UsageEvent,
+    is_claude: bool,
+) -> Result<bool> {
+    if is_claude {
+        let existing: Option<UsageEvent> = transaction
+            .query_row(
+                "SELECT occurred_at_ms, project_id, provider, model, variant,
+                        messages, input_tokens, output_tokens, cache_read_tokens,
+                        cache_write_tokens, cache_write_1h_tokens, reasoning_tokens,
+                        total_tokens, cost_microusd, cost_kind, is_sidechain, has_detailed_cache
+                 FROM artifact_events
+                 WHERE artifact_id = ?1 AND event_key = ?2",
+                params![artifact_id, event.event_key],
+                |row| {
+                    let cost_kind_str: String = row.get(14)?;
+                    let cost_kind = match cost_kind_str.as_str() {
+                        "reported" => CostKind::Reported,
+                        "estimated" => CostKind::Estimated,
+                        _ => CostKind::Unavailable,
+                    };
+                    Ok(UsageEvent {
+                        event_key: event.event_key.clone(),
+                        occurred_at_ms: row.get(0)?,
+                        project_id: row.get(1)?,
+                        provider: row.get(2)?,
+                        model: row.get(3)?,
+                        variant: row.get(4)?,
+                        messages: row.get(5)?,
+                        input_tokens: row.get(6)?,
+                        output_tokens: row.get(7)?,
+                        cache_read_tokens: row.get(8)?,
+                        cache_write_tokens: row.get(9)?,
+                        cache_write_1h_tokens: row.get(10)?,
+                        reasoning_tokens: row.get(11)?,
+                        total_tokens: row.get(12)?,
+                        cost_microusd: row.get(13)?,
+                        cost_kind,
+                        is_sidechain: row.get::<_, i64>(15)? != 0,
+                        has_detailed_cache: row.get::<_, i64>(16)? != 0,
+                    })
+                },
+            )
+            .optional()?;
+
+        if let Some(existing_event) = existing {
+            let candidates = vec![existing_event.clone(), event.clone()];
+            let merged = canonicalize_events(&candidates).unwrap_or_else(|| event.clone());
+            if merged == existing_event {
+                return Ok(false);
+            }
+            let rows_affected = transaction.execute(
+                "UPDATE artifact_events SET
+                    occurred_at_ms = ?3,
+                    project_id = ?4,
+                    provider = ?5,
+                    model = ?6,
+                    variant = ?7,
+                    messages = ?8,
+                    input_tokens = ?9,
+                    output_tokens = ?10,
+                    cache_read_tokens = ?11,
+                    cache_write_tokens = ?12,
+                    cache_write_1h_tokens = ?13,
+                    reasoning_tokens = ?14,
+                    total_tokens = ?15,
+                    cost_microusd = ?16,
+                    cost_kind = ?17,
+                    is_sidechain = ?18,
+                    has_detailed_cache = ?19
+                 WHERE artifact_id = ?1 AND event_key = ?2",
+                params![
+                    artifact_id,
+                    merged.event_key,
+                    merged.occurred_at_ms,
+                    merged.project_id,
+                    merged.provider,
+                    merged.model,
+                    merged.variant,
+                    merged.messages,
+                    merged.input_tokens,
+                    merged.output_tokens,
+                    merged.cache_read_tokens,
+                    merged.cache_write_tokens,
+                    merged.cache_write_1h_tokens,
+                    merged.reasoning_tokens,
+                    merged.total_tokens,
+                    merged.cost_microusd,
+                    merged.cost_kind.key(),
+                    if merged.is_sidechain { 1 } else { 0 },
+                    if merged.has_detailed_cache { 1 } else { 0 },
+                ],
+            )?;
+            return Ok(rows_affected > 0);
+        }
+    }
+
+    let rows_affected = transaction.execute(
+        "INSERT INTO artifact_events (
+            artifact_id, event_key, occurred_at_ms, project_id, provider, model,
+            variant, messages, input_tokens, output_tokens, cache_read_tokens,
+            cache_write_tokens, cache_write_1h_tokens, reasoning_tokens, total_tokens,
+            cost_microusd, cost_kind, is_sidechain, has_detailed_cache
+         ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+            ?14, ?15, ?16, ?17, ?18, ?19
+         )
+         ON CONFLICT(artifact_id, event_key) DO UPDATE SET
+            occurred_at_ms = excluded.occurred_at_ms,
+            project_id = excluded.project_id,
+            provider = excluded.provider,
+            model = excluded.model,
+            variant = excluded.variant,
+            messages = excluded.messages,
+            input_tokens = excluded.input_tokens,
+            output_tokens = excluded.output_tokens,
+            cache_read_tokens = excluded.cache_read_tokens,
+            cache_write_tokens = excluded.cache_write_tokens,
+            cache_write_1h_tokens = excluded.cache_write_1h_tokens,
+            reasoning_tokens = excluded.reasoning_tokens,
+            total_tokens = excluded.total_tokens,
+            cost_microusd = excluded.cost_microusd,
+            cost_kind = excluded.cost_kind,
+            is_sidechain = excluded.is_sidechain,
+            has_detailed_cache = excluded.has_detailed_cache
+         WHERE
+            artifact_events.occurred_at_ms IS NOT excluded.occurred_at_ms
+            OR artifact_events.project_id IS NOT excluded.project_id
+            OR artifact_events.provider IS NOT excluded.provider
+            OR artifact_events.model IS NOT excluded.model
+            OR artifact_events.variant IS NOT excluded.variant
+            OR artifact_events.messages IS NOT excluded.messages
+            OR artifact_events.input_tokens IS NOT excluded.input_tokens
+            OR artifact_events.output_tokens IS NOT excluded.output_tokens
+            OR artifact_events.cache_read_tokens IS NOT excluded.cache_read_tokens
+            OR artifact_events.cache_write_tokens IS NOT excluded.cache_write_tokens
+            OR artifact_events.cache_write_1h_tokens IS NOT excluded.cache_write_1h_tokens
+            OR artifact_events.reasoning_tokens IS NOT excluded.reasoning_tokens
+            OR artifact_events.total_tokens IS NOT excluded.total_tokens
+            OR artifact_events.cost_microusd IS NOT excluded.cost_microusd
+            OR artifact_events.cost_kind IS NOT excluded.cost_kind
+            OR artifact_events.is_sidechain IS NOT excluded.is_sidechain
+            OR artifact_events.has_detailed_cache IS NOT excluded.has_detailed_cache",
+        params![
+            artifact_id,
+            event.event_key,
+            event.occurred_at_ms,
+            event.project_id,
+            event.provider,
+            event.model,
+            event.variant,
+            event.messages,
+            event.input_tokens,
+            event.output_tokens,
+            event.cache_read_tokens,
+            event.cache_write_tokens,
+            event.cache_write_1h_tokens,
+            event.reasoning_tokens,
+            event.total_tokens,
+            event.cost_microusd,
+            event.cost_kind.key(),
+            if event.is_sidechain { 1 } else { 0 },
+            if event.has_detailed_cache { 1 } else { 0 },
+        ],
+    )?;
+    Ok(rows_affected > 0)
+}
+
+fn canonicalize_events(candidates: &[UsageEvent]) -> Option<UsageEvent> {
+    if candidates.is_empty() {
+        return None;
+    }
+    let mut winner = candidates[0].clone();
+    for candidate in &candidates[1..] {
+        let prefer_candidate = if candidate.total_tokens != winner.total_tokens {
+            candidate.total_tokens > winner.total_tokens
+        } else if candidate.has_detailed_cache != winner.has_detailed_cache {
+            candidate.has_detailed_cache
+        } else if candidate.is_sidechain != winner.is_sidechain {
+            !candidate.is_sidechain
+        } else {
+            // SQLite does not promise row order. Keep equal-priority snapshots
+            // stable when their artifact insertion order changes.
+            event_stable_key(candidate) < event_stable_key(&winner)
+        };
+
+        if prefer_candidate {
+            winner = candidate.clone();
+        }
+    }
+
+    let reported_candidates: Vec<&UsageEvent> = candidates
+        .iter()
+        .filter(|c| c.cost_kind == CostKind::Reported && c.cost_microusd.is_some())
+        .collect();
+
+    if !reported_candidates.is_empty() {
+        if winner.cost_kind == CostKind::Reported && winner.cost_microusd.is_some() {
+            // winner already has a reported cost, retain it
+        } else {
+            let best_reported = reported_candidates
+                .iter()
+                .max_by(|left, right| {
+                    left.cost_microusd
+                        .cmp(&right.cost_microusd)
+                        .then_with(|| left.total_tokens.cmp(&right.total_tokens))
+                        .then_with(|| right.occurred_at_ms.cmp(&left.occurred_at_ms))
+                        .then_with(|| event_stable_key(left).cmp(&event_stable_key(right)))
+                })
+                .unwrap();
+            winner.cost_microusd = best_reported.cost_microusd;
+            winner.cost_kind = CostKind::Reported;
+        }
+    }
+
+    let is_bedrock = candidates.iter().any(|c| c.provider == "amazon-bedrock");
+    let project_id = winner.project_id.or_else(|| {
+        candidates
+            .iter()
+            .filter_map(|candidate| candidate.project_id.as_ref())
+            .min()
+            .cloned()
+    });
+
+    if is_bedrock {
+        winner.provider = "amazon-bedrock".to_string();
+    }
+    winner.project_id = project_id;
+
+    Some(winner)
+}
+
+type EventStableKey<'a> = (
+    (&'a str, &'a str, &'a str, Option<&'a str>),
+    (i64, i64, i64, i64, i64, i64, i64, i64),
+    (Option<i64>, &'a str, bool, bool),
+);
+
+fn event_stable_key(event: &UsageEvent) -> EventStableKey<'_> {
+    (
+        (
+            &event.provider,
+            &event.model,
+            &event.variant,
+            event.project_id.as_deref(),
+        ),
+        (
+            event.occurred_at_ms,
+            event.messages,
+            event.input_tokens,
+            event.output_tokens,
+            event.cache_read_tokens,
+            event.cache_write_tokens,
+            event.cache_write_1h_tokens,
+            event.reasoning_tokens,
+        ),
+        (
+            event.cost_microusd,
+            event.cost_kind.key(),
+            event.is_sidechain,
+            event.has_detailed_cache,
+        ),
+    )
+}
+
+fn recalculate_canonical_event(
+    transaction: &Transaction<'_>,
+    source_id: i64,
+    event_key: &[u8],
+) -> Result<()> {
+    let mut stmt = transaction.prepare(
+        "SELECT ae.occurred_at_ms, ae.project_id, ae.provider, ae.model, ae.variant,
+                ae.messages, ae.input_tokens, ae.output_tokens, ae.cache_read_tokens,
+                ae.cache_write_tokens, ae.cache_write_1h_tokens, ae.reasoning_tokens,
+                ae.total_tokens, ae.cost_microusd, ae.cost_kind, ae.is_sidechain, ae.has_detailed_cache
+         FROM artifact_events ae
+         JOIN artifacts a ON a.id = ae.artifact_id
+         WHERE a.source_id = ?1 AND ae.event_key = ?2",
+    )?;
+    let candidates: Vec<UsageEvent> = stmt
+        .query_map(params![source_id, event_key], |row| {
+            let cost_kind_str: String = row.get(14)?;
+            let cost_kind = match cost_kind_str.as_str() {
+                "reported" => CostKind::Reported,
+                "estimated" => CostKind::Estimated,
+                _ => CostKind::Unavailable,
+            };
+            Ok(UsageEvent {
+                event_key: event_key.to_vec(),
+                occurred_at_ms: row.get(0)?,
+                project_id: row.get(1)?,
+                provider: row.get(2)?,
+                model: row.get(3)?,
+                variant: row.get(4)?,
+                messages: row.get(5)?,
+                input_tokens: row.get(6)?,
+                output_tokens: row.get(7)?,
+                cache_read_tokens: row.get(8)?,
+                cache_write_tokens: row.get(9)?,
+                cache_write_1h_tokens: row.get(10)?,
+                reasoning_tokens: row.get(11)?,
+                total_tokens: row.get(12)?,
+                cost_microusd: row.get(13)?,
+                cost_kind,
+                is_sidechain: row.get::<_, i64>(15)? != 0,
+                has_detailed_cache: row.get::<_, i64>(16)? != 0,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    if candidates.is_empty() {
+        transaction.execute(
+            "DELETE FROM usage_events WHERE source_id = ?1 AND event_key = ?2",
+            params![source_id, event_key],
+        )?;
+    } else if let Some(winner) = canonicalize_events(&candidates) {
+        upsert_canonical_usage_event(transaction, source_id, &winner)?;
+    }
+    Ok(())
+}
+
+fn upsert_canonical_usage_event(
+    transaction: &Transaction<'_>,
+    source_id: i64,
+    event: &UsageEvent,
+) -> Result<i64> {
     transaction
         .query_row(
             "INSERT INTO usage_events (
                 source_id, event_key, occurred_at_ms, project_id, provider, model,
                 variant, messages, input_tokens, output_tokens, cache_read_tokens,
-                cache_write_tokens, reasoning_tokens, total_tokens, cost_microusd,
+                cache_write_tokens, cache_write_1h_tokens, reasoning_tokens, total_tokens, cost_microusd,
                 cost_kind
              ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                ?14, ?15, ?16
+                ?14, ?15, ?16, ?17
              )
              ON CONFLICT(source_id, event_key) DO UPDATE SET
                 occurred_at_ms = excluded.occurred_at_ms,
@@ -728,10 +1159,27 @@ fn upsert_event(transaction: &Transaction<'_>, source_id: i64, event: &UsageEven
                 output_tokens = excluded.output_tokens,
                 cache_read_tokens = excluded.cache_read_tokens,
                 cache_write_tokens = excluded.cache_write_tokens,
+                cache_write_1h_tokens = excluded.cache_write_1h_tokens,
                 reasoning_tokens = excluded.reasoning_tokens,
                 total_tokens = excluded.total_tokens,
                 cost_microusd = excluded.cost_microusd,
                 cost_kind = excluded.cost_kind
+             WHERE
+                usage_events.occurred_at_ms IS NOT excluded.occurred_at_ms
+                OR usage_events.project_id IS NOT excluded.project_id
+                OR usage_events.provider IS NOT excluded.provider
+                OR usage_events.model IS NOT excluded.model
+                OR usage_events.variant IS NOT excluded.variant
+                OR usage_events.messages IS NOT excluded.messages
+                OR usage_events.input_tokens IS NOT excluded.input_tokens
+                OR usage_events.output_tokens IS NOT excluded.output_tokens
+                OR usage_events.cache_read_tokens IS NOT excluded.cache_read_tokens
+                OR usage_events.cache_write_tokens IS NOT excluded.cache_write_tokens
+                OR usage_events.cache_write_1h_tokens IS NOT excluded.cache_write_1h_tokens
+                OR usage_events.reasoning_tokens IS NOT excluded.reasoning_tokens
+                OR usage_events.total_tokens IS NOT excluded.total_tokens
+                OR usage_events.cost_microusd IS NOT excluded.cost_microusd
+                OR usage_events.cost_kind IS NOT excluded.cost_kind
              RETURNING id",
             params![
                 source_id,
@@ -746,6 +1194,7 @@ fn upsert_event(transaction: &Transaction<'_>, source_id: i64, event: &UsageEven
                 event.output_tokens,
                 event.cache_read_tokens,
                 event.cache_write_tokens,
+                event.cache_write_1h_tokens,
                 event.reasoning_tokens,
                 event.total_tokens,
                 event.cost_microusd,
@@ -753,55 +1202,15 @@ fn upsert_event(transaction: &Transaction<'_>, source_id: i64, event: &UsageEven
             ],
             |row| row.get(0),
         )
-        .context("upserting usage event")
-}
-
-fn unchanged_event_id(
-    transaction: &Transaction<'_>,
-    source_id: i64,
-    event: &UsageEvent,
-) -> Result<Option<i64>> {
-    transaction
-        .query_row(
-            "SELECT id FROM usage_events
-             WHERE source_id = ?1
-               AND event_key = ?2
-               AND occurred_at_ms = ?3
-               AND project_id IS ?4
-               AND provider = ?5
-               AND model = ?6
-               AND variant = ?7
-               AND messages = ?8
-               AND input_tokens = ?9
-               AND output_tokens = ?10
-               AND cache_read_tokens = ?11
-               AND cache_write_tokens = ?12
-               AND reasoning_tokens = ?13
-               AND total_tokens = ?14
-               AND cost_microusd IS ?15
-               AND cost_kind = ?16",
-            params![
-                source_id,
-                event.event_key,
-                event.occurred_at_ms,
-                event.project_id,
-                event.provider,
-                event.model,
-                event.variant,
-                event.messages,
-                event.input_tokens,
-                event.output_tokens,
-                event.cache_read_tokens,
-                event.cache_write_tokens,
-                event.reasoning_tokens,
-                event.total_tokens,
-                event.cost_microusd,
-                event.cost_kind.key(),
-            ],
-            |row| row.get(0),
-        )
-        .optional()
-        .context("comparing indexed usage event")
+        .or_else(|err| match err {
+            rusqlite::Error::QueryReturnedNoRows => transaction.query_row(
+                "SELECT id FROM usage_events WHERE source_id = ?1 AND event_key = ?2",
+                params![source_id, event.event_key],
+                |row| row.get(0),
+            ),
+            other => Err(other),
+        })
+        .context("upserting canonical usage event")
 }
 
 fn validate_event(event: &UsageEvent) -> Result<()> {
@@ -814,12 +1223,20 @@ fn validate_event(event: &UsageEvent) -> Result<()> {
         ("output tokens", event.output_tokens),
         ("cache read tokens", event.cache_read_tokens),
         ("cache write tokens", event.cache_write_tokens),
+        ("cache write 1h tokens", event.cache_write_1h_tokens),
         ("reasoning tokens", event.reasoning_tokens),
         ("total tokens", event.total_tokens),
     ] {
         if value < 0 {
             return Err(anyhow!("usage event {name} must not be negative"));
         }
+    }
+    if event.cache_write_1h_tokens > event.cache_write_tokens {
+        return Err(anyhow!(
+            "cache write 1h tokens ({}) must not exceed cache write tokens ({})",
+            event.cache_write_1h_tokens,
+            event.cache_write_tokens
+        ));
     }
     Ok(())
 }
@@ -830,10 +1247,9 @@ fn artifact_event_bounds(
 ) -> Result<Option<(i64, i64)>> {
     transaction
         .query_row(
-            "SELECT MIN(usage_events.occurred_at_ms), MAX(usage_events.occurred_at_ms)
-             FROM usage_events
-             JOIN artifact_events ON artifact_events.event_id = usage_events.id
-             WHERE artifact_events.artifact_id = ?1",
+            "SELECT MIN(occurred_at_ms), MAX(occurred_at_ms)
+             FROM artifact_events
+             WHERE artifact_id = ?1",
             [artifact_id],
             |row| {
                 let start: Option<i64> = row.get(0)?;
@@ -842,6 +1258,14 @@ fn artifact_event_bounds(
             },
         )
         .context("reading previous artifact event range")
+}
+
+fn artifact_event_keys(transaction: &Transaction<'_>, artifact_id: i64) -> Result<Vec<Vec<u8>>> {
+    let mut stmt =
+        transaction.prepare("SELECT event_key FROM artifact_events WHERE artifact_id = ?1")?;
+    let rows = stmt.query_map([artifact_id], |row| row.get(0))?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("listing artifact event keys")
 }
 
 fn removed_event_bounds(
@@ -853,11 +1277,10 @@ fn removed_event_bounds(
     for event_key in event_keys {
         let event_time = transaction
             .query_row(
-                "SELECT usage_events.occurred_at_ms
-                 FROM usage_events
-                 JOIN artifact_events ON artifact_events.event_id = usage_events.id
-                 WHERE artifact_events.artifact_id = ?1
-                   AND usage_events.event_key = ?2",
+                "SELECT occurred_at_ms
+                 FROM artifact_events
+                 WHERE artifact_id = ?1
+                   AND event_key = ?2",
                 params![artifact_id, event_key],
                 |row| row.get::<_, i64>(0),
             )
@@ -889,13 +1312,6 @@ fn merge_bounds(left: Option<(i64, i64)>, right: Option<(i64, i64)>) -> (Option<
         }
         (None, None) => (None, None),
     }
-}
-
-fn table_count(connection: &Connection, table: &str) -> Result<i64> {
-    let sql = format!("SELECT COUNT(*) FROM {table}");
-    connection
-        .query_row(&sql, [], |row| row.get(0))
-        .with_context(|| format!("counting {table}"))
 }
 
 #[cfg(test)]
@@ -948,10 +1364,13 @@ mod tests {
             output_tokens: 20,
             cache_read_tokens: 30,
             cache_write_tokens: 0,
+            cache_write_1h_tokens: 0,
             reasoning_tokens: 5,
             total_tokens: 60,
             cost_microusd: None,
             cost_kind: CostKind::Unavailable,
+            is_sidechain: false,
+            has_detailed_cache: false,
         }
     }
 
@@ -960,7 +1379,7 @@ mod tests {
         let (_directory, index) = index();
         let diagnostics = index.diagnostics().unwrap();
 
-        assert_eq!(diagnostics.schema_version, 3);
+        assert_eq!(diagnostics.schema_version, 4);
         assert_eq!(diagnostics.generation, 0);
         assert_eq!(diagnostics.events, 0);
         let journal_mode: String = index
@@ -976,26 +1395,186 @@ mod tests {
         index
             .connection
             .execute_batch(
-                "DROP INDEX artifact_events_event_id;
+                "DROP TABLE artifact_events;
+                 DROP TABLE usage_events;
+                 DROP TABLE usage_buckets;
+                 CREATE TABLE usage_events (
+                     id INTEGER PRIMARY KEY,
+                     source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                     event_key BLOB NOT NULL,
+                     occurred_at_ms INTEGER NOT NULL,
+                     project_id TEXT REFERENCES projects(id) ON DELETE SET NULL,
+                     provider TEXT NOT NULL,
+                     model TEXT NOT NULL,
+                     variant TEXT NOT NULL,
+                     messages INTEGER NOT NULL CHECK (messages >= 0),
+                     input_tokens INTEGER NOT NULL CHECK (input_tokens >= 0),
+                     output_tokens INTEGER NOT NULL CHECK (output_tokens >= 0),
+                     cache_read_tokens INTEGER NOT NULL CHECK (cache_read_tokens >= 0),
+                     cache_write_tokens INTEGER NOT NULL CHECK (cache_write_tokens >= 0),
+                     reasoning_tokens INTEGER NOT NULL CHECK (reasoning_tokens >= 0),
+                     total_tokens INTEGER NOT NULL CHECK (total_tokens >= 0),
+                     cost_microusd INTEGER,
+                     cost_kind TEXT NOT NULL CHECK (
+                         cost_kind IN ('reported', 'estimated', 'unavailable')
+                     ),
+                     UNIQUE (source_id, event_key)
+                 ) STRICT;
+                 CREATE TABLE artifact_events (
+                     artifact_id INTEGER NOT NULL REFERENCES artifacts(id) ON DELETE CASCADE,
+                     event_id INTEGER NOT NULL REFERENCES usage_events(id) ON DELETE CASCADE,
+                     PRIMARY KEY (artifact_id, event_id)
+                 ) STRICT, WITHOUT ROWID;
+                 CREATE TABLE usage_buckets (
+                     id INTEGER PRIMARY KEY,
+                     source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                     bucket_key BLOB NOT NULL,
+                     scope TEXT NOT NULL CHECK (scope IN ('local', 'account')),
+                     granularity TEXT NOT NULL,
+                     start_ms INTEGER NOT NULL,
+                     end_ms INTEGER NOT NULL CHECK (end_ms > start_ms),
+                     project_id TEXT REFERENCES projects(id) ON DELETE SET NULL,
+                     provider TEXT,
+                     model TEXT,
+                     messages INTEGER NOT NULL DEFAULT 0 CHECK (messages >= 0),
+                     input_tokens INTEGER NOT NULL DEFAULT 0 CHECK (input_tokens >= 0),
+                     output_tokens INTEGER NOT NULL DEFAULT 0 CHECK (output_tokens >= 0),
+                     cache_read_tokens INTEGER NOT NULL DEFAULT 0 CHECK (cache_read_tokens >= 0),
+                     cache_write_tokens INTEGER NOT NULL DEFAULT 0 CHECK (cache_write_tokens >= 0),
+                     reasoning_tokens INTEGER NOT NULL DEFAULT 0 CHECK (reasoning_tokens >= 0),
+                     total_tokens INTEGER NOT NULL DEFAULT 0 CHECK (total_tokens >= 0),
+                     cost_microusd INTEGER,
+                     cost_kind TEXT NOT NULL CHECK (
+                         cost_kind IN ('reported', 'estimated', 'unavailable')
+                     ),
+                     UNIQUE (source_id, bucket_key)
+                 ) STRICT;
                  PRAGMA user_version = 2;",
             )
             .unwrap();
 
         migrate(&index.connection).unwrap();
 
-        assert_eq!(schema_version(&index.connection).unwrap(), 3);
+        assert_eq!(schema_version(&index.connection).unwrap(), 4);
         let index_exists: bool = index
             .connection
             .query_row(
                 "SELECT EXISTS(
                     SELECT 1 FROM sqlite_master
-                    WHERE type = 'index' AND name = 'artifact_events_event_id'
+                    WHERE type = 'index' AND name = 'artifact_events_key'
                  )",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
         assert!(index_exists);
+    }
+
+    #[test]
+    fn migrates_version_three_indexes_for_cache_durations() {
+        let (_directory, index) = index();
+        index
+            .connection
+            .execute_batch(
+                "DROP TABLE artifact_events;
+                 DROP TABLE usage_events;
+                 DROP TABLE usage_buckets;
+                 CREATE TABLE usage_events (
+                     id INTEGER PRIMARY KEY,
+                     source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                     event_key BLOB NOT NULL,
+                     occurred_at_ms INTEGER NOT NULL,
+                     project_id TEXT REFERENCES projects(id) ON DELETE SET NULL,
+                     provider TEXT NOT NULL,
+                     model TEXT NOT NULL,
+                     variant TEXT NOT NULL,
+                     messages INTEGER NOT NULL CHECK (messages >= 0),
+                     input_tokens INTEGER NOT NULL CHECK (input_tokens >= 0),
+                     output_tokens INTEGER NOT NULL CHECK (output_tokens >= 0),
+                     cache_read_tokens INTEGER NOT NULL CHECK (cache_read_tokens >= 0),
+                     cache_write_tokens INTEGER NOT NULL CHECK (cache_write_tokens >= 0),
+                     reasoning_tokens INTEGER NOT NULL CHECK (reasoning_tokens >= 0),
+                     total_tokens INTEGER NOT NULL CHECK (total_tokens >= 0),
+                     cost_microusd INTEGER,
+                     cost_kind TEXT NOT NULL CHECK (
+                         cost_kind IN ('reported', 'estimated', 'unavailable')
+                     ),
+                     UNIQUE (source_id, event_key)
+                 ) STRICT;
+                 CREATE TABLE artifact_events (
+                     artifact_id INTEGER NOT NULL REFERENCES artifacts(id) ON DELETE CASCADE,
+                     event_id INTEGER NOT NULL REFERENCES usage_events(id) ON DELETE CASCADE,
+                     PRIMARY KEY (artifact_id, event_id)
+                 ) STRICT, WITHOUT ROWID;
+                 CREATE INDEX artifact_events_event_id ON artifact_events(event_id);
+                 CREATE TABLE usage_buckets (
+                     id INTEGER PRIMARY KEY,
+                     source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                     bucket_key BLOB NOT NULL,
+                     scope TEXT NOT NULL CHECK (scope IN ('local', 'account')),
+                     granularity TEXT NOT NULL,
+                     start_ms INTEGER NOT NULL,
+                     end_ms INTEGER NOT NULL CHECK (end_ms > start_ms),
+                     project_id TEXT REFERENCES projects(id) ON DELETE SET NULL,
+                     provider TEXT,
+                     model TEXT,
+                     messages INTEGER NOT NULL DEFAULT 0 CHECK (messages >= 0),
+                     input_tokens INTEGER NOT NULL DEFAULT 0 CHECK (input_tokens >= 0),
+                     output_tokens INTEGER NOT NULL DEFAULT 0 CHECK (output_tokens >= 0),
+                     cache_read_tokens INTEGER NOT NULL DEFAULT 0 CHECK (cache_read_tokens >= 0),
+                     cache_write_tokens INTEGER NOT NULL DEFAULT 0 CHECK (cache_write_tokens >= 0),
+                     reasoning_tokens INTEGER NOT NULL DEFAULT 0 CHECK (reasoning_tokens >= 0),
+                     total_tokens INTEGER NOT NULL DEFAULT 0 CHECK (total_tokens >= 0),
+                     cost_microusd INTEGER,
+                     cost_kind TEXT NOT NULL CHECK (
+                         cost_kind IN ('reported', 'estimated', 'unavailable')
+                     ),
+                     UNIQUE (source_id, bucket_key)
+                 ) STRICT;
+                 PRAGMA user_version = 3;",
+            )
+            .unwrap();
+
+        let source_id = source(&index);
+        index
+            .connection
+            .execute(
+                "INSERT INTO artifacts (
+                    source_id, artifact_key, path, device, inode, size, modified_ns,
+                    parsed_offset, boundary_hash, full_hash, cursor, parser_version, last_scanned_ms
+                 ) VALUES (
+                    ?1, 'v3-art', '/sessions/v3-art.jsonl', 1, 2, 120, 300,
+                    100, X'0102', X'0304', 'checkpoint-cursor', 7, 1000
+                 )",
+                params![source_id],
+            )
+            .unwrap();
+
+        migrate(&index.connection).unwrap();
+
+        assert_eq!(schema_version(&index.connection).unwrap(), 4);
+        let column_exists: bool = index
+            .connection
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('usage_events') WHERE name = 'cache_write_1h_tokens'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(column_exists);
+        let checkpoint = index
+            .artifact_checkpoint(source_id, "v3-art")
+            .unwrap()
+            .unwrap();
+        assert_eq!(checkpoint.device, Some(1));
+        assert_eq!(checkpoint.inode, Some(2));
+        assert_eq!(checkpoint.size, Some(120));
+        assert_eq!(checkpoint.modified_ns, Some(300));
+        assert_eq!(checkpoint.parsed_offset, 100);
+        assert_eq!(checkpoint.boundary_hash, Some(vec![1, 2]));
+        assert_eq!(checkpoint.full_hash, Some(vec![3, 4]));
+        assert_eq!(checkpoint.cursor.as_deref(), Some("checkpoint-cursor"));
+        assert_eq!(checkpoint.parser_version, 7);
     }
 
     #[test]
@@ -1102,6 +1681,171 @@ mod tests {
     }
 
     #[test]
+    fn canonicalization_prefers_larger_tokens_regardless_of_insertion_order() {
+        let (_directory, mut index1) = index();
+        let source1 = source(&index1);
+        let mut smaller = event(b"msg_1", 100);
+        smaller.total_tokens = 50;
+        let mut larger = event(b"msg_1", 100);
+        larger.total_tokens = 100;
+
+        // Insert smaller first, then larger
+        index1
+            .replace_artifact_events(source1, &artifact("art_a"), &[smaller.clone()])
+            .unwrap();
+        index1
+            .replace_artifact_events(source1, &artifact("art_b"), &[larger.clone()])
+            .unwrap();
+
+        let total: i64 = index1
+            .connection
+            .query_row(
+                "SELECT total_tokens FROM usage_events WHERE source_id = ?1",
+                [source1],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(total, 100);
+
+        // Insert larger first, then smaller
+        let (_directory2, mut index2) = index();
+        let source2 = source(&index2);
+        index2
+            .replace_artifact_events(source2, &artifact("art_b"), &[larger])
+            .unwrap();
+        index2
+            .replace_artifact_events(source2, &artifact("art_a"), &[smaller])
+            .unwrap();
+
+        let total2: i64 = index2
+            .connection
+            .query_row(
+                "SELECT total_tokens FROM usage_events WHERE source_id = ?1",
+                [source2],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(total2, 100);
+    }
+
+    #[test]
+    fn canonicalization_ties_are_independent_of_candidate_order() {
+        let mut first = event(b"msg_1", 100);
+        first.provider = "provider-z".to_string();
+        first.model = "model-z".to_string();
+        first.total_tokens = 100;
+        first.has_detailed_cache = true;
+
+        let mut second = first.clone();
+        second.provider = "provider-a".to_string();
+        second.model = "model-a".to_string();
+
+        let forward = canonicalize_events(&[first.clone(), second.clone()]).unwrap();
+        let reverse = canonicalize_events(&[second, first]).unwrap();
+
+        assert_eq!(forward, reverse);
+        assert_eq!(forward.provider, "provider-a");
+        assert_eq!(forward.model, "model-a");
+    }
+
+    #[test]
+    fn canonicalization_tie_breakers_and_retention() {
+        let (_directory, mut index) = index();
+        let source_id = source(&index);
+
+        let mut sidechain = event(b"msg_1", 100);
+        sidechain.total_tokens = 100;
+        sidechain.is_sidechain = true;
+        sidechain.has_detailed_cache = false;
+        sidechain.cost_microusd = Some(5000);
+        sidechain.cost_kind = CostKind::Reported;
+        sidechain.provider = "amazon-bedrock".to_string();
+
+        let mut main_detail = event(b"msg_1", 100);
+        main_detail.total_tokens = 100;
+        main_detail.is_sidechain = false;
+        main_detail.has_detailed_cache = true;
+        main_detail.cache_write_tokens = 20;
+        main_detail.cache_write_1h_tokens = 10;
+        main_detail.cost_microusd = None;
+        main_detail.cost_kind = CostKind::Unavailable;
+        main_detail.provider = "anthropic".to_string();
+
+        // Detailed cache wins over no detailed cache, non-sidechain wins over sidechain,
+        // but reported cost and amazon-bedrock are retained from sidechain
+        index
+            .replace_artifact_events(source_id, &artifact("sidechain_file"), &[sidechain])
+            .unwrap();
+        index
+            .replace_artifact_events(source_id, &artifact("main_file"), &[main_detail])
+            .unwrap();
+
+        let (cost_microusd, cost_kind, provider, cache_1h, total): (
+            Option<i64>,
+            String,
+            String,
+            i64,
+            i64,
+        ) = index
+            .connection
+            .query_row(
+                "SELECT cost_microusd, cost_kind, provider, cache_write_1h_tokens, total_tokens
+                 FROM usage_events WHERE source_id = ?1",
+                [source_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+
+        assert_eq!(total, 100);
+        assert_eq!(cache_1h, 10);
+        assert_eq!(cost_microusd, Some(5000));
+        assert_eq!(cost_kind, "reported");
+        assert_eq!(provider, "amazon-bedrock");
+
+        // When main_file is removed, the remaining sidechain artifact snapshot takes over
+        index.remove_artifact(source_id, "main_file").unwrap();
+
+        let (cost_microusd, provider, cache_1h): (Option<i64>, String, i64) = index
+            .connection
+            .query_row(
+                "SELECT cost_microusd, provider, cache_write_1h_tokens
+                 FROM usage_events WHERE source_id = ?1",
+                [source_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(cache_1h, 0); // sidechain didn't have detailed cache
+        assert_eq!(cost_microusd, Some(5000));
+        assert_eq!(provider, "amazon-bedrock");
+
+        // When sidechain_file is removed, event is deleted
+        index.remove_artifact(source_id, "sidechain_file").unwrap();
+        assert_eq!(index.diagnostics().unwrap().events, 0);
+    }
+
+    #[test]
+    fn validates_cache_write_1h_does_not_exceed_total_cache_write() {
+        let (_directory, mut index) = index();
+        let source_id = source(&index);
+
+        let mut invalid = event(b"invalid_event", 100);
+        invalid.cache_write_tokens = 10;
+        invalid.cache_write_1h_tokens = 15;
+
+        let result = index.replace_artifact_events(source_id, &artifact("invalid"), &[invalid]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("must not exceed"));
+    }
+
+    #[test]
     fn maps_native_projects_to_source_neutral_worktrees() {
         let (_directory, index) = index();
         let source_id = source(&index);
@@ -1126,5 +1870,300 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stored, project.id);
+    }
+
+    fn claude_source(index: &UsageIndex) -> i64 {
+        index
+            .register_source(&SourceRegistration {
+                kind: SourceKind::Claude,
+                source_key: "claude-default".to_string(),
+                display_name: "Claude Code".to_string(),
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn same_artifact_claude_incremental_append_preserves_cost_and_provider_and_upgrades() {
+        let (_directory, mut index) = index();
+        let source_id = claude_source(&index);
+
+        let mut initial = event(b"claude_event_1", 100);
+        initial.total_tokens = 100;
+        initial.cost_microusd = Some(5000);
+        initial.cost_kind = CostKind::Reported;
+        initial.provider = "amazon-bedrock".to_string();
+
+        let art = artifact("claude_session");
+        index
+            .apply_artifact_changes(source_id, &art, &[initial], &[])
+            .unwrap();
+
+        let (tokens, cost, kind, provider): (i64, Option<i64>, String, String) = index
+            .connection
+            .query_row(
+                "SELECT total_tokens, cost_microusd, cost_kind, provider
+                 FROM usage_events WHERE source_id = ?1",
+                [source_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(tokens, 100);
+        assert_eq!(cost, Some(5000));
+        assert_eq!(kind, "reported");
+        assert_eq!(provider, "amazon-bedrock");
+
+        // Appending a smaller/partial event to the same Claude artifact does NOT downgrade
+        let mut partial = event(b"claude_event_1", 100);
+        partial.total_tokens = 50;
+        partial.cost_microusd = None;
+        partial.cost_kind = CostKind::Unavailable;
+        partial.provider = "anthropic".to_string();
+
+        index
+            .apply_artifact_changes(source_id, &art, &[partial], &[])
+            .unwrap();
+
+        let (tokens, cost, kind, provider): (i64, Option<i64>, String, String) = index
+            .connection
+            .query_row(
+                "SELECT total_tokens, cost_microusd, cost_kind, provider
+                 FROM usage_events WHERE source_id = ?1",
+                [source_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(tokens, 100);
+        assert_eq!(cost, Some(5000));
+        assert_eq!(kind, "reported");
+        assert_eq!(provider, "amazon-bedrock");
+
+        // Appending a fuller event upgrades the tokens and cache stats while preserving cost and provider
+        let mut fuller = event(b"claude_event_1", 100);
+        fuller.total_tokens = 200;
+        fuller.cache_write_tokens = 40;
+        fuller.cache_write_1h_tokens = 20;
+        fuller.has_detailed_cache = true;
+        fuller.cost_microusd = None;
+        fuller.cost_kind = CostKind::Unavailable;
+        fuller.provider = "anthropic".to_string();
+
+        index
+            .apply_artifact_changes(source_id, &art, &[fuller], &[])
+            .unwrap();
+
+        let (tokens, cache_1h, cost, kind, provider): (i64, i64, Option<i64>, String, String) =
+            index
+                .connection
+                .query_row(
+                    "SELECT total_tokens, cache_write_1h_tokens, cost_microusd, cost_kind, provider
+                 FROM usage_events WHERE source_id = ?1",
+                    [source_id],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .unwrap();
+        assert_eq!(tokens, 200);
+        assert_eq!(cache_1h, 20);
+        assert_eq!(cost, Some(5000));
+        assert_eq!(kind, "reported");
+        assert_eq!(provider, "amazon-bedrock");
+    }
+
+    #[test]
+    fn same_artifact_non_claude_incremental_append_replaces() {
+        let (_directory, mut index) = index();
+        let source_id = source(&index);
+
+        let mut initial = event(b"pi_event_1", 100);
+        initial.total_tokens = 100;
+        initial.cost_microusd = Some(2000);
+        initial.cost_kind = CostKind::Estimated;
+
+        let art = artifact("pi_session");
+        index
+            .apply_artifact_changes(source_id, &art, &[initial], &[])
+            .unwrap();
+
+        // Appending a smaller event to non-Claude source performs true replacement
+        let mut smaller = event(b"pi_event_1", 100);
+        smaller.total_tokens = 50;
+        smaller.cost_microusd = None;
+        smaller.cost_kind = CostKind::Unavailable;
+
+        index
+            .apply_artifact_changes(source_id, &art, &[smaller], &[])
+            .unwrap();
+
+        let (tokens, cost, kind): (i64, Option<i64>, String) = index
+            .connection
+            .query_row(
+                "SELECT total_tokens, cost_microusd, cost_kind
+                 FROM usage_events WHERE source_id = ?1",
+                [source_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(tokens, 50);
+        assert_eq!(cost, None);
+        assert_eq!(kind, "unavailable");
+    }
+
+    #[test]
+    fn preserves_cost_provenance_and_prioritizes_reported_over_estimated() {
+        let (_directory, mut index) = index();
+        let source_id = source(&index);
+
+        let mut pi_est = event(b"shared_key", 100);
+        pi_est.total_tokens = 100;
+        pi_est.cost_microusd = Some(2500);
+        pi_est.cost_kind = CostKind::Estimated;
+
+        // Pi event alone preserves Estimated cost_kind
+        index
+            .replace_artifact_events(source_id, &artifact("pi_art_1"), &[pi_est.clone()])
+            .unwrap();
+
+        let (cost, kind): (Option<i64>, String) = index
+            .connection
+            .query_row(
+                "SELECT cost_microusd, cost_kind FROM usage_events WHERE source_id = ?1",
+                [source_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(cost, Some(2500));
+        assert_eq!(kind, "estimated");
+
+        // Duplicate Pi event across artifacts preserves Estimated cost_kind
+        index
+            .replace_artifact_events(source_id, &artifact("pi_art_2"), &[pi_est])
+            .unwrap();
+
+        let (cost, kind): (Option<i64>, String) = index
+            .connection
+            .query_row(
+                "SELECT cost_microusd, cost_kind FROM usage_events WHERE source_id = ?1",
+                [source_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(cost, Some(2500));
+        assert_eq!(kind, "estimated");
+
+        // When a Reported cost candidate exists for the same event key, Reported cost wins
+        let mut reported_copy = event(b"shared_key", 100);
+        reported_copy.total_tokens = 100;
+        reported_copy.cost_microusd = Some(3500);
+        reported_copy.cost_kind = CostKind::Reported;
+
+        index
+            .replace_artifact_events(source_id, &artifact("reported_art"), &[reported_copy])
+            .unwrap();
+
+        let (cost, kind): (Option<i64>, String) = index
+            .connection
+            .query_row(
+                "SELECT cost_microusd, cost_kind FROM usage_events WHERE source_id = ?1",
+                [source_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(cost, Some(3500));
+        assert_eq!(kind, "reported");
+    }
+
+    #[test]
+    fn migrated_database_enforces_cache_write_1h_check_constraint() {
+        let (_directory, index) = index();
+        index
+            .connection
+            .execute_batch(
+                "DROP TABLE artifact_events;
+                 DROP TABLE usage_events;
+                 DROP TABLE usage_buckets;
+                 CREATE TABLE usage_events (
+                     id INTEGER PRIMARY KEY,
+                     source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                     event_key BLOB NOT NULL,
+                     occurred_at_ms INTEGER NOT NULL,
+                     project_id TEXT REFERENCES projects(id) ON DELETE SET NULL,
+                     provider TEXT NOT NULL,
+                     model TEXT NOT NULL,
+                     variant TEXT NOT NULL,
+                     messages INTEGER NOT NULL CHECK (messages >= 0),
+                     input_tokens INTEGER NOT NULL CHECK (input_tokens >= 0),
+                     output_tokens INTEGER NOT NULL CHECK (output_tokens >= 0),
+                     cache_read_tokens INTEGER NOT NULL CHECK (cache_read_tokens >= 0),
+                     cache_write_tokens INTEGER NOT NULL CHECK (cache_write_tokens >= 0),
+                     reasoning_tokens INTEGER NOT NULL CHECK (reasoning_tokens >= 0),
+                     total_tokens INTEGER NOT NULL CHECK (total_tokens >= 0),
+                     cost_microusd INTEGER,
+                     cost_kind TEXT NOT NULL CHECK (
+                         cost_kind IN ('reported', 'estimated', 'unavailable')
+                     ),
+                     UNIQUE (source_id, event_key)
+                 ) STRICT;
+                 CREATE TABLE artifact_events (
+                     artifact_id INTEGER NOT NULL REFERENCES artifacts(id) ON DELETE CASCADE,
+                     event_id INTEGER NOT NULL REFERENCES usage_events(id) ON DELETE CASCADE,
+                     PRIMARY KEY (artifact_id, event_id)
+                 ) STRICT, WITHOUT ROWID;
+                 CREATE TABLE usage_buckets (
+                     id INTEGER PRIMARY KEY,
+                     source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+                     bucket_key BLOB NOT NULL,
+                     scope TEXT NOT NULL CHECK (scope IN ('local', 'account')),
+                     granularity TEXT NOT NULL,
+                     start_ms INTEGER NOT NULL,
+                     end_ms INTEGER NOT NULL CHECK (end_ms > start_ms),
+                     project_id TEXT REFERENCES projects(id) ON DELETE SET NULL,
+                     provider TEXT,
+                     model TEXT,
+                     messages INTEGER NOT NULL DEFAULT 0 CHECK (messages >= 0),
+                     input_tokens INTEGER NOT NULL DEFAULT 0 CHECK (input_tokens >= 0),
+                     output_tokens INTEGER NOT NULL DEFAULT 0 CHECK (output_tokens >= 0),
+                     cache_read_tokens INTEGER NOT NULL DEFAULT 0 CHECK (cache_read_tokens >= 0),
+                     cache_write_tokens INTEGER NOT NULL DEFAULT 0 CHECK (cache_write_tokens >= 0),
+                     reasoning_tokens INTEGER NOT NULL DEFAULT 0 CHECK (reasoning_tokens >= 0),
+                     total_tokens INTEGER NOT NULL DEFAULT 0 CHECK (total_tokens >= 0),
+                     cost_microusd INTEGER,
+                     cost_kind TEXT NOT NULL CHECK (
+                         cost_kind IN ('reported', 'estimated', 'unavailable')
+                     ),
+                     UNIQUE (source_id, bucket_key)
+                 ) STRICT;
+                 PRAGMA user_version = 3;",
+            )
+            .unwrap();
+
+        migrate(&index.connection).unwrap();
+        let source_id = source(&index);
+
+        // Attempting to insert cache_write_1h_tokens > cache_write_tokens should violate the CHECK constraint
+        let res = index.connection.execute(
+            "INSERT INTO usage_events (
+                source_id, event_key, occurred_at_ms, project_id, provider, model,
+                variant, messages, input_tokens, output_tokens, cache_read_tokens,
+                cache_write_tokens, cache_write_1h_tokens, reasoning_tokens, total_tokens,
+                cost_microusd, cost_kind
+             ) VALUES (
+                ?1, X'01', 100, NULL, 'anthropic', 'claude-test', 'default',
+                1, 10, 10, 0, 10, 20, 0, 40, NULL, 'unavailable'
+             )",
+            params![source_id],
+        );
+        assert!(res.is_err());
+        assert!(res
+            .unwrap_err()
+            .to_string()
+            .to_lowercase()
+            .contains("check constraint"));
     }
 }

@@ -4,10 +4,10 @@ A local terminal dashboard for AI coding harness usage.
 
 <img width="1324" height="958" alt="image" src="https://github.com/user-attachments/assets/027ae18e-7e22-437b-a58c-5a4cc3acf60d" />
 
-`expensive` combines usage from OpenCode, GitHub Copilot, Codex, and Pi into a
-small local SQLite index, then serves a live dashboard without repeatedly
-parsing session history. Source scans run in the background, so an existing
-dashboard remains usable while new accounting data is imported.
+`expensive` combines usage from OpenCode, GitHub Copilot, Codex, Pi, and Claude
+Code into a small local SQLite index, then serves a live dashboard without
+repeatedly parsing session history. Source scans run in the background, so an
+existing dashboard remains usable while new accounting data is imported.
 
 The index contains normalized accounting facts and scan checkpoints, not cloned
 session histories. Prompts, responses, reasoning text, and tool calls are never
@@ -76,7 +76,7 @@ on screen and are only redrawn when their data changes. Day rollover is handled
 separately even when automatic refresh is disabled.
 
 The first run publishes OpenCode data as soon as it is ready, then scans
-Copilot, Codex, and Pi concurrently while updating the dashboard as each source
+Copilot, Codex, Pi, and Claude Code concurrently while updating the dashboard as each source
 completes. Later scans use file identity, size, timestamps, boundary hashes,
 and parser checkpoints to read only safe appends. OpenCode fingerprints its
 database and WAL, and rechecks a rolling 24-hour mutable window when either
@@ -128,6 +128,7 @@ Available sources are discovered automatically:
 - GitHub Copilot CLI and app: local SQLite usage accounting
 - Codex: `sessions` and `archived_sessions` rollout JSONL files
 - Pi: version 3 session JSONL files
+- Claude Code: `projects` session JSONL files
 
 `expensive` finds the OpenCode database in this order:
 
@@ -144,7 +145,8 @@ reference](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cl
 and [app session documentation](https://docs.github.com/en/copilot/how-tos/github-copilot-app/agent-sessions).
 Codex uses `CODEX_HOME`, falling back to `~/.codex`. Pi uses
 `PI_CODING_AGENT_SESSION_DIR`, then `PI_CODING_AGENT_DIR/sessions`, then
-`~/.pi/agent/sessions`. These environment variables can also select custom
+`~/.pi/agent/sessions`. Claude Code uses `CLAUDE_CONFIG_DIR`, falling back to
+`~/.claude`. These environment variables can also select custom
 source locations.
 
 The normalized index is selected in this order:
@@ -208,8 +210,9 @@ editors support add/edit with `Enter`, delete with `d`, and field switching with
 `week_start` can be `monday` or `sunday`. `auto_refresh` and
 `show_comparison` can be `true` or `false`; the previous-period panel is hidden
 by default. `estimate_api_cost` is also off by default. When enabled, supported
-otherwise-unpriced OpenAI usage is added at standard API text-token rates and
-marked as estimated; unknown model IDs remain unpriced. Themes are `aurora`,
+otherwise-unpriced OpenAI and direct Anthropic usage is added at standard API
+text-token rates and marked as estimated, while recognized Bedrock retail/API-equivalent
+estimates remain automatic. Unknown model IDs remain unpriced. Themes are `aurora`,
 `ember`, `ocean`, `forest`, and `graphite`.
 `theme_scope = "calendar"` applies the theme to the Calendar heatmap only;
 `theme_scope = "all"` applies it to the entire TUI.
@@ -254,6 +257,17 @@ family rate.
 Pi usage comes from assistant entries in version 3 session files. Token
 categories and Pi's supplied cost total are indexed; supplied Pi costs are
 classified as estimates.
+
+Claude Code usage comes from `projects` session JSONL files. Claude Code records
+per-turn token usage (input, output, cache-read, cache-creation tokens including
+5-minute ephemeral and 1-hour cache write durations). When Claude Code reports
+a positive dollar cost (`costUSD`), it is preserved directly as a reported cost.
+Bedrock-routed Claude turns (identified by Bedrock model IDs, ARNs, or message ID
+prefixes) receive standard AWS Bedrock on-demand retail estimates regardless of
+the `estimate_api_cost` setting. For direct Anthropic subscription turns without
+reported cost, enabling `estimate_api_cost = true` calculates estimates using
+standard Anthropic API rates. Cross-session subagent and parent turns referencing
+identical event IDs are reconciled to the canonical highest-fidelity snapshot.
 
 `expensive` validates the required OpenCode and Copilot tables and columns, as
 well as OpenCode's SQLite JSON support, before importing them. `expensive
