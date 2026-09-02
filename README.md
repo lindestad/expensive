@@ -251,9 +251,9 @@ built-in rate table is intentionally conservative: undocumented variants such
 as subscription-only model IDs stay unpriced instead of inheriting a guessed
 family rate.
 
-Pi usage comes from assistant entries in version 3 session files. Token
-categories and Pi's supplied cost total are indexed; supplied Pi costs are
-classified as estimates.
+Pi usage comes from usage-bearing assistant, tool-result, compaction, and
+branch-summary entries in version 3 session files. Token categories and Pi's
+supplied cost total are indexed; supplied Pi costs are classified as estimates.
 
 `expensive` validates the required OpenCode and Copilot tables and columns, as
 well as OpenCode's SQLite JSON support, before importing them. `expensive
