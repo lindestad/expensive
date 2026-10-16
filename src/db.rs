@@ -913,12 +913,25 @@ pub fn diagnose(path: &Path) -> Result<DatabaseDiagnostics> {
     let project_columns = table_columns(&connection, "project")?;
 
     let assistant_messages = if errors.is_empty() {
-        let query = if modern {
-            "SELECT COUNT(*) FROM session_message WHERE type = 'assistant'"
+        let mut query = if modern {
+            "SELECT COUNT(*) FROM session_message
+             JOIN session_v2 ON session_v2.id = session_message.session_id
+             WHERE session_message.type = 'assistant'"
+                .to_string()
         } else {
             "SELECT COUNT(*) FROM message WHERE json_extract(data, '$.role') = 'assistant'"
+                .to_string()
         };
-        match connection.query_row(query, [], |row| read_u64(row, "COUNT(*)")) {
+        if modern && !table_columns(&connection, "message")?.is_empty() {
+            query = format!(
+                "SELECT ({query}) + (SELECT COUNT(*) FROM message
+                 JOIN session ON session.id = message.session_id
+                 WHERE json_extract(message.data, '$.role') = 'assistant'
+                 AND NOT EXISTS (SELECT 1 FROM session_message
+                                 WHERE session_message.id = message.id)) AS \"COUNT(*)\""
+            );
+        }
+        match connection.query_row(&query, [], |row| read_u64(row, "COUNT(*)")) {
             Ok(count) => Some(count),
             Err(error) => {
                 errors.push(format!("could not inspect assistant messages: {error}"));
@@ -1191,6 +1204,33 @@ mod tests {
         assert!(diagnostics.project_scope);
         assert_eq!(diagnostics.assistant_messages, Some(1));
         assert_eq!(diagnostics.opencode_versions, vec!["1.2.3"]);
+    }
+
+    #[test]
+    fn diagnoses_mixed_storage_with_deduplicated_legacy_complement() {
+        let file = NamedTempFile::new().unwrap();
+        let connection = Connection::open(file.path()).unwrap();
+        connection
+            .execute_batch(include_str!("../tests/fixtures/opencode_v2.sql"))
+            .unwrap();
+
+        let diagnostics = diagnose(file.path()).unwrap();
+        assert!(diagnostics.is_compatible());
+        assert_eq!(diagnostics.assistant_messages, Some(2));
+    }
+
+    #[test]
+    fn diagnoses_modern_only_storage() {
+        let file = NamedTempFile::new().unwrap();
+        let connection = Connection::open(file.path()).unwrap();
+        connection
+            .execute_batch(include_str!("../tests/fixtures/opencode_modern_only.sql"))
+            .unwrap();
+
+        let diagnostics = diagnose(file.path()).unwrap();
+        assert!(diagnostics.is_compatible());
+        assert!(diagnostics.project_scope);
+        assert_eq!(diagnostics.assistant_messages, Some(1));
     }
 
     #[test]

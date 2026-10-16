@@ -1,4 +1,4 @@
-use std::{path::Path, time::UNIX_EPOCH};
+use std::{collections::HashSet, path::Path, time::UNIX_EPOCH};
 
 use anyhow::Result;
 use chrono::{Local, TimeZone};
@@ -89,14 +89,17 @@ fn run_doctor(config: &Config, json: bool) -> Result<()> {
     if let Some(diagnostics) = &opencode {
         warnings.extend(diagnostics.warnings.iter().cloned());
     }
-    let stale: Vec<(String, usize)> = freshness
-        .iter()
-        .map(|source| (source.display_name.clone(), changed_artifacts(source)))
-        .filter(|(_, changed)| *changed > 0)
-        .collect();
-    warnings.extend(stale.iter().map(|(source, changed)| {
-        format!("{source} source changed since its last sync ({changed} artifact(s)); run: expensive sync")
-    }));
+    let mut stale_sources = HashSet::new();
+    for source in &freshness {
+        let changed = changed_artifacts(source)?;
+        if changed > 0 {
+            stale_sources.insert(source.id);
+            warnings.push(format!(
+                "{} source changed since its last sync ({changed} artifact(s)); run: expensive sync",
+                source.display_name
+            ));
+        }
+    }
 
     if json {
         let report = DoctorJson {
@@ -126,7 +129,7 @@ fn run_doctor(config: &Config, json: bool) -> Result<()> {
                         .map(|artifact| artifact.last_scanned_ms)
                         .max(),
                     artifacts: source.artifacts.len(),
-                    changed_since_sync: stale.iter().any(|(name, _)| *name == source.display_name),
+                    changed_since_sync: stale_sources.contains(&source.id),
                 })
                 .collect(),
             opencode: opencode.as_ref().map(|diagnostics| OpencodeJson {
@@ -288,15 +291,34 @@ fn format_local_ms(millis: i64) -> String {
         .unwrap_or_else(|| millis.to_string())
 }
 
-fn changed_artifacts(source: &index::SourceFreshness) -> usize {
-    source
+fn changed_artifacts(source: &index::SourceFreshness) -> Result<usize> {
+    let changed = source
         .artifacts
         .iter()
         .filter(|artifact| match artifact.path.as_deref() {
             Some(path) => changed_since(path, artifact.last_scanned_ms),
             None => false,
         })
-        .count()
+        .count();
+    let root = Path::new(&source.source_key);
+    let roots = match source.kind.as_str() {
+        "codex" => vec![root.join("sessions"), root.join("archived_sessions")],
+        "pi" => vec![root.to_path_buf()],
+        _ => return Ok(changed),
+    };
+    let known: HashSet<&str> = source
+        .artifacts
+        .iter()
+        .map(|artifact| artifact.key.as_str())
+        .collect();
+    let added = sources::discover_session_files(&roots)?
+        .iter()
+        .filter(|path| {
+            let key = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+            !known.contains(key.to_string_lossy().as_ref())
+        })
+        .count();
+    Ok(changed + added)
 }
 
 fn changed_since(path: &str, scanned_at_ms: i64) -> bool {
@@ -318,7 +340,7 @@ fn modified_after(path: &Path, scanned_at_ms: i64) -> bool {
                 .duration_since(UNIX_EPOCH)
                 .is_ok_and(|since_epoch| since_epoch.as_millis() as i64 > scanned_at_ms)
         })
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
 #[derive(Serialize)]
@@ -367,4 +389,74 @@ struct OpencodeJson {
     errors: Vec<String>,
     warnings: Vec<String>,
     unknown_usage_tables: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use expensive::sources::{codex::CodexSource, pi::PiSource, UsageSource};
+    use std::{fs, time::Duration};
+
+    fn checks_session_file_changes(kind: &str) {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join(kind);
+        let (sessions, added_root, source): (_, _, Box<dyn UsageSource>) = match kind {
+            "codex" => (
+                root.join("sessions"),
+                root.join("archived_sessions/2026/01"),
+                Box::new(CodexSource::new(root.clone())),
+            ),
+            "pi" => (
+                root.clone(),
+                root.join("project"),
+                Box::new(PiSource::new(root.clone())),
+            ),
+            _ => unreachable!(),
+        };
+        fs::create_dir_all(&sessions).unwrap();
+        let original = sessions.join("original.jsonl");
+        fs::write(&original, "{}\n").unwrap();
+        let mut usage_index = index::UsageIndex::open(&directory.path().join("usage.db")).unwrap();
+        source
+            .sync(&mut usage_index, SyncMode::Incremental)
+            .unwrap();
+        let initial = usage_index.freshness().unwrap().remove(0);
+        assert_eq!(changed_artifacts(&initial).unwrap(), 0);
+
+        fs::create_dir_all(&added_root).unwrap();
+        fs::write(added_root.join("ignored.txt"), "ignored").unwrap();
+        assert_eq!(changed_artifacts(&initial).unwrap(), 0);
+        fs::write(added_root.join("new.jsonl"), "{}\n").unwrap();
+        assert_eq!(changed_artifacts(&initial).unwrap(), 1);
+
+        fs::remove_file(&original).unwrap();
+        assert_eq!(changed_artifacts(&initial).unwrap(), 2);
+        source
+            .sync(&mut usage_index, SyncMode::Incremental)
+            .unwrap();
+        let updated = usage_index.freshness().unwrap().remove(0);
+        assert_eq!(changed_artifacts(&updated).unwrap(), 0);
+
+        let new_file = fs::OpenOptions::new()
+            .write(true)
+            .open(added_root.join("new.jsonl"))
+            .unwrap();
+        new_file
+            .set_times(fs::FileTimes::new().set_modified(
+                UNIX_EPOCH
+                    + Duration::from_millis(updated.artifacts[0].last_scanned_ms as u64 + 1000),
+            ))
+            .unwrap();
+        assert_eq!(changed_artifacts(&updated).unwrap(), 1);
+    }
+
+    #[test]
+    fn detects_added_deleted_and_modified_codex_sessions() {
+        checks_session_file_changes("codex");
+    }
+
+    #[test]
+    fn detects_added_deleted_and_modified_pi_sessions() {
+        checks_session_file_changes("pi");
+    }
 }

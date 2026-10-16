@@ -20,7 +20,7 @@ use crate::{
     sources::{event_key, SyncMode, SyncReport, UsageSource},
 };
 
-const PARSER_VERSION: i64 = 2;
+const PARSER_VERSION: i64 = 3;
 const MUTABLE_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
 const FINGERPRINT_SAMPLE_BYTES: usize = 64 * 1_024;
 
@@ -101,7 +101,9 @@ impl UsageSource for OpenCodeSource {
                 self.path.display()
             );
         }
-        let supports_incremental = modern || legacy_columns.contains("time_updated");
+        // Legacy rows without update timestamps must be reconciled in full,
+        // even when modern storage provides its own incremental watermark.
+        let supports_incremental = !legacy || legacy_columns.contains("time_updated");
         let mode = if supports_incremental {
             requested_mode
         } else {
@@ -702,6 +704,48 @@ mod tests {
 
         let initial = source.sync(&mut index, SyncMode::Incremental).unwrap();
         assert_eq!(initial.imported, 1);
+        assert_eq!(index.diagnostics().unwrap().events, 1);
+    }
+
+    #[test]
+    fn reconciles_old_legacy_rows_without_update_timestamps_in_mixed_storage() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("opencode.db");
+        let connection = Connection::open(&source_path).unwrap();
+        connection
+            .execute_batch(include_str!("../../tests/fixtures/opencode_v2.sql"))
+            .unwrap();
+        connection
+            .execute_batch(
+                "ALTER TABLE message DROP COLUMN time_updated;
+                 UPDATE session_message SET time_updated = 200000000;",
+            )
+            .unwrap();
+        let index_path = directory.path().join("usage.sqlite3");
+        let mut index = UsageIndex::open(&index_path).unwrap();
+        let source = OpenCodeSource::new(source_path);
+        source.sync(&mut index, SyncMode::Incremental).unwrap();
+
+        connection
+            .execute(
+                "UPDATE message SET data = json_set(data, '$.cost', 8.5)
+                 WHERE id = 'assistant-legacy'",
+                [],
+            )
+            .unwrap();
+        source.sync(&mut index, SyncMode::Incremental).unwrap();
+        let stored = Connection::open(&index_path).unwrap();
+        let cost: i64 = stored
+            .query_row("SELECT SUM(cost_microusd) FROM usage_events", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(cost, 9_750_000);
+
+        connection
+            .execute("DELETE FROM message WHERE id = 'assistant-legacy'", [])
+            .unwrap();
+        source.sync(&mut index, SyncMode::Incremental).unwrap();
         assert_eq!(index.diagnostics().unwrap().events, 1);
     }
 }

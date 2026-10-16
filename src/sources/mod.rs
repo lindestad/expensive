@@ -12,6 +12,7 @@ use crate::{
 pub mod codex;
 pub mod copilot;
 mod jsonl;
+pub use jsonl::discover as discover_session_files;
 pub mod opencode;
 pub mod pi;
 

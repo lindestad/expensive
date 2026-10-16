@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- reconcile mixed OpenCode storage without legacy update timestamps, include legacy-only
+  messages in diagnostics, and detect added or deleted session files in doctor freshness checks
 - read OpenCode usage from the v2.x `session_message`/`session_v2` storage, falling back
   to the legacy `message`/`session` tables only for rows missing from the migrated data
 - validate and diagnose either OpenCode storage shape, so databases that have dropped
