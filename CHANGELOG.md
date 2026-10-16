@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- read OpenCode usage from the v2.x `session_message`/`session_v2` storage, falling back
+  to the legacy `message`/`session` tables only for rows missing from the migrated data
 - import current-schema GitHub Copilot CLI and app usage from the shared local session-store database, including exact token classes and AI-credit usage value
 - incrementally scan only new Copilot usage rows while detecting source rewrites and rejecting unknown database schemas
 

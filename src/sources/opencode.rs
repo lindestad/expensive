@@ -20,9 +20,38 @@ use crate::{
     sources::{event_key, SyncMode, SyncReport, UsageSource},
 };
 
-const PARSER_VERSION: i64 = 1;
+const PARSER_VERSION: i64 = 2;
 const MUTABLE_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
 const FINGERPRINT_SAMPLE_BYTES: usize = 64 * 1_024;
+
+const MODERN_SQL: &str = "SELECT session_message.id, session_message.time_created, \
+    session_message.time_updated, session_message.data, session_v2.project_id \
+    FROM session_message \
+    JOIN session_v2 ON session_v2.id = session_message.session_id \
+    WHERE session_message.type = 'assistant' AND session_message.time_updated >= ?1 \
+    ORDER BY session_message.time_updated, session_message.id";
+
+const LEGACY_COMPLEMENT_SQL: &str = "SELECT message.id, message.time_created, \
+    message.time_updated, message.data, session.project_id \
+    FROM message \
+    JOIN session ON session.id = message.session_id \
+    WHERE message.time_updated >= ?1 \
+    AND NOT EXISTS (SELECT 1 FROM session_message WHERE session_message.id = message.id) \
+    ORDER BY message.time_updated, message.id";
+
+const LEGACY_INCREMENTAL_SQL: &str = "SELECT message.id, message.time_created, \
+    message.time_updated, message.data, session.project_id \
+    FROM message \
+    JOIN session ON session.id = message.session_id \
+    WHERE message.time_updated >= ?1 \
+    ORDER BY message.time_updated, message.id";
+
+const LEGACY_FULL_SQL: &str = "SELECT message.id, message.time_created, \
+    message.time_created, message.data, session.project_id \
+    FROM message \
+    JOIN session ON session.id = message.session_id \
+    WHERE message.time_created >= ?1 \
+    ORDER BY message.time_created, message.id";
 
 pub struct OpenCodeSource {
     path: PathBuf,
@@ -54,8 +83,17 @@ impl UsageSource for OpenCodeSource {
     fn sync(&self, index: &mut UsageIndex, requested_mode: SyncMode) -> Result<SyncReport> {
         let source_id = index.register_source(&self.registration())?;
         let connection = db::open_database(&self.path)?;
-        let columns = db::table_columns(&connection, "message")?;
-        let supports_incremental = columns.contains("time_updated");
+        let modern =
+            has_table(&connection, "session_message")? && has_table(&connection, "session_v2")?;
+        let legacy_columns = db::table_columns(&connection, "message")?;
+        let legacy = !legacy_columns.is_empty();
+        if !modern && !legacy {
+            anyhow::bail!(
+                "{} contains neither session_message nor message tables",
+                self.path.display()
+            );
+        }
+        let supports_incremental = modern || legacy_columns.contains("time_updated");
         let mode = if supports_incremental {
             requested_mode
         } else {
@@ -90,53 +128,47 @@ impl UsageSource for OpenCodeSource {
             index.upsert_project(source_id, native_id, project)?;
         }
 
-        let sql = if supports_incremental {
-            "SELECT message.id, message.time_created, message.time_updated, message.data,
-                    session.project_id
-             FROM message
-             JOIN session ON session.id = message.session_id
-             WHERE message.time_updated >= ?1
-             ORDER BY message.time_updated, message.id"
-        } else {
-            "SELECT message.id, message.time_created, message.time_created, message.data,
-                    session.project_id
-             FROM message
-             JOIN session ON session.id = message.session_id
-             WHERE message.time_created >= ?1
-             ORDER BY message.time_created, message.id"
-        };
-        let mut statement = connection.prepare(sql)?;
-        let mut rows = statement.query(params![scan_from])?;
         let mut upserts = Vec::new();
         let mut removals = Vec::new();
-        let mut scanned = 0usize;
-        let mut skipped = 0usize;
-        let mut max_updated = watermark;
-
-        while let Some(row) = rows.next()? {
-            scanned += 1;
-            let id: String = row.get(0)?;
-            let occurred_at_ms: i64 = row.get(1)?;
-            let updated_at_ms: i64 = row.get(2)?;
-            let data: String = row.get(3)?;
-            let native_project_id: String = row.get(4)?;
-            max_updated = max_updated.max(updated_at_ms);
-            let key = event_key("opencode", &id);
-
-            match parse_event(
-                key.clone(),
-                occurred_at_ms,
-                projects.get(&native_project_id),
-                &data,
-            ) {
-                Ok(Some(event)) => upserts.push(event),
-                Ok(None) => removals.push(key),
-                Err(_) => {
-                    skipped += 1;
-                    removals.push(key);
-                }
+        let mut collector = EventCollector::default();
+        if modern {
+            let mut statement = connection.prepare(MODERN_SQL)?;
+            let mut rows = statement.query(params![scan_from])?;
+            while let Some(row) = rows.next()? {
+                collect_row(
+                    &mut collector,
+                    &mut upserts,
+                    &mut removals,
+                    row,
+                    MessageFormat::Modern,
+                    &projects,
+                )?;
             }
         }
+        if legacy {
+            let sql = if modern {
+                LEGACY_COMPLEMENT_SQL
+            } else if supports_incremental {
+                LEGACY_INCREMENTAL_SQL
+            } else {
+                LEGACY_FULL_SQL
+            };
+            let mut statement = connection.prepare(sql)?;
+            let mut rows = statement.query(params![scan_from])?;
+            while let Some(row) = rows.next()? {
+                collect_row(
+                    &mut collector,
+                    &mut upserts,
+                    &mut removals,
+                    row,
+                    MessageFormat::Legacy,
+                    &projects,
+                )?;
+            }
+        }
+        let scanned = collector.scanned;
+        let skipped = collector.skipped;
+        let max_updated = collector.max_updated.max(watermark);
 
         let fingerprint_after = database_fingerprint(&self.path)?;
         let stable_fingerprint = (fingerprint_before.is_some()
@@ -179,14 +211,75 @@ fn load_projects(path: &Path) -> HashMap<String, ProjectRecord> {
         .collect()
 }
 
+fn has_table(connection: &rusqlite::Connection, name: &str) -> Result<bool> {
+    connection
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [name],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|count| count > 0)
+        .context("reading database schema")
+}
+
+#[derive(Default)]
+struct EventCollector {
+    scanned: usize,
+    skipped: usize,
+    max_updated: i64,
+}
+
+#[derive(Clone, Copy)]
+enum MessageFormat {
+    Modern,
+    Legacy,
+}
+
+fn collect_row(
+    collector: &mut EventCollector,
+    upserts: &mut Vec<UsageEvent>,
+    removals: &mut Vec<Vec<u8>>,
+    row: &rusqlite::Row<'_>,
+    format: MessageFormat,
+    projects: &HashMap<String, ProjectRecord>,
+) -> Result<()> {
+    collector.scanned += 1;
+    let id: String = row.get(0)?;
+    let occurred_at_ms: i64 = row.get(1)?;
+    let updated_at_ms: i64 = row.get(2)?;
+    let data: String = row.get(3)?;
+    let native_project_id: String = row.get(4)?;
+    collector.max_updated = collector.max_updated.max(updated_at_ms);
+    let key = event_key("opencode", &id);
+
+    match parse_event(
+        key.clone(),
+        occurred_at_ms,
+        projects.get(&native_project_id),
+        &data,
+        format,
+    ) {
+        Ok(Some(event)) => upserts.push(event),
+        Ok(None) => removals.push(key),
+        Err(_) => {
+            collector.skipped += 1;
+            removals.push(key);
+        }
+    }
+    Ok(())
+}
+
 fn parse_event(
     event_key: Vec<u8>,
     occurred_at_ms: i64,
     project: Option<&ProjectRecord>,
     raw: &str,
+    format: MessageFormat,
 ) -> Result<Option<UsageEvent>> {
     let value: Value = serde_json::from_str(raw).context("parsing OpenCode message JSON")?;
-    if value.get("role").and_then(Value::as_str) != Some("assistant") {
+    if matches!(format, MessageFormat::Legacy)
+        && value.get("role").and_then(Value::as_str) != Some("assistant")
+    {
         return Ok(None);
     }
 
@@ -194,26 +287,41 @@ fn parse_event(
     let output_tokens = nonnegative_i64(value.pointer("/tokens/output"));
     let cache_read_tokens = nonnegative_i64(value.pointer("/tokens/cache/read"));
     let cache_write_tokens = nonnegative_i64(value.pointer("/tokens/cache/write"));
+    let reasoning_tokens = nonnegative_i64(value.pointer("/tokens/reasoning"));
     let total_tokens = input_tokens
         .saturating_add(output_tokens)
         .saturating_add(cache_read_tokens)
-        .saturating_add(cache_write_tokens);
+        .saturating_add(cache_write_tokens)
+        .saturating_add(reasoning_tokens);
     let cost = value.get("cost").and_then(Value::as_f64);
     let cost_microusd = cost.and_then(cost_to_microusd);
+
+    let (provider, model, variant) = match format {
+        MessageFormat::Modern => (
+            text_or(value.pointer("/model/providerID"), "unknown"),
+            text_or(value.pointer("/model/id"), "unknown"),
+            text_or(value.pointer("/model/variant"), "default"),
+        ),
+        MessageFormat::Legacy => (
+            text_or(value.get("providerID"), "unknown"),
+            text_or(value.get("modelID"), "unknown"),
+            text_or(value.get("variant"), "default"),
+        ),
+    };
 
     Ok(Some(UsageEvent {
         event_key,
         occurred_at_ms,
         project_id: project.map(|project| project.id.clone()),
-        provider: text_or(value.get("providerID"), "unknown"),
-        model: text_or(value.get("modelID"), "unknown"),
-        variant: text_or(value.get("variant"), "default"),
+        provider,
+        model,
+        variant,
         messages: 1,
         input_tokens,
         output_tokens,
         cache_read_tokens,
         cache_write_tokens,
-        reasoning_tokens: 0,
+        reasoning_tokens,
         total_tokens,
         cost_microusd,
         cost_kind: if cost_microusd.is_some() {
@@ -466,5 +574,84 @@ mod tests {
 
         source.sync(&mut index, SyncMode::Full).unwrap();
         assert_eq!(index.diagnostics().unwrap().events, 0);
+    }
+
+    #[test]
+    fn imports_modern_opencode_messages_with_legacy_complement() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("opencode.db");
+        let connection = Connection::open(&source_path).unwrap();
+        connection
+            .execute_batch(include_str!("../../tests/fixtures/opencode_v2.sql"))
+            .unwrap();
+        drop(connection);
+        let mut index = UsageIndex::open(&directory.path().join("usage.sqlite3")).unwrap();
+        let source = OpenCodeSource::new(source_path.clone());
+
+        let initial = source.sync(&mut index, SyncMode::Incremental).unwrap();
+        assert_eq!(initial.imported, 2);
+        assert_eq!(index.diagnostics().unwrap().events, 2);
+
+        let connection = Connection::open(&source_path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data)
+                 VALUES ('assistant-b', 'session-a', 'assistant', 4, 3000, 3000,
+                    '{\"cost\":0.25,\"tokens\":{\"input\":3,\"output\":4},\"model\":{\"id\":\"new\",\"providerID\":\"provider\",\"variant\":\"default\"}}')",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let update = source.sync(&mut index, SyncMode::Incremental).unwrap();
+        assert_eq!(update.imported, 3);
+        assert_eq!(index.diagnostics().unwrap().events, 3);
+    }
+
+    #[test]
+    fn parses_modern_message_shape() {
+        let project = ProjectRecord {
+            id: "project-1".to_string(),
+            name: "Project".to_string(),
+            worktree: "/work".to_string(),
+        };
+        let event = parse_event(
+            vec![1],
+            500,
+            Some(&project),
+            r#"{"cost":0.5,"tokens":{"input":1,"output":2,"reasoning":3,"cache":{"read":4,"write":5}},"model":{"id":"model-name","providerID":"provider-name","variant":"high"}}"#,
+            MessageFormat::Modern,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(event.provider, "provider-name");
+        assert_eq!(event.model, "model-name");
+        assert_eq!(event.variant, "high");
+        assert_eq!(event.reasoning_tokens, 3);
+        assert_eq!(event.total_tokens, 15);
+        assert_eq!(event.cost_microusd, Some(500_000));
+        assert_eq!(event.project_id.as_deref(), Some("project-1"));
+    }
+
+    #[test]
+    fn modern_message_rows_do_not_require_a_role_field() {
+        let event = parse_event(
+            vec![1],
+            500,
+            None,
+            r#"{"tokens":{"input":1,"output":2}}"#,
+            MessageFormat::Modern,
+        )
+        .unwrap();
+        assert!(event.is_some());
+        let legacy = parse_event(
+            vec![1],
+            500,
+            None,
+            r#"{"tokens":{"input":1}}"#,
+            MessageFormat::Legacy,
+        )
+        .unwrap();
+        assert!(legacy.is_none());
     }
 }
