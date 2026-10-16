@@ -99,10 +99,20 @@ expensive --index ~/.local/share/expensive/usage.sqlite3
 ```
 
 Check the index, discovered sources, and OpenCode schema compatibility without
-opening the TUI:
+opening the TUI. Add `--json` for machine-readable output, including per-source
+freshness and staleness warnings:
 
 ```bash
 expensive doctor
+expensive doctor --json
+```
+
+Re-scan discovered sources into the index without opening the TUI, printing
+per-source counts. `--full` re-reads every source from scratch:
+
+```bash
+expensive sync
+expensive sync --full
 ```
 
 Write versioned JSON for scripts and exports:

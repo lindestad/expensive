@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.4
 
 - reconcile mixed OpenCode storage without legacy update timestamps, include legacy-only
   messages in diagnostics, and detect added or deleted session files in doctor freshness checks
