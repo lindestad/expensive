@@ -253,7 +253,17 @@ pub struct Cli {
 #[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
 pub enum CliCommand {
     /// Check the usage index, discovered sources, and OpenCode compatibility.
-    Doctor,
+    Doctor {
+        /// Emit the doctor report as JSON on stdout.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Re-scan usage sources into the local index and print per-source counts.
+    Sync {
+        /// Re-read every source artifact from scratch instead of resuming.
+        #[arg(long)]
+        full: bool,
+    },
     /// Write a machine-readable usage report to stdout.
     Report(ReportArgs),
 }

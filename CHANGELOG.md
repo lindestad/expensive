@@ -4,6 +4,11 @@
 
 - read OpenCode usage from the v2.x `session_message`/`session_v2` storage, falling back
   to the legacy `message`/`session` tables only for rows missing from the migrated data
+- validate and diagnose either OpenCode storage shape, so databases that have dropped
+  the legacy tables (or predate `time_updated`) still sync
+- add a headless `expensive sync [--full]` command with per-source counts, and extend
+  `expensive doctor` with per-source freshness, changed-since-last-sync warnings,
+  unknown-storage-table drift detection, and a `--json` variant for scripting
 - import current-schema GitHub Copilot CLI and app usage from the shared local session-store database, including exact token classes and AI-credit usage value
 - incrementally scan only new Copilot usage rows while detecting source rewrites and rejecting unknown database schemas
 

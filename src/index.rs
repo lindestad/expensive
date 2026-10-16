@@ -153,6 +153,28 @@ pub struct IndexDiagnostics {
     pub events: i64,
 }
 
+#[derive(Clone, Debug)]
+pub struct ArtifactFreshness {
+    pub key: String,
+    pub path: Option<String>,
+    pub size: Option<i64>,
+    pub modified_ns: Option<i64>,
+    pub watermark: i64,
+    pub last_scanned_ms: i64,
+    pub parser_version: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct SourceFreshness {
+    pub id: i64,
+    pub kind: String,
+    pub source_key: String,
+    pub display_name: String,
+    pub events: i64,
+    pub latest_event_ms: Option<i64>,
+    pub artifacts: Vec<ArtifactFreshness>,
+}
+
 pub struct UsageIndex {
     path: PathBuf,
     connection: Connection,
@@ -496,6 +518,59 @@ impl UsageIndex {
             artifacts: table_count(&self.connection, "artifacts")?,
             events: table_count(&self.connection, "usage_events")?,
         })
+    }
+
+    pub fn freshness(&self) -> Result<Vec<SourceFreshness>> {
+        let mut sources = {
+            let mut statement = self.connection.prepare(
+                "SELECT s.id, s.kind, s.source_key, s.display_name,
+                        COUNT(u.event_key), MAX(u.occurred_at_ms)
+                 FROM sources s
+                 LEFT JOIN usage_events u ON u.source_id = s.id
+                 GROUP BY s.id, s.kind, s.source_key, s.display_name
+                 ORDER BY s.display_name COLLATE NOCASE, s.source_key",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok(SourceFreshness {
+                    id: row.get(0)?,
+                    kind: row.get(1)?,
+                    source_key: row.get(2)?,
+                    display_name: row.get(3)?,
+                    events: row.get(4)?,
+                    latest_event_ms: row.get::<_, Option<i64>>(5)?,
+                    artifacts: Vec::new(),
+                })
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .context("summarizing source freshness")?
+        };
+        let mut statement = self.connection.prepare(
+            "SELECT source_id, artifact_key, path, size, modified_ns, parsed_offset,
+                    last_scanned_ms, parser_version
+             FROM artifacts
+             ORDER BY last_scanned_ms, artifact_key",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                ArtifactFreshness {
+                    key: row.get(1)?,
+                    path: row.get(2)?,
+                    size: row.get(3)?,
+                    modified_ns: row.get(4)?,
+                    watermark: row.get(5)?,
+                    last_scanned_ms: row.get(6)?,
+                    parser_version: row.get(7)?,
+                },
+            ))
+        })?;
+        for row in rows {
+            let (source_id, artifact) = row?;
+            if let Some(source) = sources.iter_mut().find(|source| source.id == source_id) {
+                source.artifacts.push(artifact);
+            }
+        }
+        Ok(sources)
     }
 }
 
