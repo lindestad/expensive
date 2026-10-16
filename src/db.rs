@@ -814,7 +814,15 @@ fn resolve_scope(
 }
 
 fn query_projects(connection: &Connection) -> Result<Vec<ProjectInfo>> {
-    let session_columns = table_columns(connection, "session")?;
+    let session_v2_columns = table_columns(connection, "session_v2")?;
+    let session_columns = if ["id", "project_id"]
+        .iter()
+        .all(|column| session_v2_columns.contains(*column))
+    {
+        session_v2_columns
+    } else {
+        table_columns(connection, "session")?
+    };
     let project_columns = table_columns(connection, "project")?;
     let project_scope = ["id", "project_id"]
         .iter()
@@ -878,18 +886,39 @@ pub fn diagnose(path: &Path) -> Result<DatabaseDiagnostics> {
         })
         .map(|value| value == 1)
         .unwrap_or(false);
-    let message_columns = table_columns(&connection, "message")?;
-    let session_columns = table_columns(&connection, "session")?;
-    let project_columns = table_columns(&connection, "project")?;
-    let mut errors = usage_schema_errors(&message_columns, &session_columns, json_functions);
+    let mut errors = usage_schema_errors(&connection, json_functions)?;
     let mut warnings = Vec::new();
+    let modern = shape_errors(
+        &connection,
+        "session_message",
+        &[
+            "id",
+            "session_id",
+            "type",
+            "time_created",
+            "time_updated",
+            "data",
+        ],
+        "session_v2",
+        &["id", "project_id"],
+    )?
+    .is_empty();
+    let (message_table, session_table) = if modern {
+        ("session_message", "session_v2")
+    } else {
+        ("message", "session")
+    };
+    let message_columns = table_columns(&connection, message_table)?;
+    let session_columns = table_columns(&connection, session_table)?;
+    let project_columns = table_columns(&connection, "project")?;
 
     let assistant_messages = if errors.is_empty() {
-        match connection.query_row(
-            "SELECT COUNT(*) FROM message WHERE json_extract(data, '$.role') = 'assistant'",
-            [],
-            |row| read_u64(row, "COUNT(*)"),
-        ) {
+        let query = if modern {
+            "SELECT COUNT(*) FROM session_message WHERE type = 'assistant'"
+        } else {
+            "SELECT COUNT(*) FROM message WHERE json_extract(data, '$.role') = 'assistant'"
+        };
+        match connection.query_row(query, [], |row| read_u64(row, "COUNT(*)")) {
             Ok(count) => Some(count),
             Err(error) => {
                 errors.push(format!("could not inspect assistant messages: {error}"));
@@ -903,7 +932,7 @@ pub fn diagnose(path: &Path) -> Result<DatabaseDiagnostics> {
     if message_columns.contains("data") && json_functions {
         let invalid_json: u64 = connection
             .query_row(
-                "SELECT COUNT(*) FROM message WHERE NOT json_valid(data)",
+                &format!("SELECT COUNT(*) FROM {message_table} WHERE NOT json_valid(data)"),
                 [],
                 |row| read_u64(row, "COUNT(*)"),
             )
@@ -925,9 +954,9 @@ pub fn diagnose(path: &Path) -> Result<DatabaseDiagnostics> {
     }
 
     let opencode_versions = if session_columns.contains("version") {
-        let mut statement = connection.prepare(
-            "SELECT DISTINCT version FROM session WHERE version IS NOT NULL AND version != '' ORDER BY version DESC LIMIT 5",
-        )?;
+        let mut statement = connection.prepare(&format!(
+            "SELECT DISTINCT version FROM {session_table} WHERE version IS NOT NULL AND version != '' ORDER BY version DESC LIMIT 5",
+        ))?;
         let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
         rows.filter_map(Result::ok).collect()
     } else {
@@ -962,9 +991,7 @@ fn validate_usage_schema(connection: &Connection) -> Result<()> {
         .query_row("SELECT json_valid('{}')", [], |row| row.get::<_, i64>(0))
         .map(|value| value == 1)
         .unwrap_or(false);
-    let message_columns = table_columns(connection, "message")?;
-    let session_columns = table_columns(connection, "session")?;
-    let errors = usage_schema_errors(&message_columns, &session_columns, json_functions);
+    let errors = usage_schema_errors(connection, json_functions)?;
     if errors.is_empty() {
         Ok(())
     } else {
@@ -972,34 +999,122 @@ fn validate_usage_schema(connection: &Connection) -> Result<()> {
     }
 }
 
-fn usage_schema_errors(
-    message_columns: &HashSet<String>,
-    session_columns: &HashSet<String>,
-    json_functions: bool,
-) -> Vec<String> {
+/// OpenCode 2.x stores usage in `session_message`/`session_v2`; older databases
+/// store it in `message`/`session`. The database is only unusable when neither
+/// complete shape is present.
+fn usage_schema_errors(connection: &Connection, json_functions: bool) -> Result<Vec<String>> {
+    let mut modern_errors = shape_errors(
+        connection,
+        "session_message",
+        &[
+            "id",
+            "session_id",
+            "type",
+            "time_created",
+            "time_updated",
+            "data",
+        ],
+        "session_v2",
+        &["id", "project_id"],
+    )?;
+    let mut legacy_errors = shape_errors(
+        connection,
+        "message",
+        &["data", "time_created"],
+        "session",
+        &["id", "project_id"],
+    )?;
+    if !json_functions {
+        modern_errors.push("SQLite JSON functions are unavailable".to_string());
+        legacy_errors.push("SQLite JSON functions are unavailable".to_string());
+    }
+    if modern_errors.is_empty() || legacy_errors.is_empty() {
+        return Ok(Vec::new());
+    }
+    modern_errors.extend(legacy_errors);
+    modern_errors.dedup();
+    Ok(modern_errors)
+}
+
+fn shape_errors(
+    connection: &Connection,
+    message_table: &str,
+    message_columns_required: &[&str],
+    session_table: &str,
+    session_columns_required: &[&str],
+) -> Result<Vec<String>> {
+    let message_columns = table_columns(connection, message_table)?;
+    let session_columns = table_columns(connection, session_table)?;
     let mut errors = Vec::new();
     if message_columns.is_empty() {
-        errors.push("missing message table".to_string());
+        errors.push(format!("missing {message_table} table"));
     } else {
-        for column in ["data", "time_created"] {
-            if !message_columns.contains(column) {
-                errors.push(format!("message table is missing {column} column"));
+        for column in message_columns_required {
+            if !message_columns.contains(*column) {
+                errors.push(format!("{message_table} table is missing {column} column"));
             }
         }
     }
     if session_columns.is_empty() {
-        errors.push("missing session table".to_string());
+        errors.push(format!("missing {session_table} table"));
     } else {
-        for column in ["id", "project_id"] {
-            if !session_columns.contains(column) {
-                errors.push(format!("session table is missing {column} column"));
+        for column in session_columns_required {
+            if !session_columns.contains(*column) {
+                errors.push(format!("{session_table} table is missing {column} column"));
             }
         }
     }
-    if !json_functions {
-        errors.push("SQLite JSON functions are unavailable".to_string());
-    }
-    errors
+    Ok(errors)
+}
+
+/// Returns tables that look like message or session storage but are not part of
+/// any schema this build knows about, which usually means OpenCode migrated its
+/// storage again.
+pub fn unknown_usage_tables(path: &Path) -> Result<Vec<String>> {
+    const KNOWN_TABLES: &[&str] = &[
+        "account",
+        "account_state",
+        "control_account",
+        "credential",
+        "event",
+        "event_sequence",
+        "instruction_blob",
+        "instruction_entry",
+        "instruction_state",
+        "kv",
+        "message",
+        "migration",
+        "part",
+        "permission",
+        "project",
+        "project_directory",
+        "session",
+        "session_inbox",
+        "session_message",
+        "session_pending",
+        "session_share",
+        "session_v2",
+        "session_worktree",
+        "todo",
+        "workspace",
+        "worktree",
+    ];
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("opening {}", path.display()))?;
+    let mut statement =
+        connection.prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    Ok(rows
+        .filter_map(Result::ok)
+        .filter(|name| {
+            let lowered = name.to_lowercase();
+            (lowered.contains("message") || lowered.contains("session"))
+                && !KNOWN_TABLES.contains(&name.as_str())
+        })
+        .collect())
 }
 
 pub(crate) fn table_columns(connection: &Connection, table: &str) -> Result<HashSet<String>> {

@@ -39,6 +39,14 @@ const LEGACY_COMPLEMENT_SQL: &str = "SELECT message.id, message.time_created, \
     AND NOT EXISTS (SELECT 1 FROM session_message WHERE session_message.id = message.id) \
     ORDER BY message.time_updated, message.id";
 
+const LEGACY_COMPLEMENT_FULL_SQL: &str = "SELECT message.id, message.time_created, \
+    message.time_created, message.data, session.project_id \
+    FROM message \
+    JOIN session ON session.id = message.session_id \
+    WHERE message.time_created >= ?1 \
+    AND NOT EXISTS (SELECT 1 FROM session_message WHERE session_message.id = message.id) \
+    ORDER BY message.time_created, message.id";
+
 const LEGACY_INCREMENTAL_SQL: &str = "SELECT message.id, message.time_created, \
     message.time_updated, message.data, session.project_id \
     FROM message \
@@ -147,8 +155,12 @@ impl UsageSource for OpenCodeSource {
         }
         if legacy {
             let sql = if modern {
-                LEGACY_COMPLEMENT_SQL
-            } else if supports_incremental {
+                if legacy_columns.contains("time_updated") {
+                    LEGACY_COMPLEMENT_SQL
+                } else {
+                    LEGACY_COMPLEMENT_FULL_SQL
+                }
+            } else if legacy_columns.contains("time_updated") {
                 LEGACY_INCREMENTAL_SQL
             } else {
                 LEGACY_FULL_SQL
@@ -653,5 +665,43 @@ mod tests {
         )
         .unwrap();
         assert!(legacy.is_none());
+    }
+
+    #[test]
+    fn imports_modern_only_databases_without_legacy_tables() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("opencode.db");
+        let connection = Connection::open(&source_path).unwrap();
+        connection
+            .execute_batch(include_str!(
+                "../../tests/fixtures/opencode_modern_only.sql"
+            ))
+            .unwrap();
+        drop(connection);
+        let mut index = UsageIndex::open(&directory.path().join("usage.sqlite3")).unwrap();
+        let source = OpenCodeSource::new(source_path);
+
+        let initial = source.sync(&mut index, SyncMode::Incremental).unwrap();
+        assert_eq!(initial.imported, 1);
+        assert_eq!(index.diagnostics().unwrap().events, 1);
+    }
+
+    #[test]
+    fn imports_legacy_databases_without_time_updated() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("opencode.db");
+        let connection = Connection::open(&source_path).unwrap();
+        connection
+            .execute_batch(include_str!(
+                "../../tests/fixtures/opencode_legacy_no_updated.sql"
+            ))
+            .unwrap();
+        drop(connection);
+        let mut index = UsageIndex::open(&directory.path().join("usage.sqlite3")).unwrap();
+        let source = OpenCodeSource::new(source_path);
+
+        let initial = source.sync(&mut index, SyncMode::Incremental).unwrap();
+        assert_eq!(initial.imported, 1);
+        assert_eq!(index.diagnostics().unwrap().events, 1);
     }
 }
