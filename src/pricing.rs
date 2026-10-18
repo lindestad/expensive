@@ -1,7 +1,8 @@
 //! Best-effort API-equivalent pricing for subscription usage without a cost.
 //!
 //! Rates are standard text-token prices per one million tokens, verified
-//! against the OpenAI model documentation on 2026-07-21. Estimates deliberately
+//! against the OpenAI model documentation (GPT-5.x on 2026-07-21, GPT-6 on
+//! 2026-10-18). Estimates deliberately
 //! exclude tool-call fees, regional/priority uplifts, and long-context
 //! multipliers that cannot be reconstructed reliably from aggregate usage.
 
@@ -56,7 +57,15 @@ fn openai_price(model: &str) -> Option<ApiPrice> {
     let model = model.trim().to_ascii_lowercase();
     let model = model.as_str();
 
-    if named_or_snapshot(model, "gpt-5.6-sol") || named_or_snapshot(model, "gpt-5.6") {
+    if named_or_snapshot(model, "gpt-6-astra") {
+        Some(ApiPrice::new(10.0, 1.0, 50.0).with_cache_write(12.5))
+    } else if named_or_snapshot(model, "gpt-6.1-sol") {
+        Some(ApiPrice::new(2.0, 0.1, 10.0).with_cache_write(2.5))
+    } else if named_or_snapshot(model, "gpt-6-sol") {
+        Some(ApiPrice::new(2.0, 0.2, 10.0).with_cache_write(2.5))
+    } else if named_or_snapshot(model, "gpt-6-luna") {
+        Some(ApiPrice::new(0.1, 0.01, 0.5).with_cache_write(0.125))
+    } else if named_or_snapshot(model, "gpt-5.6-sol") || named_or_snapshot(model, "gpt-5.6") {
         Some(ApiPrice::new(5.0, 0.5, 30.0).with_cache_write(6.25))
     } else if named_or_snapshot(model, "gpt-5.6-terra") {
         Some(ApiPrice::new(2.5, 0.25, 15.0).with_cache_write(3.125))
@@ -128,10 +137,41 @@ mod tests {
     }
 
     #[test]
+    fn estimates_gpt6_family_at_documented_rates() {
+        let tokens = TokenCounts {
+            input: 1_000_000,
+            output: 1_000_000,
+            cache_read: 1_000_000,
+            cache_write: 1_000_000,
+        };
+
+        assert_eq!(
+            estimate_api_cost("openai", "gpt-6-astra", tokens).unwrap(),
+            73.5
+        );
+        assert_eq!(
+            estimate_api_cost("openai", "gpt-6.1-sol", tokens).unwrap(),
+            14.6
+        );
+        assert_eq!(
+            estimate_api_cost("openai", "gpt-6-sol", tokens).unwrap(),
+            14.7
+        );
+        assert_eq!(
+            estimate_api_cost("openai", "gpt-6-luna", tokens).unwrap(),
+            0.735
+        );
+    }
+
+    #[test]
     fn recognizes_snapshots_without_guessing_unpublished_variants() {
         assert!(openai_price("gpt-5.5-2026-04-23").is_some());
+        assert!(openai_price("gpt-6-astra-2026-09-03").is_some());
+        assert!(openai_price("gpt-6.1-sol-2026-09-29").is_some());
+        assert!(openai_price("gpt-6-luna-2026-09-22").is_some());
         assert!(openai_price("gpt-5.3-codex").is_some());
         assert!(openai_price("gpt-5.3-codex-spark").is_none());
+        assert!(openai_price("gpt-6-astra-max").is_none());
         assert!(openai_price("some-future-model").is_none());
     }
 
