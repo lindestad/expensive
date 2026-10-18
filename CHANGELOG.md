@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.5
+
+- price GPT-6 Astra, Sol, 6.1 Sol, and Luna usage at standard API rates when API cost
+  estimation is enabled, including datestamped snapshots of those models
+
 ## 0.5.4
 
 - reconcile mixed OpenCode storage without legacy update timestamps, include legacy-only
